@@ -118,7 +118,7 @@ When a second link presents a grant that passes steps 1 to 6 while a link for th
 
 1. The endpoint sends a Paseo-level ping on the existing link and waits up to 5 s.
 2. **Existing link does not answer:** it is treated as dead (the member's own reconnect after a network change). It is closed, the new link is accepted.
-3. **Existing link answers:** two live holders of the same grant exist. The endpoint closes **both** links, removes `current[(deviceId, laneId)]` (so the gid stops working everywhere), and the host appends `grant.suspected_theft {memberId, deviceId, laneId, gid}`. The owner sees a notice. The member's device gets an event on its room session and re-issues through proof of possession; a thief cannot.
+3. **Existing link answers:** two live holders of the same grant exist. The endpoint closes **both** links, removes `current[(deviceId, laneId)]` (so the gid stops working everywhere), and the host appends `grant.suspected-theft {memberId, deviceId, laneId, gid}`. The owner sees a notice. The member's device gets an event on its room session and re-issues through proof of possession; a thief cannot.
 
 ### 6.2 Status reports with link identity
 
@@ -137,11 +137,11 @@ If the member sees a live link it cannot account for (registration offline while
 M→H { t:"grant.report", id, laneId, gid, reason: "unaccounted_link" }
 ```
 
-The host treats it like 6.1 step 3 (cut, unlist, log `grant.suspected_theft` with `reportedBy: "member"`), then the member issues a new grant.
+The host treats it like 6.1 step 3 (cut, unlist, log `grant.suspected-theft` with `reportedBy: "member"`), then the member issues a new grant.
 
 ### 6.4 Repeated theft
 
-Two `grant.suspected_theft` events for the same device within 7 days mean the device's `hosts.json` (or the device itself) is being read by someone else. The owner and the member are told to treat it as a **device compromise** (`keys-rotation-recovery.md` section 6.3): remove the device and re-link from a clean one.
+Two `grant.suspected-theft` events for the same device within 7 days mean the device's `hosts.json` (or the device itself) is being read by someone else. The owner and the member are told to treat it as a **device compromise** (`keys-rotation-recovery.md` section 6.3): remove the device and re-link from a clean one.
 
 ## 7. Revocation: enforce, then persist
 

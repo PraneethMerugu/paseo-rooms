@@ -460,6 +460,58 @@
     "genesisHash": "7X4q67YA4b5P4kLj3MZURRizJQqN8beTQyLKF2KiXBg",
     "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445"
   },
+  "recoveryCode": {
+    "seedHex": "42686550f8c62d54def71a66fdea51e26d4e419e86b792c69e67fdf43c29870c",
+    "kid": "eqcpQxwyYi88_j8xurjmw4wJzCIFePYLk9WIhYR5b3w",
+    "checkHex": "0106ec",
+    "code": "prk2-ijug-kuhy-yywv-jxxx-djtp-32sr-4jwu-4qm6-q23z-fru6-m767-ipbj-q4ga-cbxm",
+    "accept": [
+      {
+        "name": "uppercase",
+        "code": "PRK2-IJUG-KUHY-YYWV-JXXX-DJTP-32SR-4JWU-4QM6-Q23Z-FRU6-M767-IPBJ-Q4GA-CBXM"
+      },
+      {
+        "name": "spaces",
+        "code": "prk2 ijug kuhy yywv jxxx djtp 32sr 4jwu 4qm6 q23z fru6 m767 ipbj q4ga cbxm"
+      },
+      {
+        "name": "noSeparators",
+        "code": "prk2ijugkuhyyywvjxxxdjtp32sr4jwu4qm6q23zfru6m767ipbjq4gacbxm"
+      }
+    ],
+    "reject": [
+      {
+        "name": "oneCharacterChanged",
+        "code": "prk2-ijug-kuhy-yyxv-jxxx-djtp-32sr-4jwu-4qm6-q23z-fru6-m767-ipbj-q4ga-cbxm",
+        "error": "typo"
+      },
+      {
+        "name": "adjacentSwap",
+        "code": "prk2-ijug-kuhy-yywv-jxxx-djtp-23sr-4jwu-4qm6-q23z-fru6-m767-ipbj-q4ga-cbxm",
+        "error": "typo"
+      },
+      {
+        "name": "groupMissing",
+        "code": "prk2-ijug-kuhy-yywv-jxxx-djtp-32sr-4jwu-4qm6-q23z-fru6-m767-ipbj-q4ga",
+        "error": "wrong_length"
+      },
+      {
+        "name": "zeroForO",
+        "code": "prk2-ijug-k0hy-yywv-jxxx-djtp-32sr-4jwu-4qm6-q23z-fru6-m767-ipbj-q4ga-cbxm",
+        "error": "bad_character"
+      },
+      {
+        "name": "wrongPrefix",
+        "code": "prk1-ijug-kuhy-yywv-jxxx-djtp-32sr-4jwu-4qm6-q23z-fru6-m767-ipbj-q4ga-cbxm",
+        "error": "not_recovery_code"
+      },
+      {
+        "name": "otherKey",
+        "code": "prk2-are5-2bvw-2cye-zaqs-gjfs-7uep-kky4-j3ho-xug5-6omj-zh3z-i7wq-4unp-ejkb",
+        "error": "wrong_key"
+      }
+    ]
+  },
   "invite": {
     "payload": {
       "v": 2,

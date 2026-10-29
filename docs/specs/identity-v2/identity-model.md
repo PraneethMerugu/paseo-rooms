@@ -184,10 +184,38 @@ In the embedded deployment the admin key sits on the owner's daemon, and the dae
 Decision (2026-10-29): the recovery key is **offered by default and optional**. Org escrow follows org policy.
 
 - **Room creation.** The create-room dialog includes a "Create a recovery key" step, preselected. The creator can skip it with one click. The dialog says what skipping costs: "Without a recovery key, a room with one admin cannot be recovered if that admin's key is lost or stolen. Members would have to start a new room." This follows the opt-in preference in that the key is never forced on a room without org policy, while the default path produces one.
-- **Form.** 32 random bytes (the Ed25519 seed), shown once as a printable code and offered as a file to save. The seed is not stored on the daemon after the dialog closes. Only the public key enters `genesis.recovery`.
+- **Form.** 32 random bytes (the Ed25519 seed), shown once as a printable code (section 5.4.1) and offered as a file to save. The seed is not stored on the daemon after the dialog closes. Only the public key enters `genesis.recovery`.
 - **Adding later.** A room created without a recovery key can add one with `recovery.key.rotated` from `null`, signed by an admin key, since there is no previous recovery key. Members see a notice. In a room with one admin lineage (one admin, or a creator and the co-admins they added) one admin signs it alone. In a room with two or more independent admin lineages, one admin proposes it (`recovery.key.proposed`) and an admin of another lineage confirms it (decision round 4, item 1; `room-log-v2.md` section 5.2). So a single stolen admin key cannot install a recovery key of its own in a room that has an independent admin. A recovery key added later cannot revoke statements made before it was installed (`room-log-v2.md` section 5.1).
 - **Org escrow.** When org policy sets `recoveryEscrow = "org"`, room creation also requires a recovery key and hands a copy of the seed to the organisation's escrow, as the org profile specifies (for example, encrypted to an org public key and saved for upload). `genesis.policy.recoveryEscrow = "org"` tells members that someone outside the room can revoke and add admin keys. The escrow transport and custody are outside this spec.
 - **What the recovery key can do:** `admin.key.revoked`, `admin.added`, `recovery.key.rotated` and `room.closed` only (`keys-rotation-recovery.md` section 4.4). Its revocations take precedence over those of admin keys (`room-log-v2.md` section 5.1).
+
+### 5.4.1 Recovery code format
+
+The recovery code is the printable form of the recovery seed. It carries a checksum, so a typing error is reported as a typo and not confused with a correctly typed code of another key.
+
+```
+check = first 3 bytes of H("recovery-code", seed)             // signatures-and-encoding 3.3
+body  = lowercase base32 (RFC 4648 alphabet, no padding) of seed ‖ check
+        // 35 bytes = 280 bits = exactly 56 characters
+code  = "prk2-" + body in 14 groups of 4 characters joined by "-"
+        // e.g. prk2-abcd-efgh-...  (74 characters in total)
+```
+
+- **Alphabet.** `a` to `z` and `2` to `7`. The digits `0`, `1`, `8` and `9` never occur, which avoids the `0`/`o` and `1`/`l` confusion when the code is read aloud or copied by hand. Groups of 4 match the display fingerprints (`signatures-and-encoding.md` section 5.3).
+- **Checksum.** 24 bits of a domain-separated hash of the seed. Under the usual model of SHA-256 as a random function, a corrupted code of the right length and alphabet passes the checksum with probability 2^-24 (about 1 in 16.8 million). The vector generator and the unit tests also check that every one of the 1736 single-character substitutions of the vector code is detected. The checksum is a usability aid, not a security control: the code is accepted only if its public key equals the room's current recovery key, which already rules out a wrong code.
+- **Parsing.** Case is ignored; spaces, line breaks and hyphens anywhere are ignored. The checks run in this order and each has its own error and message:
+
+| Error | When | Message |
+|---|---|---|
+| `not_recovery_code` | the text does not start with `prk2` | "This is not a Paseo room recovery code. Recovery codes start with prk2-." |
+| `wrong_length` | not exactly 56 characters after the prefix | "The recovery code should have 14 groups of 4 characters after prk2-. A character is missing or extra." |
+| `bad_character` | a character outside the alphabet | "The recovery code contains a character that recovery codes do not use. They use only the letters a to z and the digits 2 to 7." |
+| `typo` | the checksum does not match | "The recovery code has a typo. Compare each group with your saved copy." |
+| `wrong_key` | the checksum matches, but the public key of the seed is not the room's current recovery key | "This recovery code is typed correctly, but it is not the current recovery key of this room." |
+
+- **Saved file.** The file offered at creation is `paseo-room-recovery-<roomId>.json` with `{ v: 2, typ: "recovery-key", roomId, genesisHash, kid, code }`. It holds the same code, so the same parser reads it.
+- **Version.** The `2` in `prk2` is the format version. Codes printed by earlier development builds (52 characters, no checksum) are not accepted; none were issued outside tests.
+- Vector: `vectors.json` → `recoveryCode` (encoding, three accepted spellings, and one rejected case per error).
 
 ## 6. Membership model
 
@@ -338,13 +366,17 @@ All rooms data lives under `$PASEO_HOME/plugin-data/rooms/`: owner-only on every
 |---|---|---|---|
 | `keystore/meta.json` | backend name, `kekId`, creation time, fallback flag; the record that a keyring KEK exists (section 7.3) | no | yes |
 | `keystore/kek.fallback` | only in fallback mode: the KEK (a DPAPI blob on Windows when available) | no (it is the KEK) | yes |
-| `member/rooms/<roomId>/keys.sealed` | device signing, DH and MLS keys for this room | yes | yes |
+| `member/rooms/<roomId>/keys.sealed` | device signing, DH and MLS keys for this room; for the creator, written at room creation together with the admin and host key files | yes | yes |
 | `member/rooms/<roomId>/state.sealed` | pinned `genesisHash`, authority state, roster, log heads, enrollment journal | yes | yes |
 | `member/rooms/<roomId>/mls.sealed` | encoded MLS group state | yes | yes |
 | `admin/<roomId>/admin-key.sealed` | admin key | yes | yes |
-| `host/<roomId>/keys.sealed` | host key, room endpoint key, lane endpoint keys | yes | yes |
+| `admin/<roomId>/state.sealed` | the admin's outstanding signed statements (no receipt and no definite rejection yet), written before a statement is returned, so a restart still knows them (room-log-v2 section 2, forward base) | yes | yes |
+| `host/<roomId>/keys.sealed` | host key, room endpoint key, lane endpoint keys, and the pinned `genesisHash` of the room | yes | yes |
+| `host/<roomId>/genesis.json` | the signed genesis, RJCS text; public | no (checked against the `genesisHash` pinned in `host/<roomId>/keys.sealed`) | yes |
 | `host/<roomId>/state.sealed` | invites (token keys), pending enrollments, grant allowlist | yes | yes |
 | `host/<roomId>/log/` | envelopes and bodies (`room-log-v2.md` section 8) | no (bodies are MLS ciphertext) | yes |
+
+The host pins the room's `genesisHash` inside its sealed key file rather than sealing the genesis itself: the genesis is public and is sent to every joiner, but the host must not accept a different one. On open, the host refuses the room when `genesis.json` does not verify or its hash differs from the pinned value (`room-log-v2.md` section 8.1).
 
 "Integrity-critical" closes M-6: whoever can modify a pinned key decides whom the device trusts. Sealing with an AEAD also detects modification.
 

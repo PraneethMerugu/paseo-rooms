@@ -9,7 +9,19 @@ import { appendFileSync, readdirSync, readFileSync, statSync, writeFileSync } fr
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createRoom, CreateRoomError, decodeRecoveryCode, encodeRecoveryCode, memberKeysPath, memberKeysPurpose, RECOVERY_SKIP_WARNING, type CreatedRoom } from "../../server/admin/genesis";
+import {
+  createRoom,
+  CreateRoomError,
+  decodeRecoveryCode,
+  encodeRecoveryCode,
+  memberKeysPath,
+  memberKeysPurpose,
+  RECOVERY_CODE_MESSAGES,
+  RECOVERY_SKIP_WARNING,
+  RecoveryCodeError,
+  recoverySeedForKey,
+  type CreatedRoom,
+} from "../../server/admin/genesis";
 import { adminKeyPath, adminKeyPurpose, AdminSigner, AdminSignerError, adminStatePath } from "../../server/admin/signer";
 import { bodyHash } from "../../server/authority/entries";
 import { verifyGenesis } from "../../server/authority/genesis";
@@ -21,11 +33,11 @@ import { SealedFileError } from "../../server/keystore/sealed";
 import { KeyStoreError, type KeyStoreBackend } from "../../server/keystore/types";
 import { LOCK_FILE } from "../../server/platform/log-lock";
 import { b64u } from "../../server/proto/b64u";
-import { CTX_KEY_CHANGE_NEW, stmtContext } from "../../server/proto/contexts";
+import { CTX_KEY_CHANGE_NEW, H_RECOVERY_CODE, stmtContext } from "../../server/proto/contexts";
 import { inviteRef, newId, newServerId } from "../../server/proto/ids";
 import { ed25519PrivateKeyFromSeed, kid as kidOf, rawPublicKey, x25519PrivateKeyFromSecret } from "../../server/proto/keys";
 import { rjcs } from "../../server/proto/rjcs";
-import { sign } from "../../server/proto/tbs";
+import { H, sign } from "../../server/proto/tbs";
 import { tempDir } from "./helpers";
 import { randomBytes, type KeyObject } from "node:crypto";
 
@@ -195,13 +207,47 @@ test("recovery key: skippable in one choice with the warning; required when org 
     org.host.close();
     await assert.rejects(newRoom(env, { policy: { grantTtl: 50000 } }), (e: unknown) => e instanceof CreateRoomError && e.code === "bad_policy");
     await assert.rejects(newRoom(env, { relay: { ...RELAY, tls: false as unknown as true } }), (e: unknown) => e instanceof CreateRoomError && e.code === "bad_relay");
-    assert.throws(() => decodeRecoveryCode("prk2-abcd"), /length/);
+    assert.throws(() => decodeRecoveryCode("prk2-abcd"), (e: unknown) => e instanceof RecoveryCodeError && e.code === "wrong_length");
   } finally {
     env.t.cleanup();
   }
 });
 
 // ---------------------------------------------------------------------------------- signer
+
+test("recovery code (identity-model 5.4.1): vectors encode, decode, and each failure has its own error", () => {
+  const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
+  const rc = V.recoveryCode;
+  const seed = Buffer.from(rc.seedHex, "hex");
+  assert.equal(seed.toString("hex"), V.keys.recovery.seedHex);
+  assert.equal(rc.kid, V.keys.recovery.kid);
+  // Encode: prefix, 14 groups of 4, checksum H("recovery-code", seed)[0..3].
+  assert.equal(encodeRecoveryCode(seed), rc.code);
+  assert.match(rc.code, /^prk2(-[a-z2-7]{4}){14}$/);
+  assert.equal(H(H_RECOVERY_CODE, seed).subarray(0, 3).toString("hex"), rc.checkHex);
+  // Decode, also with other case and separators.
+  assert.deepEqual(decodeRecoveryCode(rc.code), seed);
+  assert.deepEqual(recoverySeedForKey(rc.code, rc.kid), seed);
+  for (const a of rc.accept) assert.deepEqual(recoverySeedForKey(a.code, rc.kid), seed, a.name);
+  // Typos are told apart from a wrong (but well-formed) code.
+  assert.equal(rc.reject.length, 6);
+  for (const r of rc.reject) {
+    assert.throws(
+      () => recoverySeedForKey(r.code, rc.kid),
+      (e: unknown) => e instanceof RecoveryCodeError && e.code === r.error && e.message === RECOVERY_CODE_MESSAGES[r.error as keyof typeof RECOVERY_CODE_MESSAGES],
+      r.name,
+    );
+  }
+  assert.doesNotThrow(() => decodeRecoveryCode(rc.reject.find((r: { name: string }) => r.name === "otherKey").code), "a code of another key is not a typo");
+  // Every single-character substitution of the vector code is detected as a typo.
+  const body = rc.code.slice(5).replace(/-/g, "");
+  for (let i = 0; i < body.length; i++) {
+    for (const ch of "abcdefghijklmnopqrstuvwxyz234567") {
+      if (ch === body[i]) continue;
+      assert.throws(() => decodeRecoveryCode(`prk2${body.slice(0, i)}${ch}${body.slice(i + 1)}`), (e: unknown) => e instanceof RecoveryCodeError && e.code === "typo");
+    }
+  }
+});
 
 test("admin signer: one-time confirm token, expiry, automatic signing limited, one statement at a time", async () => {
   const env = await setup();
@@ -448,7 +494,7 @@ const SPEC_4_6: Record<string, string[]> = {
     "device.leaf.repair.requested",
   ],
   lane_display: ["lane.names.changed"],
-  alert: ["grant.suspected_theft", "endpoint.evicted", "mls.stalled", "lane.degraded"],
+  alert: ["grant.suspected-theft", "endpoint.evicted", "mls.stalled", "lane.degraded"],
 };
 
 test("4.6 (P-27): every security event is in the notice table, and each appears in the log with its producer", async () => {
@@ -480,9 +526,8 @@ test("4.6 (P-27): every security event is in the notice table, and each appears 
     host.emit("lane.degraded", { laneId, reason: "endpoint_failing" });
     host.emit("endpoint.evicted", { serverId: host.state.auth.endpoint.serverId, count: 3, windowS: 600 });
     host.emit("mls.stalled", { epoch: 0, sinceMs: 60_000 });
-    // Spec gap (reported, not fixed here): "stmt:grant.suspected_theft" is outside the context alphabet
-    // ^[a-z0-9.:-]{1,64}$ of signatures-and-encoding 3.1, so no key can sign this statement type yet.
-    assert.throws(() => host.emit("grant.suspected_theft", { memberId: signer.memberId, deviceId: newId("device"), laneId, gid: newId("grant"), reportedBy: "endpoint" }), /bad statement type/);
+    // Renamed from grant.suspected_theft, whose context was outside the alphabet of signatures 3.1.
+    host.emit("grant.suspected-theft", { memberId: signer.memberId, deviceId: newId("device"), laneId, gid: newId("grant"), reportedBy: "endpoint" });
     host.emit("invite.burned", { inviteRef: ref, reason: "attempts" });
     assert.throws(() => host.emit("room.closed" as never, { proposal: null } as never), TypeError);
 
@@ -508,6 +553,7 @@ test("4.6 (P-27): every security event is in the notice table, and each appears 
       ["lane.degraded", "host"],
       ["endpoint.evicted", "host"],
       ["mls.stalled", "host"],
+      ["grant.suspected-theft", "host"],
       ["recovery.key.rotated", "recovery"],
       ["admin.removed", "admin"],
       ["room.close.proposed", "admin"],

@@ -174,7 +174,7 @@ Each procedure lists who acts, what is signed, and what stays exposed.
 ### 6.2 Stolen grant
 
 1. Detection: `grants-v2.md` section 6 (second live link, or a link the member cannot account for).
-2. Automatic response: both links cut, the gid unlisted, `grant.suspected_theft` logged. The member reissues by proof of possession.
+2. Automatic response: both links cut, the gid unlisted, `grant.suspected-theft` logged. The member reissues by proof of possession.
 3. If it repeats: treat as 6.3.
 4. Exposure: lane content (watch role) for the time the thief held a link. The grant gives nothing on the room endpoint, so no chat or log content.
 

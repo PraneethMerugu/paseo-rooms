@@ -383,7 +383,7 @@ Every milestone ends with `npm run typecheck` clean and `npm test` green. "Linux
 **Change `lane-endpoint.ts`:**
 - Delete the `rooms.control.*` first-frame switch (the `rooms.control.hello` branch and `control` mode in `RelayConnection`, around lines 365 to 490 today).
 - Verify grants in the order of section 4, with the `gid` allowlist as the primary check and `role` equal to the roster role.
-- At most one link per (device, lane), with the ping test and `grant.suspected_theft`.
+- At most one link per (device, lane), with the ping test and `grant.suspected-theft`.
 - Count only failed attempts against the token bucket.
 - Reduce routes per link to 32.
 
@@ -586,4 +586,4 @@ The attack harness of hardening section E is out of scope. It runs only after th
 
 - **I-3 (KeyStore), not yet done:** async runtime states and UI wiring; automatic move from the fallback file to a keyring (only detected now); KEK rotation (build on the same re-seal step); the CLI keyring backends and Windows DPAPI wrapping of the fallback file; Kubernetes secret mounts are symlinks and fail the permission check. Packaging: add `"@napi-rs/keyring": "2.1.2"` to dependencies; directory installs need `npm install` on the target machine.
 - **I-2 (file layer):** no client button yet for `rooms.permissions.fix`.
-- **I-7 (room host core), not yet done:** host key and endpoint key rotation (the host refuses a `host.key.rotated` naming a key it does not hold; `endpoint.rotated` is accepted without the host holding the new key, I-12); the adjacent `device.rekey.approved` plus commit write and automatic rekey approvals (I-13); `host/<roomId>/state.sealed` (invites, pending enrollments, grant allowlist; I-9, I-10); revocation enforce-first ordering (grants-v2 7.1; nothing to enforce before sessions and grants); org policy profiles (only `recoveryEscrow = "org"` forcing a recovery key is applied); clean-up of an interrupted room creation found at start. Spec gap found: `stmt:grant.suspected_theft` is outside the context alphabet of signatures 3.1, so that statement cannot be signed (needs a spec decision).
+- **I-7 (room host core), not yet done:** host key and endpoint key rotation (the host refuses a `host.key.rotated` naming a key it does not hold; `endpoint.rotated` is accepted without the host holding the new key, I-12); the adjacent `device.rekey.approved` plus commit write and automatic rekey approvals (I-13); `host/<roomId>/state.sealed` (invites, pending enrollments, grant allowlist; I-9, I-10); revocation enforce-first ordering (grants-v2 7.1; nothing to enforce before sessions and grants); org policy profiles (only `recoveryEscrow = "org"` forcing a recovery key is applied); clean-up of an interrupted room creation found at start. Spec gap found: `stmt:grant.suspected_theft` was outside the context alphabet of signatures 3.1, so that statement could not be signed; fixed after I-7 by renaming the type to `grant.suspected-theft` (alphabet unchanged).

@@ -20,11 +20,18 @@ export const CTX_STMT_PREFIX = "stmt:";
 /** Statement type of the `LogWitness` object that travels inside MLS. */
 export const STMT_LOG_WITNESS = "log.witness";
 
+/**
+ * Statement type names use `[a-z0-9.-]` (room-log-v2.md section 4), so `stmt:<type>` stays inside the
+ * context alphabet of signatures-and-encoding.md section 3.1 and never contains a second `:`.
+ */
+export function isSignableStatementType(type: string): boolean {
+  return /^[a-z0-9.-]+$/.test(type) && CTX_RE.test(CTX_STMT_PREFIX + type);
+}
+
 /** Signature context of one statement type, e.g. `stmt:member.admitted`. */
 export function stmtContext(type: string): string {
-  const ctx = CTX_STMT_PREFIX + type;
-  if (!/^[a-z0-9.-]+$/.test(type) || !CTX_RE.test(ctx)) throw new Error("bad statement type");
-  return ctx;
+  if (!isSignableStatementType(type)) throw new Error("bad statement type");
+  return CTX_STMT_PREFIX + type;
 }
 
 // MAC label (section 3.3): HMAC-SHA256 over TBS(label, payload).
@@ -51,10 +58,12 @@ export const H_ADMIN_SET = "admin-set";
 export const H_MLS_GROUP = "mls-group";
 export const H_SAS_COMMIT = "sas-commit";
 export const H_SAS_TRANSCRIPT = "sas-transcript";
+/** Recovery code checksum (identity-model.md section 5.4.1). */
+export const H_RECOVERY_CODE = "recovery-code";
 
 // Noise prologue label (section 3.3; enrollment-v2.md section 3.3).
 export const PROLOGUE_NOISE_IK = "noise-ik";
 
 export const SIGNATURE_CONTEXTS = [CTX_GENESIS, CTX_LOG_ENTRY, CTX_LANE_GRANT, CTX_ENROLL_REQUEST, CTX_KEY_CHANGE_NEW, CTX_MLS_IDENTITY] as const;
-export const HASH_LABELS = [H_KID, H_GENESIS, H_LOG_ENTRY, H_LOG_BODY, H_ROSTER, H_INVITE_REF, H_LINK_REF, H_ADMIN_SET, H_MLS_GROUP, H_SAS_COMMIT, H_SAS_TRANSCRIPT] as const;
+export const HASH_LABELS = [H_KID, H_GENESIS, H_LOG_ENTRY, H_LOG_BODY, H_ROSTER, H_INVITE_REF, H_LINK_REF, H_ADMIN_SET, H_MLS_GROUP, H_SAS_COMMIT, H_SAS_TRANSCRIPT, H_RECOVERY_CODE] as const;
 export const DERIVATION_LABELS = [MAC_ENROLL_TOKEN, KDF_INVITE_TOKEN_KEY, KDF_LINK_TOKEN_KEY, KDF_SAS, KDF_FILE_KEY, PROLOGUE_NOISE_IK] as const;

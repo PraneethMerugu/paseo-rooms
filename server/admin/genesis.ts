@@ -18,7 +18,7 @@
 //   member/rooms/<roomId>/keys.sealed      creator device keys  (purpose member-keys:<roomId>)
 //   host/<roomId>/log/                     the room log (room-log-store.ts)
 // Nothing here logs key material, the recovery code or file contents.
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs";
 import nodePath from "node:path";
 import { verifyGenesis, type GenesisBody, type RoomGenesis } from "../authority/genesis";
@@ -28,11 +28,11 @@ import { RoomHost, writeGenesisFile, writeHostKeys, type OpenRoomHostOptions } f
 import { hostRoomDir } from "../host/room-log-store";
 import { log } from "../log";
 import { b64u } from "../proto/b64u";
-import { CTX_GENESIS } from "../proto/contexts";
+import { CTX_GENESIS, H_RECOVERY_CODE } from "../proto/contexts";
 import { newId, newServerId } from "../proto/ids";
 import { ed25519PrivateKeyFromSeed, fingerprintOfKid, kid as kidOf, rawPublicKey, x25519PrivateKeyFromSecret } from "../proto/keys";
 import { rjcs } from "../proto/rjcs";
-import { sign } from "../proto/tbs";
+import { H, sign } from "../proto/tbs";
 import { adminDir, AdminSigner, writeAdminKey } from "./signer";
 
 export const RECOVERY_SKIP_WARNING =
@@ -53,56 +53,102 @@ export function defaultPolicy(): Policy {
   };
 }
 
-// ---- recovery code ----
+// ---- recovery code (identity-model.md section 5.4.1) ----
 
 const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
 export const RECOVERY_CODE_PREFIX = "prk2";
+/** Bytes of H("recovery-code", seed) appended to the seed. */
+export const RECOVERY_CODE_CHECK_BYTES = 3;
+/** base32 characters after the prefix: (32 + 3) bytes = 280 bits = 56 characters, no padding. */
+const RECOVERY_CODE_CHARS = 56;
+const RECOVERY_CODE_GROUP = 4;
+
+export type RecoveryCodeErrorCode = "not_recovery_code" | "wrong_length" | "bad_character" | "typo" | "wrong_key";
+
+/** The texts the recovery dialog shows, one per failure (identity-model 5.4.1). */
+export const RECOVERY_CODE_MESSAGES: Readonly<Record<RecoveryCodeErrorCode, string>> = {
+  not_recovery_code: "This is not a Paseo room recovery code. Recovery codes start with prk2-.",
+  wrong_length: "The recovery code should have 14 groups of 4 characters after prk2-. A character is missing or extra.",
+  bad_character: "The recovery code contains a character that recovery codes do not use. They use only the letters a to z and the digits 2 to 7.",
+  typo: "The recovery code has a typo. Compare each group with your saved copy.",
+  wrong_key: "This recovery code is typed correctly, but it is not the current recovery key of this room.",
+};
+
+export class RecoveryCodeError extends Error {
+  constructor(readonly code: RecoveryCodeErrorCode) {
+    super(RECOVERY_CODE_MESSAGES[code]);
+    this.name = "RecoveryCodeError";
+  }
+}
+
+const recoveryCheck = (seed: Uint8Array): Buffer => H(H_RECOVERY_CODE, seed).subarray(0, RECOVERY_CODE_CHECK_BYTES);
 
 /**
- * Printable form of the 32-byte recovery seed: "prk2-" and 52 lowercase base32 characters in groups
- * of 4 (identity-model 5.4 fixes the content, not the spelling). A typo is caught when the code is
- * used: its public key must match `genesis.recovery`.
+ * Printable form of the 32-byte recovery seed: "prk2-" and the lowercase base32 (RFC 4648, no
+ * padding) of seed || first 3 bytes of H("recovery-code", seed), in 14 groups of 4 joined by "-".
  */
 export function encodeRecoveryCode(seed: Uint8Array): string {
   if (seed.length !== 32) throw new Error("recovery seed must be 32 bytes");
+  const payload = Buffer.concat([seed, recoveryCheck(seed)]);
   let bits = 0;
   let acc = 0;
   let out = "";
-  for (const byte of seed) {
-    acc = (acc << 8) | byte;
+  for (const byte of payload) {
+    acc = ((acc << 8) | byte) & 0xfff;
     bits += 8;
     while (bits >= 5) {
       bits -= 5;
       out += BASE32[(acc >> bits) & 31];
     }
-    acc &= (1 << bits) - 1;
   }
-  out += BASE32[(acc << (5 - bits)) & 31];
-  return `${RECOVERY_CODE_PREFIX}-${out.match(/.{1,4}/g)!.join("-")}`;
+  payload.fill(0);
+  return `${RECOVERY_CODE_PREFIX}-${out.match(new RegExp(`.{${RECOVERY_CODE_GROUP}}`, "g"))!.join("-")}`;
 }
 
-/** Inverse of encodeRecoveryCode; tolerant of case, spaces and hyphens. Throws on anything else. */
+/**
+ * Inverse of encodeRecoveryCode. Ignores case, whitespace and hyphens. Throws RecoveryCodeError:
+ * `not_recovery_code`, `wrong_length`, `bad_character`, or `typo` when the checksum does not match.
+ */
 export function decodeRecoveryCode(code: string): Buffer {
   const text = code.toLowerCase().replace(/[\s-]/g, "");
-  if (!text.startsWith(RECOVERY_CODE_PREFIX)) throw new Error("not a recovery code");
+  if (!text.startsWith(RECOVERY_CODE_PREFIX)) throw new RecoveryCodeError("not_recovery_code");
   const body = text.slice(RECOVERY_CODE_PREFIX.length);
-  if (body.length !== 52) throw new Error("recovery code has the wrong length");
-  const out: number[] = [];
+  if (body.length !== RECOVERY_CODE_CHARS) throw new RecoveryCodeError("wrong_length");
+  const out = Buffer.alloc(32 + RECOVERY_CODE_CHECK_BYTES);
+  let n = 0;
   let bits = 0;
   let acc = 0;
   for (const ch of body) {
     const v = BASE32.indexOf(ch);
-    if (v < 0) throw new Error("recovery code has a character outside base32");
-    acc = (acc << 5) | v;
+    if (v < 0) throw new RecoveryCodeError("bad_character");
+    acc = ((acc << 5) | v) & 0xfff;
     bits += 5;
     if (bits >= 8) {
       bits -= 8;
-      out.push((acc >> bits) & 0xff);
+      out[n++] = (acc >> bits) & 0xff;
     }
-    acc &= (1 << bits) - 1;
   }
-  if (out.length !== 32 || acc !== 0) throw new Error("recovery code is not canonical");
-  return Buffer.from(out);
+  const seed = Buffer.from(out.subarray(0, 32));
+  const ok = timingSafeEqual(out.subarray(32), recoveryCheck(seed));
+  out.fill(0);
+  if (!ok) {
+    seed.fill(0);
+    throw new RecoveryCodeError("typo");
+  }
+  return seed;
+}
+
+/**
+ * Decodes a recovery code and checks that it is the recovery key `expectedKid` (the room's current
+ * recovery key). A code that decodes but names another key throws RecoveryCodeError("wrong_key").
+ */
+export function recoverySeedForKey(code: string, expectedKid: string): Buffer {
+  const seed = decodeRecoveryCode(code);
+  if (kidOf("ed25519", rawPublicKey(ed25519PrivateKeyFromSeed(seed))) !== expectedKid) {
+    seed.fill(0);
+    throw new RecoveryCodeError("wrong_key");
+  }
+  return seed;
 }
 
 export type RecoveryKeyOffer = {

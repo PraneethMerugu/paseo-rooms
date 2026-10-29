@@ -16,6 +16,7 @@
 // void instead, and those of the revoked key from `fromSeq` on are suspect.
 // Pure: no I/O, no clock. Nothing here logs key material or bodies.
 import { b64uDecode } from "../proto/b64u";
+import { isSignableStatementType } from "../proto/contexts";
 import { isId } from "../proto/ids";
 import { kid as kidOf } from "../proto/keys";
 import { rjcsParse, RJCS_MAX_BYTES } from "../proto/rjcs";
@@ -143,8 +144,14 @@ export class RoomLogFold {
     this.step = makeStep(this.initial, this.records).live;
   }
 
+  /** Throws FoldError(-1, "bad_genesis") when the genesis does not verify (identity-model 5.1). */
   static fromGenesis(genesis: Uint8Array | unknown): RoomLogFold {
-    const v = verifyGenesis(genesis);
+    let v: ReturnType<typeof verifyGenesis>;
+    try {
+      v = verifyGenesis(genesis);
+    } catch (err) {
+      throw new FoldError(-1, "bad_genesis", err instanceof Error ? err.message : "genesis does not verify");
+    }
     return new RoomLogFold(initState(v.genesis, v.genesisHash, v.roomId));
   }
 
@@ -187,8 +194,22 @@ export class RoomLogFold {
     this.run(signed, body, false);
   }
 
+  /**
+   * Every failure leaves as a FoldError with a defined reason. An exception that no check anticipated
+   * (a bug, or input that slipped past a schema) becomes `internal_error`, so a caller never has to
+   * handle a second error type and a bad entry is rejected rather than crashing the fold.
+   */
   private run(value: unknown, body: Uint8Array | undefined, commit: boolean): void {
     const seq = this.hashes.length;
+    try {
+      this.runChecks(seq, value, body, commit);
+    } catch (err) {
+      if (err instanceof FoldError) throw err;
+      throw new FoldError(seq, "internal_error", err instanceof Error ? err.message : "unexpected failure");
+    }
+  }
+
+  private runChecks(seq: number, value: unknown, body: Uint8Array | undefined, commit: boolean): void {
     let signed: SignedEntry;
     try {
       signed = verifyChainedEntry(value, { roomId: this.st.roomId, seq, prevHash: this.head.hash }, this.hostKeyAt);
@@ -220,6 +241,8 @@ export class RoomLogFold {
     const sb = stmt.body;
     if (sb.type !== entry.type) throw new FoldError(seq, "type_mismatch", `entry type ${entry.type}, statement type ${sb.type}`);
     if (sb.roomId !== this.st.roomId) throw new FoldError(seq, "wrong_room", "statement names another room");
+    // A catalogue type whose `stmt:<type>` context is outside the alphabet can never be signed or verified.
+    if (!isSignableStatementType(sb.type)) throw new FoldError(seq, "unsignable_type", `stmt:${sb.type} is outside the context alphabet`);
 
     // Base rule: the producer's verified head lies strictly before this entry and is in this chain.
     if (!(sb.base.seq < seq)) throw new FoldError(seq, "base_not_before_entry", `base.seq ${sb.base.seq} is not before ${seq}`);
@@ -827,7 +850,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
     case "endpoint.evicted":
     case "grant.issued":
     case "grant.revoked":
-    case "grant.suspected_theft":
+    case "grant.suspected-theft":
     case "mls.stalled":
     case "producer.fence":
       return;

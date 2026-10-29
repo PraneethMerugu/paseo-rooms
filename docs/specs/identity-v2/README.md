@@ -318,3 +318,14 @@ Round 8 (2026-10-29) followed the I-5 and I-6 implementation of the fold. Each i
 | R8-4 nesting cap, linear re-fold | Positional nesting depth at most 8 (`revocation_too_deep`); fixed point over at most 9 flat passes; vector `log.revocationDepth`; unit test counting steps | room log 5, 5.1 steps 3 and 8; fold (`refold.ts`, `fold.ts`) |
 | R8-5 silent points | The four I-5 and ten I-6 choices as rules, with amendment R8-5a (only R may revoke the last active admin key) | room log 4.1 to 4.4, 5, 5.1, 5.2; identity 6.4; keys 4.3, 4.5; README section 7 |
 | Vector notes | `about.notes` now describes `deviceRekey.vetoed` and `deviceRekey.soleDeviceChangeAdmin` (added in I-6), and signatures 9.2 lists both | signatures 9.2; `vectors/` |
+
+### 10.3 Changes after I-7
+
+A fix pass after the I-7 implementation (room host core), 2026-10-29.
+
+| Item | Change | Where |
+|---|---|---|
+| Unsignable statement type | `grant.suspected_theft` renamed to `grant.suspected-theft`: its context `stmt:grant.suspected_theft` was outside the context alphabet, so no key could sign it. The alphabet is unchanged; type names now match `^[a-z0-9.-]+$`, the fold rejects a type outside it with `unsignable_type`, and a unit test checks every catalogue type | room log 4, 4.4, 4.6; signatures 3.2; grants 6.1, 6.3, 6.4; keys 6.2 |
+| Fold failures | Every failure of the fold is a `FoldError` with a reason: `bad_genesis` (seq -1), `unsignable_type`, and `internal_error` for an exception no check anticipated | fold (`fold.ts`, `state.ts`) |
+| Recovery code | `prk2-` + base32 of seed and a 3-byte checksum `H("recovery-code", seed)`, 14 groups of 4; distinct errors for a typo and a wrong key; new hash label; vector `recoveryCode` | identity 5.4, 5.4.1; signatures 3.3, 9.1, 9.2 |
+| I-7 storage | `host/<roomId>/genesis.json` with its hash pinned in the sealed host key file; `admin/<roomId>/state.sealed` for outstanding admin statements; creator device keys in `member/rooms/<roomId>/keys.sealed`; a final log line that parses but fails verification is corruption; `hts` never decreases | identity 7.1; room log 3, 8.1 |

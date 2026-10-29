@@ -8,6 +8,9 @@ import type { RoomGenesis } from "./genesis";
 import type { DeviceEntry, Policy, PolicySetting, RosterEntry } from "./schema";
 
 export type FoldReason =
+  // genesis (seq -1) and unanticipated exceptions (fold.ts)
+  | "bad_genesis"
+  | "internal_error"
   // entry layer (entries.ts)
   | EntryError["reason"]
   // body and statement layer
@@ -16,6 +19,7 @@ export type FoldReason =
   | "bad_body"
   | "type_mismatch"
   | "unknown_type"
+  | "unsignable_type"
   | "bad_statement"
   // chain rules (section 5)
   | "base_not_before_entry"

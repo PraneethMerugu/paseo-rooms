@@ -2150,6 +2150,91 @@ const sNotReduced = (() => {
   check(!verifySig(keys.devSig.pub, "stmt:member.left", rjcsBytes(witness), witnessSig), "witness does not verify as member.left");
 }
 
+// ------------------------------------------------------------------ recovery code (identity-model 5.4.1)
+// "prk2-" + lowercase base32 (RFC 4648, no padding) of seed || H("recovery-code", seed)[0..3],
+// 56 characters in 14 groups of 4. Decoding ignores case, whitespace and hyphens.
+const B32 = "abcdefghijklmnopqrstuvwxyz234567";
+function base32(bytes) {
+  let bits = 0;
+  let acc = 0;
+  let out = "";
+  for (const byte of bytes) {
+    acc = ((acc << 8) | byte) & 0xfff;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += B32[(acc >> bits) & 31];
+    }
+  }
+  if (bits > 0) out += B32[(acc << (5 - bits)) & 31];
+  return out;
+}
+const recoveryCheckOf = (seed) => dhash("recovery-code", seed).subarray(0, 3);
+function recoveryCodeOf(seed) {
+  const body = base32(concat(seed, recoveryCheckOf(seed)));
+  check(body.length === 56, "recovery code body is 56 characters");
+  return `prk2-${body.match(/.{4}/g).join("-")}`;
+}
+/** Returns { seed } or { error } with the error codes of identity-model 5.4.1. */
+function decodeRecovery(code, expectedKid) {
+  const text = code.toLowerCase().replace(/[\s-]/g, "");
+  if (!text.startsWith("prk2")) return { error: "not_recovery_code" };
+  const body = text.slice(4);
+  if (body.length !== 56) return { error: "wrong_length" };
+  const out = [];
+  let bits = 0;
+  let acc = 0;
+  for (const ch of body) {
+    const v = B32.indexOf(ch);
+    if (v < 0) return { error: "bad_character" };
+    acc = ((acc << 5) | v) & 0xfff;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((acc >> bits) & 0xff);
+    }
+  }
+  const bytes = Uint8Array.from(out);
+  const seed = bytes.subarray(0, 32);
+  if (!equalBytes(bytes.subarray(32), recoveryCheckOf(seed))) return { error: "typo" };
+  if (expectedKid !== undefined && kidOf("ed25519", ed25519.getPublicKey(seed)) !== expectedKid) return { error: "wrong_key" };
+  return { seed };
+}
+const recoveryCode = recoveryCodeOf(keys.recovery.seed);
+const recoveryKid = kidOf("ed25519", keys.recovery.pub);
+const recoveryBody = recoveryCode.slice(5).replace(/-/g, "");
+const regroup = (body) => `prk2-${body.match(/.{1,4}/g).join("-")}`;
+const substitute = (body, i, ch) => body.slice(0, i) + ch + body.slice(i + 1);
+const nextB32 = (ch) => B32[(B32.indexOf(ch) + 1) % 32];
+let swapAt = 20;
+while (recoveryBody[swapAt] === recoveryBody[swapAt + 1]) swapAt++;
+const recoveryAccept = [
+  { name: "uppercase", code: recoveryCode.toUpperCase() },
+  { name: "spaces", code: recoveryCode.replace(/-/g, " ") },
+  { name: "noSeparators", code: `prk2${recoveryBody}` },
+];
+const recoveryReject = [
+  { name: "oneCharacterChanged", code: regroup(substitute(recoveryBody, 10, nextB32(recoveryBody[10]))), error: "typo" },
+  {
+    name: "adjacentSwap",
+    code: regroup(recoveryBody.slice(0, swapAt) + recoveryBody[swapAt + 1] + recoveryBody[swapAt] + recoveryBody.slice(swapAt + 2)),
+    error: "typo",
+  },
+  { name: "groupMissing", code: regroup(recoveryBody.slice(0, 52)), error: "wrong_length" },
+  { name: "zeroForO", code: regroup(substitute(recoveryBody, 5, "0")), error: "bad_character" },
+  { name: "wrongPrefix", code: `prk1-${recoveryCode.slice(5)}`, error: "not_recovery_code" },
+  { name: "otherKey", code: recoveryCodeOf(keys.recovery2.seed), error: "wrong_key" },
+];
+{
+  check(equalBytes(decodeRecovery(recoveryCode, recoveryKid).seed, keys.recovery.seed), "recovery code decodes to the seed");
+  for (const a of recoveryAccept) check(equalBytes(decodeRecovery(a.code, recoveryKid).seed ?? new Uint8Array(), keys.recovery.seed), `recovery code accept ${a.name}`);
+  for (const r of recoveryReject) check(decodeRecovery(r.code, recoveryKid).error === r.error, `recovery code reject ${r.name}: expected ${r.error}, got ${decodeRecovery(r.code, recoveryKid).error}`);
+  // Every single-character substitution of the vector code is caught by the checksum.
+  let missed = 0;
+  for (let i = 0; i < 56; i++) for (const ch of B32) if (ch !== recoveryBody[i] && decodeRecovery(`prk2${substitute(recoveryBody, i, ch)}`).error !== "typo") missed++;
+  check(missed === 0, `recovery code: ${missed} single-character substitutions not detected`);
+}
+
 // ------------------------------------------------------------------ output
 const keyTable = Object.fromEntries(
   Object.entries(keys).map(([k, v]) => [
@@ -2198,6 +2283,14 @@ const out = {
   base64url: b64uCases,
   ed25519: { smallOrderPublicKeys: smallOrder, sNotReduced },
   genesis: { signed: genesisSigned, canonical: rjcs(genesisSigned), genesisHash: b64u(genesisHash), roomId },
+  recoveryCode: {
+    seedHex: hex(keys.recovery.seed),
+    kid: recoveryKid,
+    checkHex: hex(recoveryCheckOf(keys.recovery.seed)),
+    code: recoveryCode,
+    accept: recoveryAccept,
+    reject: recoveryReject,
+  },
   invite: { payload: invitePayload, code: inviteCode, inviteRef },
   noise: {
     cacophonyChecks,

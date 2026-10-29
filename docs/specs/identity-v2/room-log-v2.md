@@ -53,7 +53,7 @@ LogEntry = {
   v: 2, typ: "log-entry",
   roomId, seq: <0, 1, 2, ...>,
   prev: b64u(seq == 0 ? genesisHash : entryHash(seq - 1)),
-  hts: <unix ms, host clock, display only>,
+  hts: <unix ms, host clock; never decreases along the chain>,
   epoch: <MLS epoch of the room group after this entry> | null,
   cls: "stmt" | "mls",
   type: <statement type> | "mls.commit" | "mls.app",
@@ -67,10 +67,13 @@ SignedEntry = { entry: LogEntry, hash: b64u(entryHash), hsig: b64u(Sign(hostKey,
 - `bodyBytes` is `RJCS(SignedStatement)` for `cls: "stmt"` and the raw `MLSMessage` bytes for `cls: "mls"`.
 - `prev` of entry 0 is the `genesisHash`, so the chain is anchored to the room's authority.
 - `hostKid` must name a host key that is valid **at this position** (`keys-rotation-recovery.md` section 3). Validity for entries is decided by position only: no entry after the entry carrying `host.key.rotated` or `host.key.revoked` for a key may be signed by that key, whatever its `hts` says (S-15).
+- `hts` is monotonic: the host writes `max(its clock, hts of the previous entry)`, also across restarts (it takes the previous `hts` from the stored log). Holds and the closure delay are measured in `hts` (sections 4.3, 5, 5.2), so a host clock that steps back must not shorten or reverse them. The fold does not reject a decreasing `hts`; it is a host fault, like any other host clock error (section 5).
 - Every `SignedEntry` is a **signed head**: the host commits to the whole chain up to `seq`. There is no separate checkpoint format.
 - **Equivocation proof:** two `SignedEntry` values with the same `roomId` and `seq`, different `hash`, and valid `hsig` under host keys valid at that position. Anyone can verify it without trusting the reporter (vector: `log.equivocationExample`).
 
 ## 4. Event catalogue
+
+Statement type names match `^[a-z0-9.-]+$` (lowercase letters, digits, `.` and `-`; words inside a segment are joined with `-`, never `_`), so the signature context `stmt:<type>` stays inside the context alphabet of `signatures-and-encoding.md` section 3.1. A type that broke this rule could not be signed; the fold rejects such a statement with `unsignable_type`. (`grant.suspected-theft` was first written `grant.suspected_theft`, which broke the rule; renamed after I-7.)
 
 Producer kinds: **A** admin key, **D** device signing key (of the member concerned unless noted), **H** host key, **N** node key, **R** recovery key. "Roster" means the event changes the roster fold (section 5). "Authority" means it changes the authority state.
 
@@ -197,7 +200,7 @@ A request is open for 24 hours of `hts` after its entry and is used at most once
 | `lane.closed` | A, or H after `lane.degraded` for 24 h | `{ laneId }` | Authority; grants revoked |
 | `grant.issued` | H | `{ memberId, deviceId, laneId, gid, exp }` | none |
 | `grant.revoked` | H | `{ gid, reason: "superseded" \| "removed" \| "role_changed" \| "lane_closed" \| "host_key_revoked" }` | none |
-| `grant.suspected_theft` | H | `{ memberId, deviceId, laneId, gid, reportedBy: "endpoint" \| "member" }` | none (alert) |
+| `grant.suspected-theft` | H | `{ memberId, deviceId, laneId, gid, reportedBy: "endpoint" \| "member" }` | none (alert) |
 
 **Lane existence.** `lane.offer.rotated`, `lane.names.changed`, `lane.degraded` and `lane.closed` need a lane that a `lane.created` made and that is not closed (`unknown_lane`, `lane_closed`). A closed lane never reopens; a new lane gets a new `laneId`. Lane lists in `member.admitted`, `member.lanes.changed` and `invite.created` are not checked against the lane table: they may name lanes created later or since closed, and access is decided when a grant is issued (`grants-v2.md`).
 
@@ -231,7 +234,7 @@ These events produce a visible notice in every member's room view, not only an e
 | Authority keys | `admin.added`, `admin.removed`, `admin.key.rotated`, `admin.key.revoked`, `recovery.key.proposed`, `recovery.key.rotated`, `host.key.rotated`, `host.key.revoked`, `endpoint.rotated`, `lane.offer.rotated` |
 | Membership and devices | `member.admitted`, `member.removed`, `member.left`, `member.device.replaced`, `device.added` ("Sam is adding a device; it joins at <time>", and, when the requester is Sam's only device, "Sam has only one device in this room, and it is adding another"), `device.add.vetoed`, `device.add.approved` (with "added by their own device" or "approved by an admin"), `device.removed`, `device.rekeyed` (and, when the requester is Sam's only device, "Sam has only one device in this room, and it is changing its keys"), `device.rekey.vetoed`, `device.rekey.approved`, `device.conflict.resolved`, `device.leaf.repair.requested` ("Sam's laptop asked to repair its membership in *<group>*") |
 | Lane display | `lane.names.changed` |
-| Alerts | `grant.suspected_theft`, `endpoint.evicted`, `mls.stalled`, `lane.degraded`, the detection results of section 6 (`fork`, `truncation`), and a host key, room endpoint or lane offer left **uncertified** by a re-fold (section 5.1, step 9) |
+| Alerts | `grant.suspected-theft`, `endpoint.evicted`, `mls.stalled`, `lane.degraded`, the detection results of section 6 (`fork`, `truncation`), and a host key, room endpoint or lane offer left **uncertified** by a re-fold (section 5.1, step 9) |
 
 The member's own devices additionally get the veto prompt for `device.added` and `device.rekeyed` (`identity-model.md` section 6.3).
 
@@ -471,6 +474,7 @@ What the host still learns: the shape of the room (number of members and devices
 
 ### 8.1 Host
 
+- `host/<roomId>/genesis.json`: the signed genesis as RJCS text. It is public and not sealed; its `genesisHash` is pinned inside the sealed host key file `host/<roomId>/keys.sealed` (`identity-model.md` section 7.1). On open the host recomputes the hash of `genesis.json` and refuses the room if it differs from the pinned value or names another room, so a swapped genesis file is detected even though the file itself is not sealed.
 - `host/<roomId>/log/entries.jsonl`: one line per entry, `RJCS({ entry, hash, hsig })`.
 - `host/<roomId>/log/bodies.jsonl`: one line per body, `RJCS({ seq, body: b64u })`. Statement bodies are also kept in an index for fast folding.
 - Append = write one full line in append mode under the single-writer lock, then flush (`grants-v2.md` section 7.3, platform-specific primitives).
@@ -479,8 +483,10 @@ What the host still learns: the shape of the room (number of members and devices
 
 **Torn lines (C-11).** On load the host reads line by line:
 
-- A final line without a trailing newline, or one that fails to parse, is a torn write: it is moved to `entries.torn.<unix ms>` and the head is the last valid entry. The host logs `log_torn_line` locally. If the torn entry had been acknowledged to anyone, members will report it as truncation, which is the correct outcome.
-- A bad line **before** the last one is corruption: the host stops serving the room and raises an error in the owner UI. It never skips lines.
+- A final line without a trailing newline, or one that fails to parse (not strict RJCS of the expected shape), is a torn write: it is moved to `entries.torn.<unix ms>` (or `bodies.torn.<unix ms>`) and the head is the last valid entry. The host logs `log_torn_line` locally. If the torn entry had been acknowledged to anyone, members will report it as truncation, which is the correct outcome.
+- Complete body lines after the last entry (a crash between the body append and the entry append) are moved aside the same way: they were never acknowledged.
+- A bad line **before** the last one, a gap in `seq`, or an entry without its body is corruption: the host stops serving the room and raises an error in the owner UI. It never skips lines.
+- A final line that parses but then fails verification (entry hash, `hsig`, chain link, body hash, or the fold) is corruption, not a torn write. Only a line that does not parse is attributed to a crash: a crash can cut a line short, but it cannot produce a complete, well-formed line with a wrong hash or signature. The host stops serving the room as above and does not move or truncate that line.
 
 ### 8.2 Member
 

@@ -190,7 +190,7 @@ export const STATEMENT_TYPES = {
     producers: [H],
     data: z.strictObject({ gid: GrantId, reason: z.enum(["superseded", "removed", "role_changed", "lane_closed", "host_key_revoked"]) }),
   },
-  "grant.suspected_theft": {
+  "grant.suspected-theft": {
     producers: [H],
     data: z.strictObject({ memberId: MemberId, deviceId: DeviceId, laneId: LaneId, gid: GrantId, reportedBy: z.enum(["endpoint", "member"]) }),
   },

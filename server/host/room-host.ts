@@ -133,7 +133,7 @@ export const SECURITY_EVENTS: Readonly<Partial<Record<StatementType, SecurityCat
   "device.conflict.resolved": "membership",
   "device.leaf.repair.requested": "membership",
   "lane.names.changed": "lane_display",
-  "grant.suspected_theft": "alert",
+  "grant.suspected-theft": "alert",
   "endpoint.evicted": "alert",
   "mls.stalled": "alert",
   "lane.degraded": "alert",

@@ -10,9 +10,9 @@ import { bodyHash, entryHash, isEquivocationProof, type LogEntry } from "../../s
 import { foldLog, FoldError, RoomLogFold, versionKey, type FoldReason } from "../../server/authority/fold";
 import { GenesisError, verifyGenesis } from "../../server/authority/genesis";
 import { rosterHash } from "../../server/authority/roster";
-import { parseSignedStatement, STATEMENT_TYPE_NAMES, StatementError, verifyStatementSig, type SignedStatement } from "../../server/authority/statements";
+import { parseSignedStatement, STATEMENT_TYPE_NAMES, STATEMENT_TYPES, StatementError, verifyStatementSig, type SignedStatement } from "../../server/authority/statements";
 import { b64u, b64uDecode } from "../../server/proto/b64u";
-import { CTX_KEY_CHANGE_NEW, CTX_LOG_ENTRY, stmtContext } from "../../server/proto/contexts";
+import { CTX_KEY_CHANGE_NEW, CTX_LOG_ENTRY, CTX_RE, isSignableStatementType, STMT_LOG_WITNESS, stmtContext } from "../../server/proto/contexts";
 import { ed25519PrivateKeyFromSeed, verify } from "../../server/proto/keys";
 import { rjcs, rjcsText } from "../../server/proto/rjcs";
 import { sign } from "../../server/proto/tbs";
@@ -139,6 +139,20 @@ test("statements: strict at every level; unknown types and bad field values are 
   assert.equal(STATEMENT_TYPE_NAMES.length, 50);
 });
 
+test("statements: every catalogue type yields a valid stmt:<type> context (signatures 3.1)", () => {
+  for (const type of [...STATEMENT_TYPE_NAMES, STMT_LOG_WITNESS]) {
+    assert.match(type, /^[a-z0-9.-]+$/, type);
+    assert.ok(isSignableStatementType(type), type);
+    const ctx = stmtContext(type);
+    assert.equal(ctx, `stmt:${type}`);
+    assert.ok(CTX_RE.test(ctx), ctx);
+  }
+  assert.ok(STATEMENT_TYPE_NAMES.includes("grant.suspected-theft" as never));
+  // The old name could not be signed: "_" is outside the context alphabet.
+  assert.equal(isSignableStatementType("grant.suspected_theft"), false);
+  assert.throws(() => stmtContext("grant.suspected_theft"), /bad statement type/);
+});
+
 // ---- log.entries, log.rosterAfter ----
 
 test("log.entries: hashes, body hashes and prev links; the fold accepts the main chain", () => {
@@ -252,7 +266,7 @@ const PRODUCER_KIND: Record<string, "admin" | "device" | "host" | "recovery"> = 
 type Built = { signed: { entry: LogEntry; hash: string; hsig: string }; body: Uint8Array; stmt: SignedStatement };
 
 /** Builds the next entry on `fold` (statement base = the fold's head unless given). */
-function build(fold: RoomLogFold, type: string, data: unknown, signer: string, opts: { base?: { seq: number; hash: string }; hts?: number; ts?: number } = {}): Built {
+function build(fold: RoomLogFold, type: string, data: unknown, signer: string, opts: { base?: { seq: number; hash: string }; hts?: number; ts?: number; sigCtx?: string } = {}): Built {
   const head = fold.head;
   const body = {
     v: 2,
@@ -264,7 +278,7 @@ function build(fold: RoomLogFold, type: string, data: unknown, signer: string, o
     ts: opts.ts ?? 1793300000000 + head.seq + 1,
     data,
   };
-  const stmt = { body, sig: b64u(sign(seedKey(signer), stmtContext(type), rjcs(body))) } as SignedStatement;
+  const stmt = { body, sig: b64u(sign(seedKey(signer), opts.sigCtx ?? stmtContext(type), rjcs(body))) } as SignedStatement;
   const bodyBytes = rjcs(stmt);
   const entry: LogEntry = {
     v: 2,
@@ -462,4 +476,46 @@ test("fold: the host's own statements need the host key valid at that position",
   add(fold, build(fold, "mls.stalled", { epoch: 0, sinceMs: 1000 }, "host"));
   assert.equal(fold.head.seq, 5);
   assert.equal(fold.roster().seq, 2, "host statements change no roster");
+});
+
+// ---- every fold failure is a FoldError ----
+
+test("fold: an unsignable catalogue type, an unexpected exception and a bad genesis are FoldErrors with a reason", () => {
+  // A catalogue entry whose stmt:<type> context is outside the alphabet (as grant.suspected_theft was).
+  const catalogue = STATEMENT_TYPES as unknown as Record<string, unknown>;
+  const bad = "grant.bad_type";
+  catalogue[bad] = { producers: ["admin"], data: STATEMENT_TYPES["producer.fence"].data };
+  try {
+    const fold = base4();
+    const b = build(fold, bad, {}, "adminA", { sigCtx: stmtContext("producer.fence") });
+    const before = fold.head;
+    expectFold(() => fold.check(b.signed, b.body), "unsignable_type");
+    expectFold(() => add(fold, b), "unsignable_type");
+    assert.deepEqual(fold.head, before);
+    const res = foldLog(GENESIS, [...mainChain().slice(0, 4), b]);
+    assert.equal(res.error?.reason, "unsignable_type");
+    assert.equal(res.error?.seq, 4);
+  } finally {
+    delete catalogue[bad];
+  }
+
+  // An exception no check anticipated becomes internal_error at that seq; the fold is unchanged.
+  const fold = base4();
+  const next = build(fold, "producer.fence", {}, "adminA");
+  const head = fold.head;
+  fold.hostKeyAt = () => {
+    throw new TypeError("lookup failed");
+  };
+  assert.throws(
+    () => fold.append(next.signed, next.body),
+    (e: unknown) => e instanceof FoldError && e.reason === "internal_error" && e.seq === 4 && /lookup failed/.test(e.message),
+  );
+  assert.deepEqual(fold.head, head);
+
+  // A genesis that does not verify is FoldError(-1, "bad_genesis"), from fromGenesis and foldLog alike.
+  const badGenesis = clone(GENESIS);
+  badGenesis.body.createdAt += 1;
+  for (const fn of [() => RoomLogFold.fromGenesis(badGenesis), () => foldLog(badGenesis, []), () => RoomLogFold.fromGenesis("not a genesis")]) {
+    assert.throws(fn, (e: unknown) => e instanceof FoldError && e.reason === "bad_genesis" && e.seq === -1);
+  }
 });
