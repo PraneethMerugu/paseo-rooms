@@ -25,13 +25,19 @@ import {
   roomsSettingsSet,
 } from "./shared/rpc";
 import {
-  roomsV2DevDescriptor,
-  roomsV2DevDevicePrepare,
-  roomsV2DevMemberAdmit,
-  roomsV2DevMemberRemove,
-  roomsV2DevRoomConnect,
-  roomsV2DevRoomDisconnect,
+  roomsV2InviteCreate,
+  roomsV2InviteRevoke,
+  roomsV2JoinAdmit,
+  roomsV2JoinCancel,
+  roomsV2JoinConfirm,
+  roomsV2JoinDismiss,
+  roomsV2JoinPreview,
+  roomsV2JoinReject,
+  roomsV2JoinStart,
+  roomsV2MemberRemove,
+  roomsV2RoomConnect,
   roomsV2RoomCreate,
+  roomsV2RoomDisconnect,
   roomsV2Status,
 } from "./shared/rpc-v2";
 
@@ -144,7 +150,8 @@ function contributeV2(server: PluginServerContext) {
   log("protocol_v2_enabled", {});
 
   function handle<I extends ZodType, O extends ZodType>(contract: PluginRpcContract<I, O>, fn: (input: ZodOutput<I>) => ZodInput<O> | Promise<ZodInput<O>>): void {
-    server.handle(contract, async (input) => {
+    server.handle(contract, async (input, context) => {
+      rt.attach(context?.paseo);
       try {
         return await fn(input);
       } catch (e) {
@@ -160,12 +167,32 @@ function contributeV2(server: PluginServerContext) {
     return rt.status();
   });
   handle(roomsV2RoomCreate, () => rt.createRoom());
-  handle(roomsV2DevDescriptor, (i) => rt.descriptor(i.roomId));
-  handle(roomsV2DevDevicePrepare, (i) => rt.prepareDevice(i.genesis));
-  handle(roomsV2DevMemberAdmit, (i) => rt.admitDev(i));
-  handle(roomsV2DevMemberRemove, (i) => rt.removeDev(i.roomId, i.memberId));
-  handle(roomsV2DevRoomConnect, (i) => rt.connect(i.roomId));
-  handle(roomsV2DevRoomDisconnect, (i) => {
+  // Owner: invites and join requests (enrollment-v2.md 2.1, 6.3).
+  handle(roomsV2InviteCreate, (i) => rt.createInvite(i));
+  handle(roomsV2InviteRevoke, async (i) => {
+    await rt.revokeInvite(i.roomId, i.inviteId);
+    return { ok: true as const };
+  });
+  handle(roomsV2JoinAdmit, (i) => rt.admitJoin(i.roomId, i.pendingId));
+  handle(roomsV2JoinReject, async (i) => {
+    await rt.rejectJoin(i.roomId, i.pendingId, i.reason);
+    return { ok: true as const };
+  });
+  handle(roomsV2MemberRemove, (i) => rt.removeMember(i.roomId, i.memberId));
+  // Member: preview, join, compare, confirm (2.3, 6.4).
+  handle(roomsV2JoinPreview, (i) => rt.previewJoin(i.code));
+  handle(roomsV2JoinStart, (i) => rt.startJoin(i));
+  handle(roomsV2JoinConfirm, (i) => rt.confirmJoin(i.roomId, i.match));
+  handle(roomsV2JoinCancel, async (i) => {
+    await rt.cancelJoin(i.roomId);
+    return { ok: true as const };
+  });
+  handle(roomsV2JoinDismiss, async (i) => {
+    await rt.dismissJoin(i.roomId);
+    return { ok: true as const };
+  });
+  handle(roomsV2RoomConnect, (i) => rt.connect(i.roomId));
+  handle(roomsV2RoomDisconnect, (i) => {
     rt.disconnect(i.roomId);
     return { ok: true as const };
   });

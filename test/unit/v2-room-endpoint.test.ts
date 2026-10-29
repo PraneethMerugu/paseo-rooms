@@ -422,7 +422,7 @@ test("v2 runtime in-process: switch, relay address rules, owner and member runti
   const mk = (name: string) => {
     const home = join(t.dir, name);
     mkdirSync(home, { mode: 0o700 });
-    return new RoomsRuntimeV2({ PASEO_HOME: home, PASEO_ROOMS_KEYSTORE: "fallback-file", PASEO_ROOMS_RELAY_ENDPOINT: `127.0.0.1:${relay.port}`, PASEO_ROOMS_RELAY_TLS: "false" });
+    return new RoomsRuntimeV2({ PASEO_HOME: home, PASEO_ROOMS_KEYSTORE: "fallback-file", PASEO_ROOMS_RELAY_ENDPOINT: `127.0.0.1:${relay.port}`, PASEO_ROOMS_RELAY_TLS: "false", PASEO_ROOMS_DEV_INSECURE_RELAY: "1" });
   };
   const owner = mk("owner");
   const member = mk("member");
@@ -432,19 +432,32 @@ test("v2 runtime in-process: switch, relay address rules, owner and member runti
     assert.equal(owner.status().keystore?.backend, "fallback-file");
     const { roomId } = await owner.createRoom();
     await until("endpoint online", () => owner.status().owned[0]?.endpoint === "online");
-    const { genesis } = owner.descriptor(roomId);
-    const dev = await member.prepareDevice(genesis);
-    assert.equal(dev.roomId, roomId);
-    assert.equal((await member.connect(roomId)).lastError, "not_authorized", "not in the roster yet");
-    await owner.admitDev(dev);
-    assert.equal((await member.connect(roomId)).status, "open");
+    // Real enrollment (I-9): invite, preview, relay trust, SAS on both sides, confirm, admit.
+    const { code } = await owner.createInvite({ roomId, note: "for Sam" });
+    const preview = await member.previewJoin(code);
+    assert.equal(preview.roomId, roomId);
+    assert.equal(preview.relay.trusted, false, "a loopback relay is never in the default trusted list");
+    await assert.rejects(member.startJoin({ code, label: "Sam laptop" }), /relay you have not used before/);
+    await member.startJoin({ code, label: "Sam laptop", trustRelay: true });
+    const mSas = await until("member SAS", () => member.status().joining[0]?.sas, 5000);
+    const oSas = await until("owner SAS", () => owner.status().owned[0].joinRequests[0]?.sas, 5000);
+    assert.equal(mSas, oSas, "both sides show the same six digits");
+    await member.confirmJoin(roomId, true);
+    const pendingId = owner.status().owned[0].joinRequests[0].pendingId;
+    await until("member confirmed on the host", () => owner.status().owned[0].joinRequests[0].state === "member_ok", 5000);
+    await owner.admitJoin(roomId, pendingId);
+    await until("member session open", () => member.status().joined[0]?.status === "open", 5000);
+    assert.equal(member.status().joining[0].state, "registered", "no lanes: registered at once");
+    await until("member synced", () => member.status().joined[0].head.seq === owner.status().owned[0].head.seq, 5000);
     assert.deepEqual(member.status().joined[0].head, owner.status().owned[0].head);
     assert.equal(owner.status().owned[0].sessions.length, 1);
-    await owner.removeDev(roomId, dev.memberId);
+    assert.equal(owner.status().owned[0].invites[0].state, "used");
+    const memberId = member.status().joined[0].memberId;
+    await owner.removeMember(roomId, memberId);
     await until("member ended", () => member.status().joined[0].status === "ended");
     assert.equal(member.status().joined[0].endedReason, "removed");
     // Nothing secret-looking leaves the runtime in its views.
-    const text = JSON.stringify([owner.status(), member.status(), dev]);
+    const text = JSON.stringify([owner.status(), member.status()]);
     assert.ok(!/seed|secret/i.test(text));
   } finally {
     await member.stop();

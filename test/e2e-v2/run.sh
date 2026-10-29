@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Identity v2 end-to-end test (implementation plan I-8): room endpoint transport and sessions between
-# two disposable Paseo 0.13.2 test daemons running the plugin with PASEO_ROOMS_PROTOCOL=v2.
+# Identity v2 end-to-end test (implementation plan I-8, I-9): room endpoint transport, sessions and SAS
+# enrollment between two disposable Paseo 0.13.2 test daemons running the plugin with
+# PASEO_ROOMS_PROTOCOL=v2. The driver restarts both daemons once, mid-enrollment.
 #
 #   owner  : plugin/.test-homes/v2-owner   127.0.0.1:6921  (room host, room endpoint)
 #   member : plugin/.test-homes/v2-member  127.0.0.1:6922  (member device)
@@ -74,10 +75,12 @@ export PASEO_DICTATION_ENABLED=false PASEO_VOICE_MODE_ENABLED=false
 export PASEO_ROOMS_PROTOCOL=v2 PASEO_ROOMS_KEYSTORE=fallback-file
 unset PASEO_ROOMS_KEK_FILE
 if [ "$LIVE" = 1 ]; then
-  unset PASEO_ROOMS_RELAY_ENDPOINT PASEO_ROOMS_RELAY_TLS     # default: relay.paseo.sh:443 over TLS
+  unset PASEO_ROOMS_RELAY_ENDPOINT PASEO_ROOMS_RELAY_TLS PASEO_ROOMS_DEV_INSECURE_RELAY   # default: relay.paseo.sh:443 over TLS
   echo "== live relay mode: the room endpoint and the member connect to relay.paseo.sh:443 (network)"
 else
-  export PASEO_ROOMS_RELAY_ENDPOINT=127.0.0.1:$RELAY_PORT PASEO_ROOMS_RELAY_TLS=false
+  # The member accepts a loopback, plain-ws relay only with the development flag (P-20); an invite
+  # can never set it. Not exported in live mode.
+  export PASEO_ROOMS_RELAY_ENDPOINT=127.0.0.1:$RELAY_PORT PASEO_ROOMS_RELAY_TLS=false PASEO_ROOMS_DEV_INSECURE_RELAY=1
   echo "== offline mode: fake relay on 127.0.0.1:$RELAY_PORT"
 fi
 
@@ -140,6 +143,6 @@ write_config "$MEMBER" "$MEMBER_PORT"
 for h in "$OWNER" "$MEMBER"; do pa "$h" daemon start --timeout 120 | tail -1; done
 for h in "$OWNER" "$MEMBER"; do pa "$h" plugin install "$PLUGIN_DIR" --json | tail -3; done
 
-E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log \
+E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_PASEO_BIN=$P \
   "${TSX[@]}" "$E2E_DIR/e2e.ts" 2>&1 | tee "$LOGDIR/e2e.log"
 test "${PIPESTATUS[0]}" -eq 0

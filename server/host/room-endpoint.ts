@@ -12,7 +12,9 @@
 //   never confirms, so it is closed by the timer and cannot push the real device off.
 // - Authorization after the handshake (section 4): `rs` an active device DH key -> session operations;
 //   a known but ended device -> `access_ended` with its reason, revealed only now (P-23); anything
-//   else may use only pre-auth operations (I-9) and gets `not_authorized` for any other frame.
+//   else may use only pre-auth operations (enrollment, server/host/enrollment.ts) and gets
+//   `not_authorized` for any other frame. At most 8 sessions of statics that are not active devices
+//   are open at a time (5.4); further ones are closed after message 1.
 // - Served here: session.hello, log.fetch, log.subscribe (pushes `log.entries`), roster.get and
 //   stmt.submit. Later operations of section 4 answer `not_permitted` until their milestone.
 // - A session lasts at most 12 h; ping after 30 s of silence, close after 90 s.
@@ -21,7 +23,7 @@
 // - P-16: repeated eviction of the control socket (a relay "Replaced by new connection" close) is
 //   logged as a host-produced `endpoint.evicted` statement.
 //
-// Not here (later milestones): enrollment (I-9), grants (I-10), rate limits per device (I-9, I-10),
+// Not here (later milestones): grants (I-10), rate limits per active device (I-10),
 // endpoint rotation and `moved` (I-12), MLS operations (I-13).
 import { x25519 } from "@noble/curves/ed25519.js";
 import { RoomLogFold } from "../authority/fold";
@@ -52,6 +54,7 @@ import {
   type RoomErrorCode,
   type RoomSessionTimings,
 } from "../transport/room-session";
+import { EnrollmentHost, type EnrollmentHostOptions, type EnrollSession } from "./enrollment";
 import { readHostKeys, type RoomHost, type SubmitResult } from "./room-host";
 import type { Kek } from "../keystore/keystore";
 
@@ -74,6 +77,10 @@ export interface RoomEndpointOptions {
   /** `endpoint.evicted` after this many control-socket evictions within `evictionWindowS`. */
   evictionThreshold?: number;
   evictionWindowS?: number;
+  /** Concurrent sessions of statics that are not active devices (5.4: 8). */
+  maxPreauthSessions?: number;
+  /** Serve enrollment (pre-auth operations). Without it they get the generic `enroll_rejected`. */
+  enrollment?: Omit<EnrollmentHostOptions, "host" | "afterAppend" | "endpointDh" | "now">;
   now?: () => number;
 }
 
@@ -112,6 +119,7 @@ export class RoomEndpoint {
   private evictions: number[] = [];
   private evictionReported = 0;
   readonly now: () => number;
+  readonly enrollment: EnrollmentHost | null;
 
   constructor(readonly o: RoomEndpointOptions) {
     this.serverId = o.host.state.auth.endpoint.serverId;
@@ -120,6 +128,9 @@ export class RoomEndpoint {
     if (b64u(o.endpointKey.publicKey) !== o.host.state.auth.endpoint.dh.pub) throw new Error("room endpoint key does not match the room's endpoint");
     this.history = RoomLogFold.fromGenesis(o.host.genesis);
     this.catchUp();
+    this.enrollment = o.enrollment
+      ? new EnrollmentHost({ ...o.enrollment, host: o.host, now: this.now, afterAppend: () => this.afterAppend(), endpointDh: () => o.host.state.auth.endpoint.dh.pub })
+      : null;
   }
 
   get host(): RoomHost {
@@ -152,6 +163,7 @@ export class RoomEndpoint {
     this.stopped = true;
     this.status = "closed";
     for (const c of [...this.connections.values()]) c.close(why);
+    this.enrollment?.stop();
     this.control?.stop(1001, "room endpoint stopped");
     log("room_endpoint_stopped", { roomId: this.roomId, why });
   }
@@ -216,6 +228,13 @@ export class RoomEndpoint {
     }
   }
 
+  /** Open sessions (past message 1) whose static is not an active device. */
+  preauthSessions(): number {
+    let n = 0;
+    for (const c of this.connections.values()) if ((c.state === "unconfirmed" || c.state === "open") && c.deviceDh && this.accessOf(c.deviceDh).kind !== "active") n++;
+    return n;
+  }
+
   unregister(conn: RoomConnection): void {
     if (conn.deviceDh && this.live.get(conn.deviceDh) === conn) this.live.delete(conn.deviceDh);
     this.connections.delete(conn.connectionId);
@@ -278,11 +297,13 @@ function devicesByDh(members: Readonly<Record<string, { memberId: string; device
 type ConnState = "handshake" | "unconfirmed" | "open" | "closed";
 
 /** One relay connection: IK responder, then one room session. */
-export class RoomConnection {
+export class RoomConnection implements EnrollSession {
   state: ConnState = "handshake";
   access: DeviceAccess = { kind: "unknown" };
   /** Initiator static (b64u), known after message 1 authenticated. */
   deviceDh: string | null = null;
+  /** Handshake hash `h` (b64u), known after message 2 was written. */
+  h = "";
   private relay: RelayConnection | null = null;
   private hs: NoiseHandshake;
   private crypto: SessionCrypto | null = null;
@@ -353,12 +374,17 @@ export class RoomConnection {
     try {
       this.hs.readMessage(msg);
       reply = this.hs.writeMessage(EMPTY);
+      this.h = b64u(this.hs.handshakeHash());
       const keys = this.hs.split();
       this.crypto = new SessionCrypto(keys.send, keys.receive);
     } catch {
       return this.preauthFail("handshake_failed");
     }
-    this.deviceDh = b64u(this.hs.remoteStatic()!);
+    const dh = b64u(this.hs.remoteStatic()!);
+    if (this.endpoint.accessOf(dh).kind !== "active" && this.endpoint.preauthSessions() >= (this.endpoint.o.maxPreauthSessions ?? 8)) {
+      return this.preauthFail("preauth_sessions_cap");
+    }
+    this.deviceDh = dh;
     this.state = "unconfirmed";
     this.relay!.sendBinary(reply);
     // Key confirmation must follow within the handshake timeout (3.5, S-10).
@@ -396,7 +422,9 @@ export class RoomConnection {
     const access = this.access;
     if (access.kind === "ended") return this.fail("access_ended", frame.id, { reason: access.reason });
     if (PREAUTH_OPS.has(t)) {
-      // Enrollment is I-9. The generic code reveals nothing about invites or state.
+      const enrollment = this.endpoint.enrollment;
+      if (enrollment) return enrollment.handle(this, frame);
+      // Not served on this endpoint. The generic code reveals nothing about invites or state.
       this.endpoint.host.access.record({ event: "preauth_failed", reason: "enrollment_not_served" });
       return this.fail("enroll_rejected", frame.id);
     }
@@ -506,6 +534,30 @@ export class RoomConnection {
     }
     this.send({ t: "stmt.submit.ok", re: frame.id, receipt: res.receipt } as unknown as Frame);
     this.endpoint.afterAppend();
+  }
+
+  // ---- EnrollSession
+  get rs(): string {
+    return this.deviceDh ?? "";
+  }
+
+  isActive(): boolean {
+    return this.access.kind === "active";
+  }
+
+  isOpen(): boolean {
+    return this.state === "open";
+  }
+
+  /** After admission on this session: the device is active from now on (enrollment-v2.md 5.1). */
+  promote(): void {
+    if (this.state !== "open" || this.access.kind === "active") return;
+    const access = this.endpoint.accessOf(this.deviceDh!);
+    if (access.kind !== "active") return;
+    this.access = access;
+    this.endpoint.register(this);
+    this.endpoint.host.access.record({ event: "session.opened", deviceKid: access.sigKid });
+    log("room_session_open", { roomId: this.endpoint.roomId, conn: this.tag, memberId: access.memberId, deviceId: access.deviceId, enrolled: true });
   }
 
   send(frame: Frame): void {

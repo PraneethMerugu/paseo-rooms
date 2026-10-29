@@ -15,7 +15,13 @@
 //   signed. Peer evidence (MLS `log.evidence.request`, I-13) is supplied by the caller.
 // - Section 3.5 timers: ping after 30 s of silence, close after 90 s, reconnect before 12 h.
 //
-// Not here: persistence of the verified copy and receipts (the member journal, I-9), MLS gossip
+// - Enrollment (I-9) uses the same client before the member has the genesis: `target` names the
+//   room and endpoint from the invite; then only `open` and `request` are available, and the
+//   session's handshake hash is `handshakeHash`. Frames the host pushes outside a reply
+//   (`enroll.admitted`, `enroll.closed`) go to `onPush`.
+//
+// Not here: persistence of the verified copy, maxSignedHead and receipts (not yet in the member
+// journal; truncation is detected within one process lifetime only), MLS gossip
 // transport (I-13), and the UI for alerts (I-14). Alerts are kept in memory and passed to `onAlert`.
 import WebSocket from "ws";
 import { z } from "zod";
@@ -26,7 +32,8 @@ import { log } from "../log";
 import { NOISE_MAX_MESSAGE_BYTES } from "../noise/cipher-state";
 import type { NoiseHandshake, NoiseKeyPair } from "../noise/handshake-state";
 import { createRoomIkInitiator, type RoomEndpointBinding } from "../noise/prologue";
-import { b64uDecode, b64uDecodeVar } from "../proto/b64u";
+import { b64u, b64uDecode, b64uDecodeVar } from "../proto/b64u";
+import { roomIdOf } from "../proto/ids";
 import type { Frame } from "../transport/records";
 import { relayClientUrl, type RelayAddress } from "../transport/relay-server";
 import {
@@ -72,8 +79,12 @@ export class RoomSessionError extends Error {
 }
 
 export interface RoomClientOptions {
-  /** The room's signed genesis (from the invite; verified here). */
-  genesis: RoomGenesis | Uint8Array;
+  /** The room's signed genesis (verified here). Absent only while enrolling (`target`). */
+  genesis?: RoomGenesis | Uint8Array;
+  /** Enrollment before the genesis is known: the room and endpoint named by the invite. */
+  target?: { genesisHash: string; endpoint: { serverId: string; dh: { pub: string } } };
+  /** Frames the host pushes outside a reply (enrollment). */
+  onPush?(frame: Frame): void;
   /** This device's X25519 key pair (the roster's `dh`). */
   device: NoiseKeyPair;
   /** Where the relay is reached. */
@@ -122,7 +133,9 @@ export class RoomClient {
   readonly alerts: RoomAlert[] = [];
   /** Set by fork, truncation and invalid_entry: stop sending application messages, keep reading (6.6). */
   sendingStopped = false;
-  private readonly fold: RoomLogFold;
+  private readonly fold: RoomLogFold | null;
+  /** Handshake hash `h` of the current session (b64u), set once the handshake completed. */
+  handshakeHash: string | null = null;
   private readonly chain: SignedEntry[] = [];
   /** No further entries are processed after an invalid one (6.6). */
   private processingStopped = false;
@@ -135,17 +148,23 @@ export class RoomClient {
   private readonly now: () => number;
 
   constructor(private readonly o: RoomClientOptions) {
-    const v = verifyGenesis(o.genesis);
-    this.roomId = v.roomId;
-    this.genesisHash = v.genesisHash;
-    this.fold = RoomLogFold.fromGenesis(v.genesis);
+    if (o.genesis) {
+      const v = verifyGenesis(o.genesis);
+      this.roomId = v.roomId;
+      this.genesisHash = v.genesisHash;
+      this.fold = RoomLogFold.fromGenesis(v.genesis);
+    } else if (o.target) {
+      this.genesisHash = o.target.genesisHash;
+      this.roomId = roomIdOf(b64uDecode(o.target.genesisHash, 32));
+      this.fold = null;
+    } else throw new Error("room client needs a genesis or an enrollment target");
     this.timings = resolveTimings(o.timings);
     this.now = o.now ?? Date.now;
   }
 
   /** Own verified head: `{-1, genesisHash}` before the first entry. */
   get head(): { seq: number; hash: string } {
-    return this.fold.head;
+    return this.fold ? this.fold.head : { seq: -1, hash: this.genesisHash };
   }
 
   /** Highest signed entry this member verified. */
@@ -154,7 +173,12 @@ export class RoomClient {
   }
 
   get state() {
-    return this.fold.state;
+    return this.requireFold().state;
+  }
+
+  private requireFold(): RoomLogFold {
+    if (!this.fold) throw new Error("room client: no genesis yet (enrollment session)");
+    return this.fold;
   }
 
   entry(seq: number): SignedEntry | undefined {
@@ -169,6 +193,7 @@ export class RoomClient {
     this.lastErrorFields = {};
     try {
       await this.handshake();
+      this.status = "open";
     } catch (err) {
       this.close();
       throw err;
@@ -178,6 +203,7 @@ export class RoomClient {
   /** Opens the session, compares heads, syncs the log and subscribes. Rejects with RoomSessionError. */
   async connect(): Promise<HelloOk> {
     if (this.status === "connecting" || this.status === "open") throw new Error("room client already connected");
+    this.requireFold();
     this.status = "connecting";
     this.lastError = null;
     this.lastErrorFields = {};
@@ -279,7 +305,8 @@ export class RoomClient {
   // ------------------------------------------------------------------------------- internals
 
   private handshake(): Promise<void> {
-    const auth = this.fold.state.auth.endpoint;
+    const auth = this.fold ? this.fold.state.auth.endpoint : this.o.target!.endpoint;
+    this.handshakeHash = null;
     const binding: RoomEndpointBinding = this.o.bindingOverride ?? { genesisHash: b64uDecode(this.genesisHash, 32), serverId: auth.serverId };
     let hs: NoiseHandshake;
     try {
@@ -314,6 +341,7 @@ export class RoomClient {
           if (!isBinary || bytes.byteLength !== IK_MESSAGE2_BYTES) return finish(new RoomSessionError("handshake_failed"));
           try {
             hs.readMessage(bytes);
+            this.handshakeHash = b64u(hs.handshakeHash());
             const keys = hs.split();
             this.crypto = new SessionCrypto(keys.send, keys.receive);
           } catch {
@@ -359,7 +387,9 @@ export class RoomClient {
       this.pending.delete(frame.re!);
       clearTimeout(p.timer);
       p.resolve(frame);
+      return;
     }
+    if (frame.re === undefined) this.o.onPush?.(frame);
   }
 
   private onError(frame: Frame): void {
@@ -466,7 +496,7 @@ export class RoomClient {
       if (this.processingStopped) return;
       const seq = this.head.seq + 1;
       try {
-        this.fold.append(e, bodies.get(seq));
+        this.requireFold().append(e, bodies.get(seq));
       } catch (err) {
         if (!(err instanceof FoldError)) throw err;
         this.processingStopped = true;
@@ -485,7 +515,7 @@ export class RoomClient {
   /** A signed entry with a correct hash and a valid hsig by a host key valid at `seq` (own fold's view). */
   private validAt(value: unknown, seq: number): boolean {
     try {
-      return verifySignedEntry(value, this.fold.hostKeyAt).entry.seq === seq;
+      return verifySignedEntry(value, this.requireFold().hostKeyAt).entry.seq === seq;
     } catch {
       return false;
     }
@@ -503,7 +533,7 @@ export class RoomClient {
   }
 
   private raiseFork(seq: number, a: SignedEntry, b: SignedEntry, peer?: { memberId: string; deviceId: string }): PeerHeadResult {
-    if (!isEquivocationProof(a, b, this.fold.hostKeyAt)) return "unverified_head_claim";
+    if (!isEquivocationProof(a, b, this.requireFold().hostKeyAt)) return "unverified_head_claim";
     this.raise({ type: "fork", roomId: this.roomId, seq, at: this.now(), proof: [a, b], ...(peer ? { peer } : {}) });
     return "fork";
   }
@@ -522,5 +552,6 @@ export class RoomClient {
 }
 
 function isReply(frame: Frame): boolean {
-  return typeof frame.re === "number" && frame.t.endsWith(".ok");
+  // `.ok` replies, and `enroll.pending`, the reply to `enroll.request` (enrollment-v2.md 5.2).
+  return typeof frame.re === "number" && (frame.t.endsWith(".ok") || frame.t === "enroll.pending");
 }
