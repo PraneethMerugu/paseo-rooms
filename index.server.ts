@@ -5,6 +5,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { registerAgentGuard } from "./server/gateway/agent-guard";
 import { log } from "./server/log";
 import { RoomsRuntime } from "./server/runtime";
+import { roomsProtocol, RoomsRuntimeV2 } from "./server/runtime-v2";
 import {
   roomsBootstrap,
   roomsCreate,
@@ -23,10 +24,22 @@ import {
   roomsRotate,
   roomsSettingsSet,
 } from "./shared/rpc";
+import {
+  roomsV2DevDescriptor,
+  roomsV2DevDevicePrepare,
+  roomsV2DevMemberAdmit,
+  roomsV2DevMemberRemove,
+  roomsV2DevRoomConnect,
+  roomsV2DevRoomDisconnect,
+  roomsV2RoomCreate,
+  roomsV2Status,
+} from "./shared/rpc-v2";
 
 const VERSION = "0.1.0";
 
 export default function contribute(server: PluginServerContext) {
+  // Development switch (decision D-2), read once at start. Unset: the M1 runtime, unchanged.
+  if (roomsProtocol() === "v2") return contributeV2(server);
   const rt = new RoomsRuntime();
   rt.start();
 
@@ -117,6 +130,47 @@ export default function contribute(server: PluginServerContext) {
     removeGuard();
     removeOpen();
     removeArchived();
+    await rt.stop();
+  };
+}
+
+/**
+ * Identity v2 development runtime (PASEO_ROOMS_PROTOCOL=v2; I-8 to I-15). Only the v2 RPCs are
+ * registered; the M1 runtime, its RPCs and its hooks are not started.
+ */
+function contributeV2(server: PluginServerContext) {
+  const rt = new RoomsRuntimeV2();
+  void rt.start();
+  log("protocol_v2_enabled", {});
+
+  function handle<I extends ZodType, O extends ZodType>(contract: PluginRpcContract<I, O>, fn: (input: ZodOutput<I>) => ZodInput<O> | Promise<ZodInput<O>>): void {
+    server.handle(contract, async (input) => {
+      try {
+        return await fn(input);
+      } catch (e) {
+        log("rpc_failed", { method: contract.name, error: (e as Error).message?.slice(0, 200) });
+        throw e;
+      }
+    });
+  }
+
+  handle(roomsBootstrap, () => ({ ok: true as const, version: VERSION, dataDir: "plugin-data/rooms" as const }));
+  handle(roomsV2Status, async () => {
+    await rt.start();
+    return rt.status();
+  });
+  handle(roomsV2RoomCreate, () => rt.createRoom());
+  handle(roomsV2DevDescriptor, (i) => rt.descriptor(i.roomId));
+  handle(roomsV2DevDevicePrepare, (i) => rt.prepareDevice(i.genesis));
+  handle(roomsV2DevMemberAdmit, (i) => rt.admitDev(i));
+  handle(roomsV2DevMemberRemove, (i) => rt.removeDev(i.roomId, i.memberId));
+  handle(roomsV2DevRoomConnect, (i) => rt.connect(i.roomId));
+  handle(roomsV2DevRoomDisconnect, (i) => {
+    rt.disconnect(i.roomId);
+    return { ok: true as const };
+  });
+
+  return async () => {
     await rt.stop();
   };
 }

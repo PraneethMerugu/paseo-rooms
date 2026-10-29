@@ -2,3 +2,4 @@ node_modules/
 .test-homes/
 test/e2e/logs/*.log
 test/e2e/scratch/
+test/e2e-v2/logs/

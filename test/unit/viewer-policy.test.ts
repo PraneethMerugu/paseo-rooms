@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import * as messages from "@getpaseo/protocol/messages";
 import { generateEd25519, signEd25519 } from "../../server/crypto";
-import { LaneEndpoint, LinkSession, RelayConnection } from "../../server/gateway/lane-endpoint";
+import { LaneEndpoint, LinkSession, LaneConnection } from "../../server/gateway/lane-endpoint";
 import { LaneErrorLog } from "../../server/gateway/lane-errors";
 import { Gateway } from "../../server/gateway/gateway";
 import { HostStore } from "../../server/host/host-store";
@@ -230,13 +230,13 @@ test("errors: plugin RPCs (rooms.lane.errors) are not reachable through a lane",
 // ------------------------------------------------------------------ through a real route (fake daemon)
 
 let fake: FakeDaemon;
-const realStart = RelayConnection.prototype.start;
+const realStart = LaneConnection.prototype.start;
 before(async () => {
   fake = await startFakeDaemon();
-  RelayConnection.prototype.start = function () {};
+  LaneConnection.prototype.start = function () {};
 });
 after(async () => {
-  RelayConnection.prototype.start = realStart;
+  LaneConnection.prototype.start = realStart;
   await fake.close();
 });
 
@@ -257,7 +257,7 @@ function enroll(host: HostStore, laneId: string) {
 }
 
 async function openViewer(ep: LaneEndpoint, token: string) {
-  const conn = new RelayConnection(ep, "c1");
+  const conn = new LaneConnection(ep, "c1");
   const sent: any[] = [];
   conn.send = (f: unknown) => void sent.push(f);
   ep.connections.set("c1", conn);

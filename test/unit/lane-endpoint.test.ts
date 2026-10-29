@@ -1,10 +1,10 @@
 // B1 and B3 at the lane endpoint, plus C-13 and the C-iso2 start check. Uses a fake loopback daemon
-// (test/unit/fake-daemon.ts); relay sockets are never opened (RelayConnection.start is stubbed).
+// (test/unit/fake-daemon.ts); relay sockets are never opened (LaneConnection.start is stubbed).
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { after, before, test } from "node:test";
 import { generateEd25519, signEd25519 } from "../../server/crypto";
-import { LaneEndpoint, LinkSession, RelayConnection } from "../../server/gateway/lane-endpoint";
+import { LaneEndpoint, LinkSession, LaneConnection } from "../../server/gateway/lane-endpoint";
 import { HostStore } from "../../server/host/host-store";
 import { decodeInviteCode } from "../../server/invite-code";
 import { DEFAULT_LIMITS, resolveLimits, LIMIT_BOUNDS, type ResourceLimits } from "../../server/limits";
@@ -12,13 +12,13 @@ import { startFakeDaemon, waitFor, type FakeDaemon } from "./fake-daemon";
 import { tempDir } from "./helpers";
 
 let fake: FakeDaemon;
-const realStart = RelayConnection.prototype.start;
+const realStart = LaneConnection.prototype.start;
 before(async () => {
   fake = await startFakeDaemon();
-  RelayConnection.prototype.start = function () {};
+  LaneConnection.prototype.start = function () {};
 });
 after(async () => {
-  RelayConnection.prototype.start = realStart;
+  LaneConnection.prototype.start = realStart;
   await fake.close();
 });
 
@@ -48,7 +48,7 @@ function enroll(host: HostStore, laneId: string) {
 }
 
 async function link(ep: LaneEndpoint, id: string, grant: string) {
-  const conn = new RelayConnection(ep, id);
+  const conn = new LaneConnection(ep, id);
   const sent: any[] = [];
   conn.send = (f: unknown) => void sent.push(f);
   ep.connections.set(id, conn);

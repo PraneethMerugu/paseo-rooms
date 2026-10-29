@@ -12,8 +12,7 @@
 // at its grant's exp. No polling.
 import { createHash, randomBytes } from "node:crypto";
 import WebSocket from "ws";
-import { openDaemonSecureChannel, SecureChannelRejectedError, importPublicKey, importSecretKey, type SecureChannel, type Transport } from "@getpaseo/relay/e2ee";
-import { buildRelayWebSocketUrl } from "@getpaseo/protocol/daemon-endpoints";
+import { openDaemonSecureChannel, SecureChannelRejectedError, importPublicKey, importSecretKey, type SecureChannel } from "@getpaseo/relay/e2ee";
 import type { GrantClaims, Lane } from "../../shared/schemas";
 import { clip, log, logError, LogLimiter, short } from "../log";
 import type { HostStore } from "../host/host-store";
@@ -45,6 +44,7 @@ import {
 import { LaneErrorLog } from "./lane-errors";
 import { buildUpstreamHello, openDaemonSocket, RawDaemon } from "./local-daemon";
 import { handleControlChannel } from "./control-server";
+import { MAX_CONNECTION_ID_CHARS, parseRelayNotice, RelayConnection, RelayControlSocket, relayServerUrl } from "../transport/relay-server";
 
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const FIRST_FRAME_TIMEOUT_MS = 15_000;
@@ -77,17 +77,15 @@ const denyLog = new LogLimiter(20, 20);
 
 export class LaneEndpoint {
   status: EndpointStatus = "starting";
-  private control: WebSocket | null = null;
-  private keepalive: ReturnType<typeof setInterval> | null = null;
+  private control: RelayControlSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
-  private reconnectDelay = 1000;
   private startDelay = START_RETRY_MIN_MS;
   private startFailures = 0;
   private missingSeen: number[] = [];
   /** Why the lane cannot start (isolation tripwire, profile assertion), or null. */
   blockedReason: string | null = null;
-  readonly connections = new Map<string, RelayConnection>();
+  readonly connections = new Map<string, LaneConnection>();
   scope: LaneScope;
   upstreamVersion = "0.0.0";
   readonly directory: LaneDirectory;
@@ -181,14 +179,7 @@ export class LaneEndpoint {
   }
 
   relayUrl(connectionId?: string): string {
-    return buildRelayWebSocketUrl({
-      endpoint: this.lane.relay.endpoint,
-      useTls: this.lane.relay.useTls,
-      serverId: this.lane.serverId,
-      role: "server",
-      version: "2",
-      ...(connectionId ? { connectionId } : {}),
-    });
+    return relayServerUrl(this.lane.relay, this.lane.serverId, connectionId);
   }
 
   keyPair() {
@@ -281,47 +272,32 @@ export class LaneEndpoint {
 
   private connectControl(): void {
     if (this.stopped) return;
-    const ws = new WebSocket(this.relayUrl(), { perMessageDeflate: false, maxPayload: this.limits.maxInboundFrameBytes });
-    this.control = ws;
-    ws.on("open", () => {
-      this.status = "online";
-      this.reconnectDelay = 1000;
-      log("lane_relay_online", { laneId: this.lane.id, serverId: short(this.lane.serverId) });
-      this.keepalive = setInterval(() => ws.readyState === WebSocket.OPEN && ws.ping(), 20_000);
+    // Control socket, keepalive and reconnects: server/transport/relay-server.ts (same behaviour as M1).
+    this.control = new RelayControlSocket({
+      url: () => this.relayUrl(),
+      maxPayload: this.limits.maxInboundFrameBytes,
+      logPrefix: "lane",
+      logFields: { laneId: this.lane.id },
+      serverId: this.lane.serverId,
+      onNotice: (msg) => this.onRelayControl(msg),
+      onStatus: (status) => {
+        this.status = status;
+      },
     });
-    ws.on("message", (raw) => {
-      let msg: any;
-      try {
-        msg = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-      if (msg.type === "ping") return void ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
-      this.onRelayControl(msg);
-    });
-    ws.on("close", (code) => {
-      if (this.keepalive) clearInterval(this.keepalive);
-      this.keepalive = null;
-      if (this.stopped) return;
-      this.status = "offline";
-      log("lane_relay_closed", { laneId: this.lane.id, code });
-      this.reconnectTimer = setTimeout(() => this.connectControl(), this.reconnectDelay);
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30_000);
-    });
-    ws.on("error", (err) => log("lane_relay_error", { laneId: this.lane.id, error: clip(err.message, 200) }));
+    this.control.connect();
   }
 
   /** Relay control-socket notices: new data connections (capped per lane) and disconnects. */
   onRelayControl(msg: any): void {
-    if (msg?.type === "disconnected" && typeof msg.connectionId === "string") this.connections.get(msg.connectionId)?.close("relay_disconnected");
-    const ids: unknown[] = msg?.type === "sync" ? (Array.isArray(msg.connectionIds) ? msg.connectionIds : []) : msg?.type === "connected" ? [msg.connectionId] : [];
-    for (const id of ids) {
-      if (typeof id !== "string" || !id || id.length > 256 || this.connections.has(id) || this.stopped) continue;
+    const notice = parseRelayNotice(msg);
+    if (notice.disconnected !== null) this.connections.get(notice.disconnected)?.close("relay_disconnected");
+    for (const id of notice.announced) {
+      if (typeof id !== "string" || !id || id.length > MAX_CONNECTION_ID_CHARS || this.connections.has(id) || this.stopped) continue;
       if (this.connections.size >= this.limits.maxConnectionsPerLane) {
         denyLog.log(`lane:${this.lane.id}:conn_cap`, "lane_connection_cap", { laneId: this.lane.id, open: this.connections.size, max: this.limits.maxConnectionsPerLane });
         continue;
       }
-      const conn = new RelayConnection(this, id);
+      const conn = new LaneConnection(this, id);
       this.connections.set(id, conn);
       conn.start();
     }
@@ -346,24 +322,24 @@ export class LaneEndpoint {
     this.stopped = true;
     this.status = "closed";
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    if (this.keepalive) clearInterval(this.keepalive);
     for (const c of this.connections.values()) {
       c.link?.cut(why);
       c.close(why);
     }
     this.directory.close();
     this.routeSlots.clear();
-    try {
-      this.control?.close(1001, "lane endpoint stopped");
-    } catch {}
+    this.control?.stop(1001, "lane endpoint stopped");
     log("lane_endpoint_stopped", { laneId: this.lane.id, why });
   }
 }
 
 // -------------------------------------------------------------------------------------------------
-/** One relay data socket after the Noise handshake. Becomes a host link or a control channel. */
-export class RelayConnection {
-  private ws: WebSocket | null = null;
+/**
+ * One relay data socket (server/transport/relay-server.ts RelayConnection) after the Noise NK
+ * handshake. Becomes a host link or a control channel.
+ */
+export class LaneConnection {
+  private relay: RelayConnection | null = null;
   channel: SecureChannel | null = null;
   link: LinkSession | null = null;
   private mode: "pending" | "link" | "control" = "pending";
@@ -378,48 +354,41 @@ export class RelayConnection {
   }
 
   start(): void {
-    const ws = new WebSocket(this.endpoint.relayUrl(this.connectionId), { perMessageDeflate: false, maxPayload: this.endpoint.limits.maxInboundFrameBytes });
-    this.ws = ws;
-    const transport: Transport = {
-      send: (data) => new Promise<void>((resolve, reject) => ws.send(data, (err) => (err ? reject(err) : resolve()))),
-      close: (code, reason) => ws.close(code, reason),
-      onmessage: null,
-      onclose: null,
-      onerror: null,
-    };
-    ws.on("message", (data, isBinary) => {
-      const payload = isBinary ? new Uint8Array(data as Buffer).slice().buffer : (data as Buffer).toString("utf8");
-      transport.onmessage?.({ data: payload, isBinary });
-    });
-    ws.on("close", (code, reason) => {
-      transport.onclose?.(code, reason.toString());
-      this.close("data_socket_closed");
-    });
-    ws.on("error", (err) => transport.onerror?.(err));
-    ws.on("open", async () => {
-      const timer = setTimeout(() => ws.terminate(), HANDSHAKE_TIMEOUT_MS);
-      try {
-        this.channel = await openDaemonSecureChannel(transport, {
-          daemonKeyPair: this.endpoint.keyPair(),
-          minimumMode: "protected",
-          events: {
-            onmessage: (data) => this.onMessage(data),
-            onclose: () => this.close("channel_closed"),
-            onerror: (err) => log("lane_channel_error", { conn: this.tag, error: clip(err.message, 200) }),
-          },
-        });
-        clearTimeout(timer);
-        this.firstFrameTimer = setTimeout(() => this.mode === "pending" && this.close("first_frame_timeout"), FIRST_FRAME_TIMEOUT_MS);
-      } catch (err) {
-        clearTimeout(timer);
-        if (err instanceof SecureChannelRejectedError) {
-          log("lane_e2ee_rejected", { conn: this.tag, reason: clip(err.message, 200) });
-          ws.close(err.closeCode, err.closeReason);
-        } else {
-          log("lane_e2ee_failed", { conn: this.tag, error: clip((err as Error).message, 200) });
-          ws.close(1011, "E2EE handshake failed");
+    const rc = new RelayConnection(this.endpoint.relayUrl(this.connectionId), this.endpoint.limits.maxInboundFrameBytes);
+    this.relay = rc;
+    const transport = rc.transport();
+    rc.open({
+      onMessage: (payload, isBinary) => transport.onmessage?.({ data: payload, isBinary }),
+      onClose: (code, reason) => {
+        transport.onclose?.(code, reason);
+        this.close("data_socket_closed");
+      },
+      onError: (err) => transport.onerror?.(err),
+      onOpen: async () => {
+        const timer = setTimeout(() => rc.terminate(), HANDSHAKE_TIMEOUT_MS);
+        try {
+          this.channel = await openDaemonSecureChannel(transport, {
+            daemonKeyPair: this.endpoint.keyPair(),
+            minimumMode: "protected",
+            events: {
+              onmessage: (data) => this.onMessage(data),
+              onclose: () => this.close("channel_closed"),
+              onerror: (err) => log("lane_channel_error", { conn: this.tag, error: clip(err.message, 200) }),
+            },
+          });
+          clearTimeout(timer);
+          this.firstFrameTimer = setTimeout(() => this.mode === "pending" && this.close("first_frame_timeout"), FIRST_FRAME_TIMEOUT_MS);
+        } catch (err) {
+          clearTimeout(timer);
+          if (err instanceof SecureChannelRejectedError) {
+            log("lane_e2ee_rejected", { conn: this.tag, reason: clip(err.message, 200) });
+            rc.close(err.closeCode, err.closeReason);
+          } else {
+            log("lane_e2ee_failed", { conn: this.tag, error: clip((err as Error).message, 200) });
+            rc.close(1011, "E2EE handshake failed");
+          }
         }
-      }
+      },
     });
   }
 
@@ -504,9 +473,7 @@ export class RelayConnection {
     try {
       this.channel?.close(1000, "closed");
     } catch {}
-    try {
-      this.ws?.close();
-    } catch {}
+    this.relay?.close();
     this.endpoint.connections.delete(this.connectionId);
     denyLog.forget(`conn:${this.connectionId}`);
   }
@@ -524,7 +491,7 @@ export class LinkSession {
   private readonly openedAt = Date.now();
   readonly rate: TokenBucket;
 
-  constructor(readonly conn: RelayConnection) {
+  constructor(readonly conn: LaneConnection) {
     this.rate = new TokenBucket(conn.endpoint.limits.linkFramesPerSecond, conn.endpoint.limits.linkFrameBurst);
   }
 
