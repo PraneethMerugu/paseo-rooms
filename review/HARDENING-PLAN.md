@@ -184,3 +184,11 @@ After Spike A (`spikes/security/RESULTS.md`):
 1. **`prevSig` removed entirely** (not limited to `joinGroup`), as the revised MLS spec has it.
 2. **Subgroups and pending adds:** options (b) and (c) of `mls-integration.md` section 4.4. Any scope device may commit an Add of a leaf the signed roster already contains (b), and roster equality tolerates pending adds that have no leaf yet (c, answers Q7). `kp.fetch` opens to scope devices, still under the per-device rate cap.
 3. **Test budget:** up to 20 small Claude Haiku calls for e2e runs on test daemons before asking again. Count tracked in `test/e2e/HAIKU-BUDGET.md`.
+
+## Decisions, round 8 (user approved, 2026-10-29)
+
+1. **Dead leaves:** the affected device may sign a request for its own leaf replacement, which any leaf of the group may carry out. New signed statement type.
+2. **Joiner fork check:** after joining, a device compares a hash of its epoch authenticator with the value other members anchor in the room log, and raises an alarm on mismatch.
+3. **Retired keys never return to use,** including host keys, even when a re-fold voids the rotation that retired them. The room then needs a fresh statement from a valid admin.
+4. **Revocation nesting is capped** in the spec (for example, depth 8), and the implementation's re-fold cost must grow linearly, not exponentially.
+5. **Silent points:** the four I-5 choices and the other ten I-6 choices are written into the specs as rules.
