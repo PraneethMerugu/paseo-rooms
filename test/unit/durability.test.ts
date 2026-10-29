@@ -13,7 +13,8 @@ import { HostStore, REVOKED_GRANT_RETENTION_S } from "../../server/host/host-sto
 import { decodeInviteCode } from "../../server/invite-code";
 import { clip, LogLimiter } from "../../server/log";
 import { MemberRole } from "../../server/member/member";
-import { fileMode, writePrivateFile } from "../../server/paths";
+import { writePrivateFile } from "../../server/paths";
+import { defaultProtection } from "../../server/platform/file-protection";
 import { tempDir } from "./helpers";
 
 function setup(nowRef = { t: Date.parse("2026-10-28T12:00:00Z") }) {
@@ -86,7 +87,7 @@ test("durable writes leave no temp files and keep 0600", () => {
     writePrivateFile(p, '{"a":1}');
     assert.equal(readFileSync(p, "utf8"), '{"a":1}');
     assert.deepEqual(readdirSync(join(tmp.dir, "x")), ["state.json"]);
-    assert.equal(fileMode(p), 0o600);
+    assert.deepEqual(defaultProtection().verify(p), { ok: true });
   } finally {
     tmp.cleanup();
   }

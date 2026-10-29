@@ -6,7 +6,7 @@ import { ensureInertMcp, isInertMcp, restrictRoomAgentConfig } from "../../serve
 import { HostStore } from "../../server/host/host-store";
 import { decodeInviteCode } from "../../server/invite-code";
 import { __testing } from "../../server/log";
-import { fileMode } from "../../server/paths";
+import { defaultProtection } from "../../server/platform/file-protection";
 import { tempDir } from "./helpers";
 
 test("logger redacts secret fields and token-shaped values", () => {
@@ -23,10 +23,10 @@ test("host files are 0600 in 0700 directories; invite code round-trips", () => {
     const room = host.createRoom("Lab");
     const lane = host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "a" }, agentId: "a", workspaceId: "w" });
     const { code, invite } = host.createInvite({ laneId: lane.id, ttlSeconds: 600, grantTtlSeconds: 3600 });
-    assert.equal(fileMode(join(tmp.dir, "gateway")), 0o700);
-    assert.equal(fileMode(join(tmp.dir, "gateway", "host-key.json")), 0o600);
-    assert.equal(fileMode(join(tmp.dir, "gateway", "state.json")), 0o600);
-    assert.equal(fileMode(join(tmp.dir, "gateway", "rooms", room.id, "events.jsonl")), 0o600);
+    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway")), { ok: true });
+    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway", "host-key.json")), { ok: true });
+    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway", "state.json")), { ok: true });
+    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway", "rooms", room.id, "events.jsonl")), { ok: true });
     const payload = decodeInviteCode(code);
     assert.equal(payload.laneId, lane.id);
     assert.equal(payload.offer.serverId, lane.serverId);
@@ -51,7 +51,7 @@ test("room agent guard shadows Paseo's MCP with an inert non-HTTP server and dro
     assert.equal(out.mcpServers.paseo.type, "stdio");
     assert.equal(out.toolPolicy, undefined);
     assert.ok(out.mcpServers.other, "other servers are kept");
-    assert.equal(fileMode(inert.args[0]), 0o600);
+    assert.deepEqual(defaultProtection().verify(inert.args[0]), { ok: true });
   } finally {
     tmp.cleanup();
   }

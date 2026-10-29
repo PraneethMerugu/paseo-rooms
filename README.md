@@ -30,6 +30,7 @@ Design source: `../research/rooms-architecture.md`. Status, evidence and deviati
 | `server/gateway/local-daemon.ts` | server | Loopback upstream with `hello.sessionPermissions` | 8.2 (defence in depth) |
 | `server/host/host-store.ts` | server | Embedded host: members, grants, invites, revocation, change push | 5, 8.1 |
 | `server/host/event-log.ts` | server | Hash-chained, host-signed room log | 3, 8.3 |
+| `server/platform/` | server | Identity v2 file layer (I-2): daemon-identical home resolution, owner-only `FileProtection` (POSIX modes; win32 DACL via `icacls`/PowerShell, untested on Windows), durable writes, room log writer lock. `server/paths.ts` wraps it for M1 | 10 (cross-platform) |
 | `server/member/member.ts` | server | Member role: join, `hosts.add/update/remove`, `hosts.observe`, rotation | 8.2 native app path |
 | `server/member/control-client.ts` | server | Member side of the control protocol | 8.2 |
 | `client/` | app | Rooms screen, Open room screen, sidebar item, composer pills | 5 (Rooms UI) |
@@ -66,6 +67,7 @@ Runtime dependencies (`@getpaseo/relay`, `@getpaseo/protocol`, `ws`) are bundled
 - `field-policy.test.ts`: field conformance gate (fails on any unreviewed or stale field); upstream hello built from scratch; leakage tests with realistic agent and workspace descriptors; sanitised messages still parse with the protocol schema; prompting types denied on owner-uid lanes.
 - `lane-endpoint.test.ts`: resource caps (connections, links, routes, pending queue, tracked requests, frame size, rate limit) against a fake loopback daemon; route-slot clientIds; archived lane agent; tripwire at lane start.
 - `durability.test.ts`: revocation enforced before persisting and after a failed write; grant allowlist and pruning margin; torn room log recovery; log clipping; member timers armed at start; archived agent closes its lanes.
+- `v2-file-layer.test.ts`: start-time permission check (symlink, mode, foreign owner, chmod that does not take effect) and explicit fix; durable-write fault injection (temp cleanup, win32 rename retry, directory fsync reporting); BOM; simulated win32 SDDL checks; log lock takeover and ownership loss with a faked clock.
 - `tripwire.test.ts`: stored-config tripwire, resume check, provider allowlist.
 
 **End to end** (`npm run test:e2e`, about 2 minutes including daemon start):

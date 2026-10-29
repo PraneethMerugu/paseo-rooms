@@ -64,6 +64,20 @@ export const roomsBootstrap = defineRpc({
   output: z.object({ ok: z.literal(true), version: z.string(), dataDir: z.literal("plugin-data/rooms") }),
 });
 
+/** Problem found by the start-time file protection check (paths are relative to plugin-data/rooms). */
+export const PermissionProblemView = z.object({ path: z.string(), code: z.string(), detail: z.string() });
+
+/**
+ * Explicit "Fix permissions" action (audit X-2). The start check never repairs silently: when it
+ * fails, the plugin loads no keys and every other RPC returns the permission error until this runs.
+ * Symlinks and foreign owners are never fixed; they stay in `problems`.
+ */
+export const roomsPermissionsFix = defineRpc({
+  name: "rooms.permissions.fix",
+  input: Empty,
+  output: z.object({ ok: z.boolean(), problems: z.array(PermissionProblemView) }),
+});
+
 export const roomsOverview = defineRpc({
   name: "rooms.overview",
   input: Empty,

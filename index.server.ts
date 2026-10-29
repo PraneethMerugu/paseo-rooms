@@ -19,6 +19,7 @@ import {
   roomsLog,
   roomsMemberRevoke,
   roomsOverview,
+  roomsPermissionsFix,
   roomsRotate,
   roomsSettingsSet,
 } from "./shared/rpc";
@@ -45,6 +46,7 @@ export default function contribute(server: PluginServerContext) {
   }
 
   handle(roomsBootstrap, () => ({ ok: true as const, version: VERSION, dataDir: "plugin-data/rooms" as const }));
+  handle(roomsPermissionsFix, () => rt.fixPermissions());
   handle(roomsOverview, async (_i, paseo) => ({ owned: await rt.gateway.overview(paseo), joined: rt.member.view() }));
   handle(roomsCreate, (i: RpcInput<typeof roomsCreate>, paseo) => rt.gateway.createRoom(paseo, i));
   handle(roomsLaneCreate, async (i, paseo) => ({ lane: await rt.gateway.createLane(paseo, i) }));
@@ -93,17 +95,20 @@ export default function contribute(server: PluginServerContext) {
     return { ...r, grantExpiresAt: rec?.grantExpiresAt ?? null };
   });
 
-  const removeGuard = registerAgentGuard(server, rt.dataDir);
+  // While the start check has failed (rt.ready false), room agent creates are refused (fail closed).
+  const removeGuard = registerAgentGuard(server, rt.dataDir, () => rt.ready);
   // Any lifecycle hook also hands us the PaseoApi; agent.session_open fires on every agent open/resume.
   // It is also the isolation tripwire for resumes (C-iso2): a fork lane agent whose stored config
   // lost the inert shadow is refused before its provider session opens.
   const removeOpen = server.before("agent.session_open", ({ request }, context) => {
     rt.attach(context.paseo);
-    if (request.reason !== "create") rt.gateway.assertRoomAgentIntact(request.agentId);
+    // Not ready: no lane is served, so no member can reach a room agent; the tripwire has nothing to guard.
+    if (request.reason !== "create" && rt.ready) rt.gateway.assertRoomAgentIntact(request.agentId);
   });
   // C-13: a lane whose agent is archived closes at once (recorded as lane.closed, reason agent_archived).
   const removeArchived = server.on("agent.archived", (event, context) => {
     rt.attach(context.paseo);
+    if (!rt.ready) return;
     const closed = rt.gateway.onAgentArchived(event.agent.id);
     if (closed) log("lanes_closed_for_archived_agent", { agentId: event.agent.id, lanes: closed });
   });

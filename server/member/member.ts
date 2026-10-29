@@ -37,6 +37,7 @@ interface MemberFile {
   rooms: JoinedRoomRecord[];
 }
 
+const SAVE_RETRY_MS = 5_000;
 const AUTH_FAILURE_CODES = new Set(["authentication_failed", "auth_failed", "incorrect_password", "password_required"]);
 const TERMINAL_CONTROL_CODES = new Set(["revoked", "not_member", "lane_closed", "unknown_lane"]);
 
@@ -67,6 +68,9 @@ export class MemberRole {
   /** Lanes whose rotation timer fired before the PaseoApi was available (C-12). */
   private readonly pendingRotations = new Set<string>();
   private stopped = false;
+  private saveRetry: ReturnType<typeof setTimeout> | null = null;
+  /** True while rooms.json on disk is behind the in-memory state (a save failed). */
+  dirty = false;
 
   constructor(dataDir: string, private readonly pluginId = "rooms") {
     this.file = join(dataDir, "member", "rooms.json");
@@ -74,8 +78,36 @@ export class MemberRole {
     this.state = readJsonFile<MemberFile>(this.file) ?? { v: 1, rooms: [] };
   }
 
+  /**
+   * Durable save. On failure the in-memory state stays authoritative, a retry runs every 5 s (as in
+   * HostStore, audit X-4), and the error still reaches the caller.
+   */
   private save(): void {
-    writePrivateFile(this.file, JSON.stringify(this.state, null, 2));
+    try {
+      writePrivateFile(this.file, JSON.stringify(this.state, null, 2));
+    } catch (e) {
+      this.dirty = true;
+      this.scheduleSaveRetry();
+      throw e;
+    }
+    this.dirty = false;
+    if (this.saveRetry) clearTimeout(this.saveRetry);
+    this.saveRetry = null;
+  }
+
+  private scheduleSaveRetry(): void {
+    if (this.saveRetry || this.stopped) return;
+    this.saveRetry = setTimeout(() => {
+      this.saveRetry = null;
+      if (!this.dirty || this.stopped) return;
+      try {
+        this.save();
+        log("member_state_saved_after_retry", {});
+      } catch (e) {
+        log("member_state_save_failed", { error: (e as Error).message?.slice(0, 200) });
+      }
+    }, SAVE_RETRY_MS);
+    (this.saveRetry as unknown as { unref?: () => void }).unref?.();
   }
 
   private deviceKey(): StoredEd25519Key {
@@ -369,6 +401,8 @@ export class MemberRole {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    if (this.saveRetry) clearTimeout(this.saveRetry);
+    this.saveRetry = null;
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
     this.pendingRotations.clear();

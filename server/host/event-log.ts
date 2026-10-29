@@ -5,7 +5,8 @@ import { canonicalJson } from "../../shared/control";
 import { RoomEvent } from "../../shared/schemas";
 import { sha256Hex, signEd25519, verifyEd25519, type StoredEd25519Key } from "../crypto";
 import { log } from "../log";
-import { appendPrivateLine, writePrivateFile } from "../paths";
+import { basename, dirname } from "node:path";
+import { appendPrivateLine, logPath, writePrivateFile } from "../paths";
 
 export const GENESIS_PREV = "0".repeat(64);
 type EventData = RoomEvent["data"];
@@ -111,7 +112,7 @@ export class RoomEventLog {
       closeSync(fd);
     }
     this.recoveredTornTail = true;
-    log("room_log_torn_tail_recovered", { file: this.path.split("/").slice(-2).join("/"), bytes: Buffer.byteLength(torn, "utf8"), quarantine: quarantine.split("/").pop() });
+    log("room_log_torn_tail_recovered", { file: logPath(dirname(dirname(this.path)), this.path), bytes: Buffer.byteLength(torn, "utf8"), quarantine: basename(quarantine) });
   }
 
   read(): LogRead {

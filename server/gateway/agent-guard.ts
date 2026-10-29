@@ -135,11 +135,20 @@ export function restrictRoomAgentConfig<C extends object>(config: C, inert: Iner
   return next;
 }
 
-export function registerAgentGuard(server: PluginServerContext, dataDir: string): () => void {
-  const inert = ensureInertMcp(dataDir);
+/**
+ * `isReady` is false while the start-time permission check has failed (audit X-2): the inert server
+ * is not written into an unverified directory, and room agent creates are refused.
+ */
+export function registerAgentGuard(server: PluginServerContext, dataDir: string, isReady: () => boolean = () => true): () => void {
+  let inert: InertMcpServer | null = isReady() ? ensureInertMcp(dataDir) : null;
   return server.before("agent.create", ({ request }) => {
     const laneId = request.env?.[ROOM_LANE_ENV];
     if (!laneId) return;
+    if (!isReady()) {
+      log("agent_guard_refused", { laneId, reason: "permission_error" });
+      throw new Error("Room agents cannot be created: Rooms did not start because its data folder failed the permission check");
+    }
+    inert ??= ensureInertMcp(dataDir);
     const provider = String(request.config.provider ?? "");
     if (!isForkVerifiedProvider(provider)) {
       log("agent_guard_refused", { laneId, provider: provider.slice(0, 64) });
