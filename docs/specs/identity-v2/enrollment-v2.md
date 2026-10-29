@@ -175,6 +175,8 @@ flags: 0x00 = last fragment of a frame, 0x01 = more fragments follow
 
 A frame is the concatenation of its fragments, at most 4 MiB, and is one RJCS object (MLS payloads inside are base64url). Fragments of different frames do not interleave. The receiver closes the session on an oversized frame, a bad AEAD tag, or a non-canonical RJCS frame.
 
+Noise transport messages use **empty associated data**. Per-message binding comes from the session keys, which `Split()` derives from the handshake transcript (prologue included), and from the Noise nonce counter, which each side increments per message and never sends. A reordered, replayed, dropped or cross-session record therefore fails its AEAD tag. The implementation (`server/transport/records.ts`) already does this.
+
 ### 3.5 Session lifetime
 
 - A session lasts at most 12 hours, then the member reconnects with a new handshake. This bounds nonce use and the life of transport keys without Noise rekey.
@@ -206,7 +208,7 @@ Who may call what depends on whether the initiator's static key (`rs` after the 
 | `device.link.create`, `link.nonce`, `link.confirm`, `link.abort` | active device (the link's creator for the last three) | `identity-model.md` 6.4. The host pushes `link.request` and `link.closed` to the creator |
 | `device.rekey` | active device | `keys-rotation-recovery.md` 4.1 |
 | `kp.publish`, `commit.submit`, `welcome.fetch`, `msg.send`, `msg.fetch` | active device (`kp.publish` for its own packages only) | `mls-integration.md` section 6 |
-| `kp.fetch` | admin device; `maintain` device for gateway targets only | `mls-integration.md` section 6.4. The host pushes `kp.low` to a device whose KeyPackages run low |
+| `kp.fetch` | active device, for `current` packages of devices it shares a group with (the room group, or a team scope of its member), under a per-fetcher hourly cap; `rekey` packages: admin device only; `maintain` device for gateway targets (decisions round 7, item 2) | `mls-integration.md` section 6.4. The host pushes `kp.low` to a device whose KeyPackages run low |
 
 A device whose `rs` is known but no longer active (removed, member left, room closed) may only receive `{t:"error", code:"access_ended", reason}` with `reason ∈ {removed, left, room_closed}`. This is disclosed only after the handshake proves possession of that device's DH key, so it is not an oracle for anyone else (P-23).
 
@@ -247,7 +249,7 @@ Member device (M)                         Host room endpoint (H)                
   verify; journal "admitted"; register lane hosts (section 8)
 ```
 
-After `enroll.admitted` the device is active. Before anything else on that session it publishes its MLS KeyPackages (`kp.publish`, `mls-integration.md` section 6.4), so that an admin daemon can fetch one and commit its Add. Until that Add, the device is a pending add in the room group (`mls-integration.md` section 4.2).
+After `enroll.admitted` the device is active. Before anything else on that session it publishes its MLS KeyPackages (`kp.publish`, `mls-integration.md` section 6.4), so that a device of each group it joins can fetch one and commit its Add (normally the admitting admin daemon for the room group; since round 7 any device of the group, `mls-integration.md` section 4.3). Until that Add, the device is a pending add in the room group (`mls-integration.md` section 4.2).
 
 The host waits for **both** confirmations. The admin may admit before the member confirms; the host then holds `enroll.admitted` until `enroll.confirm` arrives. Either side pressing "Codes do not match" ends the enrollment (section 7.2).
 

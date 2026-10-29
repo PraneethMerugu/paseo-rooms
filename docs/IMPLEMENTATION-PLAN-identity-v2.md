@@ -444,12 +444,12 @@ Every milestone ends with `npm run typecheck` clean and `npm test` green. "Linux
 **Add:**
 - `server/mls/adapter.ts`: the only importer of ts-mls, pinned at exactly 1.6.4 (floor 1.6.4; the removal check fails on 1.6.2). Public API only: no fork of `createCommit`, no imports through the `./*.js` subpath exports.
 - `auth-service.ts`: a closure over the reference roster; fails closed when no roster is set; rule 6 requires the roster key with no `prevSig` exception (Spike A, decision round 6). For a Welcome, the reference roster is the one the Add commit names.
-- `roster-rule.ts`: roster equality before and after processing, with leaf identity `(memberId, deviceId, deviceSig)`; role checks in the `IncomingMessageCallback` by `senderLeafIndex`; the continuity check after processing (sender's leaf credential byte-identical before and after a path commit); who may commit what.
-- The admin route for device rekeys (`mls-integration.md` 4.4): Remove plus Add commit builder, `commit.submit` with `statement`, adjacent sequencing on the host, and the rekeyed device's rejoin by Welcome.
+- `roster-rule.ts`: roster equality before and after processing, with leaf identity `(memberId, deviceId, deviceSig)`, in its round 7 form (`mls-integration.md` 4.2 rules 1 to 3): every leaf in the roster, at most one leaf per `(memberId, deviceId)`, no valid roster leaf removed, pending adds tolerated, old-key leaves removed; role checks in the `IncomingMessageCallback` by `senderLeafIndex`; the continuity check after processing (sender's leaf credential byte-identical before and after a path commit); who may commit what (4.3, decisions round 7): roster-determined Adds and rekey Remove plus Add by any device of the group, leaf replacement, GroupContextExtensions and ReInit by admin devices only.
+- The admin route for device rekeys (`mls-integration.md` 4.4): Remove plus Add commit builder, `commit.submit` with `statement`, adjacent sequencing on the host, and the rekeyed device's rejoin by Welcome. The repair rule for any device of a group (60 s, plus up to 60 s of random delay for devices that are not admins).
 - npm `overrides` for ts-mls's exact `@noble/ciphers` peer, so it shares the plugin's noble 2.4.0 (Spike A case (g); the override itself is untried).
 - The authority extension `0xF0A1`.
 - Sealed state written before the ack; rollback check against `lastAck`; key retention 2, 64 and 1000.
-- Host delivery service: `kp.publish`, `commit.submit` (one commit per epoch, `stale_roster`, optional `device.rekey.approved` sequenced adjacently or not at all), `welcome.fetch`, `msg.send`, `msg.fetch`, `pending_remove`, and `mls.stalled` after 5 minutes.
+- Host delivery service: `kp.publish`, `kp.fetch` (any device for `current` packages of devices it shares a group with, `rekey` for admins only, the per-target `g + 2` cap and the per-fetcher `k` cap of 6.4), `commit.submit` (one commit per epoch, `stale_roster`, optional `device.rekey.approved` sequenced adjacently or not at all), `welcome.fetch`, `msg.send`, `msg.fetch`, `pending_remove`, and `mls.stalled` after 5 minutes.
 - A dev-only alias `ts-mls-162` for the positive control.
 
 **Tests:** MLS section 10, tests 1 to 10, with test 11 already done in Step 0. Test 10 is the admin-route rekey and the continuity check; its Remove plus Add path was not run in Spike A. E2E: two members exchange an application message; the removed one cannot read the next one; the host files hold no plaintext.
@@ -581,3 +581,8 @@ The attack harness of hardening section E is out of scope. It runs only after th
 | I-15 cut-over and migration | M |
 | I-16 X-3, X-5 | S |
 | I-17 traceability and results | S |
+
+## Follow-ups recorded during implementation
+
+- **I-3 (KeyStore), not yet done:** async runtime states and UI wiring; automatic move from the fallback file to a keyring (only detected now); KEK rotation (build on the same re-seal step); the CLI keyring backends and Windows DPAPI wrapping of the fallback file; Kubernetes secret mounts are symlinks and fail the permission check. Packaging: add `"@napi-rs/keyring": "2.1.2"` to dependencies; directory installs need `npm install` on the target machine.
+- **I-2 (file layer):** no client button yet for `rooms.permissions.fix`.

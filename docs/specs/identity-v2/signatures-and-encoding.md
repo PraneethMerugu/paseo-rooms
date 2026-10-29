@@ -64,7 +64,7 @@ A receiver accepts RJCS bytes only if all of these hold:
 
 Rule 5 rejects duplicate keys, whitespace, unsorted keys, `1.0`, `1e3`, unnecessary escapes and every other alternative spelling, without a custom parser. Signatures are then verified over the **received bytes** (which equal the canonical bytes).
 
-Schema validation (zod) runs after the strict parse and must not strip unknown fields silently in signed objects. Signed objects use `.strict()` schemas: an unknown field is an error, because it would be covered by the signature but ignored by the code.
+Schema validation (zod) runs after the strict parse and must not strip unknown fields silently in signed objects. Signed objects must reject unknown fields **at every nesting level**: an unknown field is an error, because it would be covered by the signature but ignored by the code. With zod this means `z.strictObject(...)` (or `.strict()`) on every object schema inside a signed object, not only the outer one, because `.strict()` does not propagate to nested schemas (verified in the I-1 tests). A nested `z.object(...)` would strip an unknown field silently. The same applies to objects inside arrays and records.
 
 ### 2.4 Text fields
 
@@ -267,6 +267,6 @@ The cacophony entries are copied into the generator from `rweather/noise-c` `tes
 
 ## 10. Open questions
 
-- **Q1.** Confirm that the zod version in use can express `.strict()` on every signed object, including nested ones, without stripping.
+- **Q1.** Answered by the I-1 tests: zod can reject unknown fields at every level, but only when each nested object schema is itself `z.strictObject` (or `.strict()`); `.strict()` on the outer schema does not propagate. Section 2.3 now requires a strict schema at each level.
 - **Q2.** Should statement bodies above 64 KiB ever exist (for example large roster snapshots in rooms of 300)? A roster of 300 members with 2 devices is about 120 KiB. Proposed: roster snapshots are not signed objects themselves (each entry is backed by statements), so the limit holds; snapshots travel as frames up to 4 MiB.
 - **Q3.** Ed25519 batch verification is not used. If log verification for large rooms is slow, revisit with a library that implements ZIP-215-consistent rules on both sides.

@@ -1,7 +1,7 @@
 # Identity v2 specifications (paseo-rooms)
 
 - **Date:** 2026-10-28
-- **Status:** proposed. Written from the M1 reviews and the user-approved decisions in `plugin/review/HARDENING-PLAN.md`, including "Decisions, round 2", "round 3", "round 4", "round 5" and "round 6" (2026-10-29, section 7 below). **Not implemented.** Independently reviewed on 2026-10-29 (`plugin/review/identity-v2-review.md`, verdict "ready with fixes"), revised, re-reviewed (`plugin/review/identity-v2-rereview.md`, verdict "ready with small fixes") and revised again (section 10). Per round 4, item 4, the next step is a targeted check that each R finding is addressed and that the vectors regenerate, not another full review.
+- **Status:** proposed. Written from the M1 reviews and the user-approved decisions in `plugin/review/HARDENING-PLAN.md`, including "Decisions, round 2", "round 3", "round 4", "round 5", "round 6" and "round 7" (2026-10-29, section 7 below). **Not implemented.** Independently reviewed on 2026-10-29 (`plugin/review/identity-v2-review.md`, verdict "ready with fixes"), revised, re-reviewed (`plugin/review/identity-v2-rereview.md`, verdict "ready with small fixes") and revised again (section 10). Per round 4, item 4, the next step is a targeted check that each R finding is addressed and that the vectors regenerate, not another full review.
 - **Evidence labels:** statements about Paseo, the relay library and ts-mls cite the source files read. Statements about our design are specification, not results. The executed artifacts are the test-vector generator (`vectors/`), which runs and self-checks (including the cacophony NK and IK vectors), the keyring spike (`spikes/keyring/RESULTS.md`), and Spike A on ts-mls rekey behaviour (`spikes/security/RESULTS.md`, last section; `mls-integration.md` section 10, test 11).
 
 ## 1. What this covers
@@ -52,9 +52,9 @@ Suggested reading order: identity model, signatures and encoding, enrollment, gr
 | Grant **allowlist of the current gid** per (device, lane); one link per (device, lane); forced rotation at 75 % | grants 4, 5, 6 | P-9, P-12 |
 | **Enforce, then persist** with file and directory fsync; failures reported, never success | grants 7 | P-13 |
 | One log sequence for security events, commits and chat; **producer signatures** plus host-signed entries; heads gossiped inside MLS authenticated data | room log 1 to 6 | P-7 |
-| MLS **roster equality**: a commit must leave the leaf set, keyed by `(memberId, deviceId, deviceSig)`, equal to the admin-signed roster it names | MLS 4.2 | P-3 |
-| **Device rekey by the admin route**: the approving admin daemon removes the old leaf and adds the new KeyPackage in a commit sequenced next to the approval; public ts-mls APIs only | MLS 4.4; keys 4.1 | ts-mls 1.6.4 cannot send a credential change in an UpdatePath without a fork (Spike A); no rekey window, so no `prevSig` exception |
-| **KeyPackages** published by each device into two pools (current key, pending rekey key), fetched only by admin devices, single-use and deleted when served, with one last-resort package per pool and a per-device rate limit; the fetcher checks every package against the roster | MLS 6.4; enrollment 4, 5.1 | Every Add needs one, and a pending add blocks non-admin commits, so availability matters; the host is trusted for availability only |
+| MLS **roster equality**: a commit must leave the leaf set, keyed by `(memberId, deviceId, deviceSig)`, equal to the admin-signed roster it names, minus devices that have no leaf yet; every leaf absent from the roster is removed. Adds are roster-determined and may be committed by any device of the group (R7-2) | MLS 4.2, 4.3 | P-3 |
+| **Device rekey by the admin route**: the approving admin daemon removes the old leaf and adds the new KeyPackage in a commit sequenced next to the approval; public ts-mls APIs only. Any device of a group may complete a rekey there (R7-2) | MLS 4.4; keys 4.1 | ts-mls 1.6.4 cannot send a credential change in an UpdatePath without a fork (Spike A); no rekey window, so no `prevSig` exception |
+| **KeyPackages** published by each device into two pools (current key, pending rekey key), fetched by any device sharing a group with the target (`rekey` pool by admins only), single-use and deleted when served, with one last-resort package per pool, a per-device rate limit and a per-fetcher cap; the fetcher checks every package against the roster | MLS 6.4; enrollment 4, 5.1 | Every Add needs one, and a device stays out of a group until one is used, so availability matters; the host is trusted for availability only |
 | One KEK behind a **KeyStore** abstraction (Keychain, Credential Manager, Secret Service; never kernel keyutils) seals every key file and MLS state; owner-only fallback file on every OS | identity 7.3, 7.5 | Decision 1, P-2, keyring spike |
 | **Owner-only files verified at startup on every OS** (POSIX modes, Windows DACL) and platform-aware durable writes | identity 7.8, 7.9; grants 7.3 | Cross-platform requirement (Linux, macOS, Windows, WSL, Docker) |
 | Room **policy** in genesis, changed only by signed `room.policy.changed`; org policy can fix stricter values | identity 5.2.1; room log 4.1, 4.6 | Decisions round 2 |
@@ -189,6 +189,13 @@ After Spike A (`spikes/security/RESULTS.md`, section "Identity v2 Step 0, Spike 
 | R6-3 | Upstream | Ask ts-mls for credential change through the public `createCommit`. Held with the other requests until the user approves sending. | Would allow a device to commit its own rekey later. | section 6, item 8 |
 | R6-4 | Next step | Start implementation with I-1 and I-16 in parallel. | | implementation plan |
 
+The user decided on 2026-10-29 ("Decisions, round 7"; item 3 of that round concerns the e2e test budget, not the specs):
+
+| # | Question | Decision | Rationale | Applied in |
+|---|---|---|---|---|
+| R7-1 | Scope of the `prevSig` removal | `prevSig` is removed entirely, not limited to `joinGroup`. | Confirms the revised MLS spec (R6-2): with `deviceSig` in the leaf identity and every old-key leaf removed by the next commit, no valid Welcome contains an old-key leaf. | MLS 4.1, 4.4; keys 4.1 |
+| R7-2 | Team subgroups with no admin, and pending adds that block commits | Options (b) and (c) of MLS 4.4. (b) Any device that is a leaf of a group (room group or subgroup) may commit an Add whose every added leaf validates against the reference roster and whose result satisfies roster equality. (c) Roster equality tolerates pending adds: the leaf set equals the reference roster minus devices with no leaf yet, and every leaf absent from the roster, old-key leaves included, is removed (answers MLS Q7). `kp.fetch` opens to devices that share a group with the target, for `current` packages, under the per-device rate cap plus a new per-fetcher cap; `rekey` packages stay admin-only. The admin route stays the primary rekey path; any device of a group may complete it there. Leaf replacement, GroupContextExtensions and ReInit stay admin-only. | The roster already fixes which leaves may exist, so the admin-only Add rule added only a second guard, at the price of groups that could not commit at all. A compromised device that is not an admin gains timing, choice among published packages and the ability to send Welcomes, which allow denial of service against specific devices but not admission of an unlisted device or new plaintext (MLS 4.4). Open: dead leaves in groups with no admin, and fork detection for joiners. | MLS 4.2, 4.3, 4.4, 6.4, 10, 11; keys 4.1, 5, 6.6; enrollment 4, 5.1 |
+
 ## 8. Open questions
 
 Each document lists its own. These need the user or a test before implementation:
@@ -198,7 +205,7 @@ Each document lists its own. These need the user or a test before implementation
 3. **Org policy profiles** (identity Q7): format, distribution, and whether members can verify that a room was created under one.
 4. **License of `paseo-rooms`**: `plugin/package.json` declares none. Needed before vendoring Apache-2.0 code is released (enrollment 3.2.1).
 5. **SAS word format** (enrollment Q2) and **trust on first use** for low-stakes rooms (enrollment Q3, proposed: no).
-6. **ts-mls rekey behaviour** (MLS Q6, test 11): resolved by Spike A and decision R6-1 (admin route). Open: a team subgroup with no admin device cannot apply a rekey or add a device, and then nobody in it can commit again (MLS 4.4, options (a) to (c)). Related: whether roster equality should tolerate pending adds (MLS Q7).
+6. **ts-mls rekey behaviour** (MLS Q6, test 11): resolved by Spike A and decision R6-1 (admin route). The subgroup gap and MLS Q7 are resolved by R7-2. Still open (MLS 4.4): a dead leaf in a group with no admin device persists, because leaf replacement is admin-only; a joiner cannot yet detect a Welcome that is inconsistent with its commit.
 
 ## 9. Verification still required before implementation
 
