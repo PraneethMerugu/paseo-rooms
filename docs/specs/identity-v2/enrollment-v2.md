@@ -399,7 +399,7 @@ The member therefore commits to a random `Nm` before it sees the host's `Nh`, an
 info   = RJCS({ deviceDh, deviceSig, endpointDh, genesisHash, inviteId })   // linkId in place of inviteId for device links
 sasKey = HKDF-SHA256(ikm = Nm ‖ Nh, salt = h, info = TBS("sas", info), L = 8)
 sas    = (uint64_be(sasKey) mod 10^6), zero-padded to 6 digits
-display = first three digits, space, last three digits     ("015 136" in the vector)
+display = first three digits, space, last three digits     ("317 837" in the vector)
 sasTranscript = H("sas-transcript", h ‖ Nm ‖ Nh ‖ info)    // recorded in member.admitted
 ```
 

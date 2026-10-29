@@ -101,6 +101,8 @@ Size: **S**.
 
 Size: **S/M**.
 
+**Result (2026-10-29, run in `spikes/keyring-plugin/`, see its `RESULTS.md`).** B1 to B5 pass on Linux x64 glibc. B1: a directory install loads the gnu `.node` from the probe's `node_modules` and round-trips in the isolated keyring. B2: the missing platform package gives a clean load error, and the plugin stays `running`. B3: with no bus, the pinned store throws at construction in 0 ms. B4: an npm-source install from an offline local registry installs the linux-x64 platform packages and the probe loads them. Caveat: the tarballs came from the npm cache, so no real download was exercised. B5: the bundle holds no native code, and a static import fails to compile ("No loader is configured for .node files"). The directory locator (`$PASEO_HOME/config.json` `plugins[id].path`) worked for both install kinds. `__dirname` and `import.meta.url` are unavailable, so the locator stays fragile: `--id` installs and a daemon without `PASEO_HOME` were not tested. The first outcome row applies: the native backend is the primary KEK store on Linux x64 glibc desktops, and the fallback file is used only when the backend is unavailable. macOS, Windows, musl and arm are untested.
+
 ### 1.3 Other gates
 
 | Gate | Why | Size |
@@ -298,12 +300,12 @@ Every milestone ends with `npm run typecheck` clean and `npm test` green. "Linux
 **Add:**
 - `server/authority/refold.ts`: `admin.key.revoked` and `host.key.revoked` with `fromSeq` bounds and authority starts, plus suspect and void marking.
 - `lineage.ts`: lineage roots, independence for closure, the first recovery key needing two lineages.
-- `holds.ts`: 24 h and 72 h holds measured in `hts`, vetoes, conflicts, cancellation when the requester is removed, no auto-add from devices younger than 24 h, the `soleDeviceAdd` and `deviceAddApproval` policies.
+- `holds.ts`: 24 h and 72 h holds measured in `hts`, vetoes, conflicts, cancellation when the requester is removed, no auto-add from devices younger than 24 h, the `soleDeviceChange` and `deviceAddApproval` policies.
 - `KeyChange` and `key-change-new` verification; the retired-key set; the device and admin denylists.
 
 **Depends on Spike A:** the `device.rekey.approved` and `prevSig` bookkeeping stays as specified only if Spike A (c) passes.
 
-**Tests:** `log.refold` (including `rejectRevocationBeforeStart`), `log.closure` (one accepted, three rejected), `deviceLink.chain` and `deviceLink.chain.cases`, the recovery-key `null` format examples (format only), and an admin key that adds a ghost which a recovery-key revocation removes.
+**Tests:** `log.refold` (including `rejectRevocationBeforeStart`), `log.closure` (one accepted, three rejected), `deviceLink.chain` and `deviceLink.chain.cases`, the recovery-key `null` format examples (format only), and an admin key that adds a ghost which a recovery-key revocation removes. Also `deviceRekey` (sole-device rekey: 24 h rejected, 72 h accepted). Two vectors still missing from the generator must be added here: `device.rekey.vetoed`, and a sole-device rekey under `soleDeviceChange = "admin"` (needs `room.policy.changed` in the generator's fold).
 
 **Cross-platform:** pure. **Exit:** every fold self-check the generator lists in signatures 9.2 is reproduced by the production fold. **Size: L.**
 

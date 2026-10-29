@@ -608,7 +608,7 @@ const policy0 = {
   deviceAddApproval: "same-person",
   rotateLaneOnRemove: "compromise",
   recoveryEscrow: "none",
-  soleDeviceAdd: "held",
+  soleDeviceChange: "held",
   projectNames: "lane-owner",
   grantTtl: 43200,
   closeDelay: 86400,
@@ -795,7 +795,7 @@ const publicEntry = ({ entry, hash, hsig }) => ({ entry, hash, hsig });
 // Fold (room-log-v2.md section 5) covering the rules these vectors exercise: chain links, host signatures,
 // bodyHash, producer authority and signature, the base, unique, forward-base and ref rules (S-1, R-1, R-10),
 // field versions (section 4.0), the creator rule for seq 0, device denylist and retired keys, device holds
-// (24 h, 72 h for a sole device), vetoes, conflicts and cancellation (R-8), admin lineages and closure
+// for adds and rekeys (24 h, 72 h for a sole device), vetoes, conflicts and cancellation (R-8), admin lineages and closure
 // (section 5.2), and one level of revocation re-fold with the roster position rule (section 5.1, R-7).
 // It is a checking aid, not the full fold: nested or competing revocations are not modelled.
 const HOUR = 3600000;
@@ -964,7 +964,7 @@ function apply(st, body, pub, entry, bodyHash) {
       if (m.devices.length >= 8) return "device_count";
       if (d.mode === "auto") {
         if (st.policy.deviceAddApproval === "admin") return "auto_not_allowed";
-        if (p.sole && st.policy.soleDeviceAdd === "admin") return "auto_not_allowed";
+        if (p.sole && st.policy.soleDeviceChange === "admin") return "auto_not_allowed";
         if (st.conflicts.has(d.memberId)) return "conflict_open";
         if (p.young) return "requester_too_young";
         if (hts - p.hts < (p.sole ? 72 : 24) * HOUR) return "hold_not_elapsed";
@@ -974,6 +974,53 @@ function apply(st, body, pub, entry, bodyHash) {
       st.deviceSince.set(d.deviceId, hts);
       st.versions.set(`devices:${d.memberId}`, seq);
       p.done = true;
+      return null;
+    }
+    case "device.rekeyed": {
+      const f = findDevice(st, pub);
+      const c = d.change;
+      if (kind !== "device" || !f || c.subject.kind !== "device" || c.subject.id !== f.device.deviceId) return "producer_not_allowed";
+      if (c.old !== kidEd(pub)) return "stale_version";
+      if (st.denied.has(c.newSig) || st.denied.has(c.newDh) || st.retired.has(c.newSig)) return "denylisted_key";
+      if (!verifySig(fromB64uStrict(c.newSig, 32), "key-change-new", rjcsBytes(c), fromB64uStrict(d.newKeySig, 64))) return "new_key_sig";
+      st.pending.set(bodyHash, {
+        kind: "rekey",
+        memberId: f.member.memberId,
+        device: { deviceId: f.device.deviceId, sig: c.newSig, dh: c.newDh },
+        requester: f.device.deviceId,
+        seq,
+        hts,
+        sole: f.member.devices.length === 1,
+        vetoed: false,
+        cancelled: false,
+        done: false,
+      });
+      return null;
+    }
+    case "device.rekey.approved": {
+      if (kind !== "admin") return "producer_not_allowed";
+      const p = st.pending.get(d.ref);
+      if (!p || p.kind !== "rekey" || p.memberId !== d.memberId || p.device.deviceId !== d.deviceId) return "not_pending";
+      if (p.cancelled) return "request_cancelled";
+      if (p.vetoed) return "vetoed";
+      if (p.done) return "not_pending";
+      const m = st.members.get(d.memberId);
+      const dev = m && m.devices.find((x) => x.deviceId === d.deviceId);
+      if (!dev) return "unknown_device";
+      if (d.mode === "auto") {
+        if (st.policy.deviceAddApproval === "admin") return "auto_not_allowed";
+        if (p.sole && st.policy.soleDeviceChange === "admin") return "auto_not_allowed";
+        if (st.conflicts.has(d.memberId)) return "conflict_open";
+        if (hts - p.hts < (p.sole ? 72 : 24) * HOUR) return "hold_not_elapsed";
+      }
+      st.denied.add(dev.sig).add(dev.dh);
+      st.retired.add(dev.sig);
+      dev.sig = p.device.sig;
+      dev.dh = p.device.dh;
+      st.versions.set(`devices:${d.memberId}`, seq);
+      p.done = true;
+      // Requests signed by the old key are cancelled (room-log-v2.md section 4.3).
+      cancelPending(st, (q) => q !== p && q.requester === d.deviceId);
       return null;
     }
     case "device.removed": {
@@ -1254,7 +1301,7 @@ const roomPolicyChanged = statement(
   {
     changes: [
       { setting: "deviceAddApproval", value: "admin", ver: -1 },
-      { setting: "soleDeviceAdd", value: "admin", ver: -1 },
+      { setting: "soleDeviceChange", value: "admin", ver: -1 },
     ],
   },
   1793240300000,
@@ -1573,6 +1620,50 @@ const deviceLinkCases = [
   check(r.ok && r.state.members.get(memberId).devices.length === 0 && r.rosterSeq === 6, `admin may remove the last device; member kept with no devices (${r.error})`);
 }
 
+// Sole-device rekey (keys-rotation-recovery.md section 4.1; decision round 5, item 3). Sam's laptop, Sam's only
+// device, requests a rekey at seq 4, 48 h after its admission. An automatic approval 24 h later is rejected; one
+// 72 h later is accepted and replaces the laptop's keys.
+const RK_T = e2.entry.hts + 48 * HOUR;
+const soleRekeyed = statement(keys.devSig, "device", "device.rekeyed", { change: rekeyChange, newKeySig: b64u(rekeyNewKeySig) }, RK_T - 100, baseOf(e3));
+const rk4 = entryFor(4, e3.hashBytes, soleRekeyed, RK_T, 0);
+const rekeyRef = bodyHashOf(soleRekeyed);
+const rekeyApprovalAt = (hours) =>
+  entryFor(
+    5,
+    rk4.hashBytes,
+    statement(keys.adminA, "admin", "device.rekey.approved", { memberId, deviceId, ref: rekeyRef, mode: "auto" }, rk4.entry.hts + hours * HOUR - 100, baseOf(rk4)),
+    rk4.entry.hts + hours * HOUR,
+    0,
+  );
+const rk5 = rekeyApprovalAt(72);
+const deviceRekeyChain = [rk4, rk5];
+{
+  const r = fold([...p3, ...deviceRekeyChain]);
+  const dev = r.ok && r.state.members.get(memberId).devices[0];
+  check(r.ok && r.rosterSeq === 5 && dev.sig === b64u(keys.devSig2.pub) && dev.dh === b64u(keys.devDh2.pub), `sole-device rekey approved after 72 h (${r.error})`);
+  check(r.ok && r.state.denied.has(b64u(keys.devSig.pub)), "sole-device rekey: old signing key denylisted");
+}
+const deviceRekeyCases = [
+  {
+    name: "soleRekeyHoldTooShort",
+    prefix: [...p3, rk4],
+    entry: rekeyApprovalAt(24),
+    expect: "hold_not_elapsed",
+    note: "the requester is the member's only device, so the rekey hold is 72 h, not 24 h (decision round 5, item 3)",
+  },
+].map(({ name, prefix, entry, expect, note }) => {
+  const r = fold([...prefix, entry]);
+  check(!r.ok && r.error === expect, `device rekey case ${name}: expected ${expect}, got ${r.error}`);
+  return {
+    name,
+    note,
+    chain: prefix.slice(4).map((e) => ({ ...publicEntry(e), statement: e.statement })),
+    entry: publicEntry(entry),
+    statement: entry.statement,
+    expect,
+  };
+});
+
 // ------------------------------------------------------------------ MLS (mls-integration.md sections 2, 3, 5)
 const mlsIdentity = {
   v: 2,
@@ -1784,7 +1875,7 @@ const out = {
       "All secrets are derived from public labels. Never use these keys outside tests.",
       "Timestamps: unix seconds for createdAt/iat/exp/notBefore/oldValidTo; unix milliseconds for ts/hts.",
       "noise.ikCacophonyKeys uses the cacophony keys and matches the cacophony.txt IK entry byte for byte (noise.cacophonyChecks).",
-      "Statements outside log.entries name the head at seq 3 as their base unless they belong to a folded chain (deviceLink.chain, log.foldChecks, log.refold, log.closure); standalone ones are format examples.",
+      "Statements outside log.entries name the head at seq 3 as their base unless they belong to a folded chain (deviceLink.chain, deviceRekey.chain, log.foldChecks, log.refold, log.closure); standalone ones are format examples.",
       "Every folded chain starts with log.entries[0..3]; chains and cases list only the entries after seq 3.",
       "Field versions (ver) are log positions; -1 means the genesis value (room-log-v2.md section 4.0).",
       "MLS commit entries are omitted from log.entries; epoch is 0 throughout.",
@@ -1837,6 +1928,17 @@ const out = {
       entries: deviceLinkChain.map((e) => ({ ...publicEntry(e), statement: e.statement })),
       holdMs: 72 * HOUR,
       cases: deviceLinkCases,
+    },
+  },
+  deviceRekey: {
+    deviceRekeyed: soleRekeyed,
+    deviceRekeyedBodyHash: rekeyRef,
+    chain: {
+      prefix: "log.entries[0..3], then these entries at seq 4 and 5",
+      entries: deviceRekeyChain.map((e) => ({ ...publicEntry(e), statement: e.statement })),
+      holdMs: 72 * HOUR,
+      note: "the requester is the member's only active device, so the rekey hold is 72 h (decision round 5, item 3)",
+      cases: deviceRekeyCases,
     },
   },
   statements: {
