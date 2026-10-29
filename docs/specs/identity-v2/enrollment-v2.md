@@ -276,7 +276,7 @@ enroll.pending = {
   Nh: <32 random bytes b64u>,                // for a device link: the confirming device's Nc
   deviceId?: "dev_<32 hex>",                  // device links only (identity-model.md 6.4)
   genesis: RoomGenesis,                       // identity-model.md 5.1
-  authority: { seq, entries: [ signed admin/host statements since genesis ] },
+  authority: AuthorityChain,                  // section 5.2.1: authority-key entries only, not the log
   terms: { role, lanes: [laneId...] },
   expiresAt: <unix ms>                        // min(invite exp, now + 15 min)
 }
@@ -284,7 +284,9 @@ enroll.pending = {
 sas.reveal     = { t: "sas.reveal", id, Nm: <b64u>, newKeySig?: <b64u> }   // newKeySig: device links only
 sas.reveal.ok  = { t: "sas.reveal.ok", re }
 enroll.confirm = { t: "enroll.confirm", id, pendingId }     // member pressed "Codes match"
+enroll.confirm.ok = { t: "enroll.confirm.ok", re }
 enroll.abort   = { t: "enroll.abort", id, pendingId, reason: "sas_mismatch" | "cancelled" }
+enroll.abort.ok   = { t: "enroll.abort.ok", re }
 
 enroll.admitted = {
   t: "enroll.admitted", pendingId,
@@ -305,7 +307,42 @@ Notes:
 
 - `deviceDh` must equal the IK initiator static `rs`. This proves possession of the DH key. `sig` proves possession of the signing key and binds it to this handshake (`h`) and this room (`genesisHash`).
 - The token never crosses the wire, even encrypted. Only a MAC bound to `h` does. A party that relays the member's frames into another session (different `h`) cannot reuse them.
-- `authority.entries` is everything the member needs to compute the current admin set, host keys and endpoint from the genesis (`identity-model.md` section 5.2). It is verified, not trusted.
+- `authority` is not the room log. It carries only the entries that change which keys speak for the room (section 5.2.1), so a holder of a stolen invite learns nothing about the roster, invites, lanes, grants or chat before the SAS is compared. It is verified, not trusted.
+- Every request frame gets a reply. `enroll.confirm.ok` and `enroll.abort.ok` carry nothing but `re`. `enroll.confirm` is idempotent: a repeat on a pending the member already confirmed gets `enroll.confirm.ok` again, and on an admitted pending it also re-delivers `enroll.admitted`. `enroll.confirm` before the host received `sas.reveal` is `bad_frame`. `enroll.abort` on a pending that is no longer open gets `enroll_closed` with its reason. `enroll.confirm`, `enroll.abort` and `enroll.resume` naming a `pendingId` whose `deviceDh` is not this session's `rs`, or an unknown `pendingId`, get the generic `enroll_rejected`.
+- **`sas.reveal` handling.** The host finds the pending enrollment by `rs` (its `deviceDh`). A reveal with no pending for this `rs` gets `enroll_rejected`. If `H("sas-commit", Nm)` differs from the pinned `sasCommit`, the host closes the pending enrollment as **abandoned** (section 5.4) and replies `enroll_rejected`: the requester saw `Nh` and could compute the host-side SAS for the `Nm` it committed, so a reveal that does not open the commitment is an attempt that reached the SAS. A repeated reveal with the same `Nm` gets `sas.reveal.ok` again; a second reveal with a different `Nm` gets `enroll_rejected` and leaves the pending enrollment as it was (the first `Nm` stays pinned).
+
+### 5.2.1 The pre-admission authority chain
+
+```
+AuthorityChain = {
+  seq: <int ≥ -1>,                 // seq of the last entry in `entries`; -1 when `entries` is empty
+  entries: [ SignedEntry ],        // room-log-v2.md section 3, ascending seq
+  bodies:  [ { seq, body } ]       // one per entry, same seq; body = b64u(RJCS(SignedStatement)), as in log.fetch
+}
+```
+
+**Content.** The host selects, from its log at the moment it creates the pending enrollment, every `cls: "stmt"` entry whose `type` is one of exactly these eight, in log order, with its statement body:
+
+`admin.added`, `admin.removed`, `admin.key.rotated`, `admin.key.revoked`, `recovery.key.rotated`, `host.key.rotated`, `host.key.revoked`, `endpoint.rotated`.
+
+No other type is included. In particular `recovery.key.proposed` (no authority effect), `lane.offer.rotated` (would reveal lanes), `room.policy.changed`, `room.closed` and every member, device, invite, enrollment, grant and MLS entry are left out. The chain is part of the stored `enroll.pending` content, so it is fixed for the life of the pending enrollment (section 5.6, rule 2).
+
+**`seq`** is the `seq` of the last included entry, or -1 when there is none. It is **not** the log head, which would disclose the log's length. The member checks only that it names the last entry.
+
+**What the member verifies before admission** (`verifyAuthorityChain`), starting from the verified genesis:
+
+1. `bodies` has exactly one element per entry, with the same `seq`; entries are of this room, `cls: "stmt"`, of an included type, and strictly ascending in `seq`.
+2. Each entry's `hsig` verifies under a host key valid at its position, using the positional rule of `keys-rotation-recovery.md` section 3: the genesis host key from seq 0; a `host.key.rotated` entry at `r` is the last one the old key signs, and the key it installs is valid from `r + 1`.
+3. Each body matches the entry's `bodyHash`, parses strictly as a `SignedStatement` whose `type` and `roomId` equal the entry's, and is signed by an admin or recovery key (producer kind `admin` or `recovery`) that the genesis or an earlier chain entry certified.
+4. Each statement with a `KeyChange` carries a valid `newKeySig`. The key it installs is added to the set of signers (admin and recovery keys) or, for `host.key.rotated`, to the host-key table.
+5. `endpoint.rotated` replaces the endpoint. The last endpoint after the whole chain (the genesis endpoint if no `endpoint.rotated` is included) must equal the invite's `endpoint` (section 5.5, step 2).
+6. `seq` equals the `seq` of the last entry (or -1).
+
+**What the member cannot verify before admission.** Entries are not hash-linked to each other here (each one's `prev` names an entry that was not sent), so the member cannot tell whether an entry was omitted, for example a revocation or an `endpoint.rotated`. Removals and revocations are checked for signature but do not narrow the signer set. The producer rules of `room-log-v2.md` section 4 beyond "admin or recovery key" (which key may sign which type, old-key signing of rotations), the base, unique and forward rules, versions, lineages and re-folds are not applied. The chain therefore cannot detect an endpoint rolled back to an earlier certified one. It gives certified display (the owner fingerprint of section 6.4 is a key the chain certifies) and a consistency check on the endpoint. The protection against a substituted or rolled-back endpoint is the SAS: the IK handshake proves the host holds the invite's endpoint key, and the voice comparison binds that key and the genesis to the person (sections 6.1, 6.5). None of the SAS inputs come from the log.
+
+**Residual disclosure.** Before the SAS, a holder of the invite learns, from the included entries: their `seq` values and the `base` and `fromSeq` positions inside them (a lower bound on the log's length at each key change), their `hts` (when key changes happened), their `epoch` (the MLS epoch count at each, a rough measure of membership churn), the admin and recovery public keys and the `memberId` of each admin named in a `KeyChange.subject`, and the field versions (`ver`) in `endpoint.rotated`. This is accepted. It reveals nothing about ordinary members, invites, lanes or content.
+
+**After admission** the chain is discarded. The member's first authenticated session fetches the complete log with `log.fetch` from seq 0 and runs the full fold of `room-log-v2.md` section 5. Only that fold decides the authority state the device acts on (section 5.7).
 
 ### 5.3 Host check order
 
@@ -333,25 +370,28 @@ The host processes `enroll.request` in this order. "Generic" means the reply is 
 | Abandoned attempts | 3 | per invite | invite burned; `invite.burned {reason:"abandoned"}` logged |
 | Confirmer nonces | 3 per link, 1 per pending, 1 open pending at a time | per device link, **counted by the confirming device A**, not the host | A burns the link locally (`identity-model.md` section 6.4, R-2) |
 | SAS rejections | 1 | per invite | invite burned with `reason:"sas_mismatch"` |
-| Pre-auth requests | token bucket, 10 per minute, burst 5 | per room endpoint, statics **not** in the roster | `busy` |
+| Pre-auth requests | token bucket, 10 per minute, burst 5; counts `enroll.request` frames only | per room endpoint, statics **not** in the roster | `busy` |
 | Concurrent pre-auth sessions | 8 | per room endpoint, statics not in the roster | new handshakes refused until one closes |
 | Requests from active devices | token bucket, 60 per minute, burst 20 | per device | `busy` |
 | Pending enrollments | 16 | per room | `busy` |
 
-**Abandoned attempts** (decision round 3, review finding S-4). An attempt is abandoned when its pending enrollment reached `enroll.pending`, and so disclosed `Nh`, and then ended without admission for any reason other than a SAS rejection: `cancelled`, timeout, the admin's Cancel, a disconnect that outlasted `expiresAt`, or a failed resume. Each one sets `abandoned += 1` and returns the invite to `open`. The third burns the invite. Without this limit, a man in the middle holding the token could open a pending enrollment, compute the host-side SAS, and abort whenever it did not match, about 300 times over a 30-minute invite. With it, an attacker gets at most 3 SAS comparisons per invite, so it succeeds with probability at most 3 × 10^-6. The cost is that a member whose connection fails three times during one join needs a new invite; resume (section 5.6) keeps an ordinary network drop from counting. The admin's join card shows the count ("2 earlier attempts were abandoned").
+**Abandoned attempts** (decision round 3, review finding S-4). An attempt is abandoned when its pending enrollment reached `enroll.pending`, and so disclosed `Nh`, and then ended without admission for any reason other than a SAS rejection: `cancelled`, timeout, the admin's Cancel, a disconnect that outlasted `expiresAt`, a failed resume, a `sas.reveal` that does not open the commitment (section 5.2), or a repeated request with the same keys and a different `sasCommit` (section 5.6). A pending enrollment closed because the room closed does not count. Each one sets `abandoned += 1` and returns the invite to `open`. The third burns the invite. Without this limit, a man in the middle holding the token could open a pending enrollment, compute the host-side SAS, and abort whenever it did not match, about 300 times over a 30-minute invite. With it, an attacker gets at most 3 SAS comparisons per invite, so it succeeds with probability at most 3 × 10^-6. The cost is that a member whose connection fails three times during one join needs a new invite; resume (section 5.6) keeps an ordinary network drop from counting. The admin's join card shows the count ("2 earlier attempts were abandoned").
 
 **Who can touch an invite.** An attacker who only saw the endpoint key (any past invitee, P-15) can make requests, but steps 4 and 5 stop them before any invite is touched unless they name a real `inviteId`. The `inviteId` appears only inside the invite code, next to the token, and in the admin's local state. The log and MLS carry only `inviteRef`, a hash of the id, so members cannot learn the ids of open invites and burn them (S-5).
 
-**Separate budgets.** The pre-auth bucket and slots count only handshakes whose static key is not an active device in the roster. Active devices have their own per-device budget. So a past invitee who floods the pre-auth path delays new enrollments but cannot block the sessions of members (S-21). The pre-auth budget is per endpoint because the relay hides source addresses.
+**Separate budgets.** The pre-auth bucket and slots apply only to sessions whose static key is not an active device in the roster. Active devices have their own per-device budget. So a past invitee who floods the pre-auth path delays new enrollments but cannot block the sessions of members (S-21). The pre-auth budget is per endpoint because the relay hides source addresses.
+
+**What the pre-auth bucket counts.** Only `enroll.request` frames take a token, at step 3 of section 5.3, so a request that later fails the signature or token check has still used one. `sas.reveal`, `enroll.confirm`, `enroll.abort` and `enroll.resume` take none. They act only on the pending enrollment whose `deviceDh` equals the session's `rs`, so only the holder of that device key can use them, and any other use gets `enroll_rejected` and closes the session. Counting them would let a flood of requests starve a legitimate member who is resuming or confirming. The handshakes themselves are not counted by the bucket; the cap of 8 concurrent pre-auth sessions bounds them, and every pre-auth failure closes its session.
 
 ### 5.5 Member verification of `enroll.pending`
 
 The member checks, in order:
 
 1. `H("genesis", RJCS(genesis)) == invite.genesisHash`, and the genesis signature verifies with a key in `genesis.body.admins`.
-2. `genesis.body.endpoint` equals the invite's `endpoint` (same `serverId`, the same `dh` object, the same relay). A mismatch means the invite was altered: abort with `identity_mismatch`.
-3. `authority.entries` verify and fold (`room-log-v2.md` section 5). The endpoint they yield is the one connected to.
-4. `terms` are shown to the member with the SAS.
+2. `authority` verifies (section 5.2.1), and the **last certified endpoint** it yields equals the invite's `endpoint` (same `serverId`, the same `dh` object, the same relay). With no `endpoint.rotated` in the chain, that is the genesis endpoint. A mismatch means the invite was altered or the chain is not the room's: abort with `identity_mismatch`.
+3. `terms` are shown to the member with the SAS.
+
+Step 2 compares the invite with the last certified endpoint, not with `genesis.body.endpoint`: after an `endpoint.rotated`, a valid invite names the new endpoint, which never equals the genesis endpoint. An invite created before a rotation names a retired endpoint, which completes handshakes only for active devices (`keys-rotation-recovery.md` section 4.6), so the admin issues a new invite. The full fold of `room-log-v2.md` section 5 is not run here; it runs after admission (section 5.7).
 
 Only then does it send `sas.reveal`.
 
@@ -376,14 +416,27 @@ enroll.resume.ok = { t: "enroll.resume.ok", re, pending: <the stored enroll.pend
 ```
 
 1. The host accepts `enroll.resume` only from a session whose `rs` equals the pending enrollment's `deviceDh`. Anything else gets `enroll_rejected`.
-2. The host returns the stored `enroll.pending` content unchanged. It never issues a new `Nh`, a new `pendingId` or new terms for an existing pending enrollment. Authority changes during the pending period reach the member with `enroll.admitted`.
+2. The host returns the stored `enroll.pending` content unchanged, `authority` included. It never issues a new `Nh`, a new `pendingId`, new terms or a new chain for an existing pending enrollment. Authority changes during the pending period reach the member through `log.fetch` after admission (section 5.7).
 3. The member accepts the resume only if `pending` is byte-identical to what it stored. On any difference it aborts with `enroll.abort {reason: "cancelled"}`, deletes its keys and shows "The join could not be resumed safely. Ask for a new invite." The host closes the pending enrollment and counts an abandoned attempt (section 5.4).
 4. The member never sends `Nm` into a pending enrollment other than the one it stored. If `state` is `created` (the host never received `sas.reveal`), it re-sends `sas.reveal` with the same `Nm`. The SAS it shows is the stored one.
-5. Later states resume where they were: the member re-sends `enroll.confirm` if its journal says it confirmed and `state` is not yet `member_ok`; `held` and `admitted` deliver the stored frames.
+5. Later states resume where they were: the member re-sends `enroll.confirm` if its journal says it confirmed and `state` is not yet `member_ok`; `held` and `admitted` deliver the stored frames. For an admitted pending enrollment, `state` is `member_ok` (both confirmations were in) and `admitted` carries the stored `enroll.admitted` frame; the member processes `admitted` and ignores `state`. The session continues as the admitted device's session.
 
 **Restart before `enroll.pending` arrived.** A member whose journal is in state `keys` and has no `pendingId` opens a new session, appends `h′` to `sentH`, and sends a new `enroll.request` with the **same** keys, `Nm` and `sasCommit`, signed over `h′`. If the host already holds a pending enrollment for that `deviceDh`, it checks that `sasCommit` is the same, replies with `enroll.resume.ok` whose `pending` carries the original `h`, and keeps that `h` for the SAS. The member finds the original `h` in `sentH` and computes the SAS with it. If the host never received the first request, it creates the pending enrollment with `h′`. A different `sasCommit` for the same keys means the member lost its journal: the host closes the old pending enrollment as abandoned and replies `enroll_rejected`.
 
 Required tests: a resumed session that receives a different `Nh` aborts; a different `pendingId` aborts; a resume from a session with another `rs` is rejected; the SAS shown after resume equals the SAS shown before; a crash in state `keys` after the request was sent, followed by a restart, shows matching SAS codes on both sides (R-4); an `enroll.pending` whose `h` is not in `sentH` is refused.
+
+### 5.7 Member verification of `enroll.admitted`
+
+On `enroll.admitted` (pushed, or inside `enroll.resume.ok`) the member checks, before it journals `admitted`:
+
+- `pendingId` is its own;
+- `entry.entry.type` and the statement's `type` are `member.admitted`, the statement's `roomId` is this room, and `entry.entry.bodyHash` matches `RJCS(statement)`;
+- the statement's member has `memberId` and a device with `deviceId` whose `sig` and `dh` are the member's own keys;
+- `confirmation` is `{method: "sas6", inviteRef, transcript}` with the `inviteRef` of its invite and the transcript the member computed (section 6.2).
+
+Any failure ends the join with `bad_admission` and deletes the keys.
+
+The admin's signature on the statement and the host's signature on the entry are **not** checked on `enroll.admitted` itself. The admin key that signs may have been rotated in after the pending enrollment's chain was fixed (section 9), and the chain cannot show that it was not revoked (section 5.2.1). They are checked by the full fold instead: on its first authenticated session the member runs `log.fetch` from seq 0 and folds the whole chain (`room-log-v2.md` section 5). The entry carried by `enroll.admitted` must appear at its `seq` with the same `hash`; a different valid entry at that position is an equivocation and raises `fork` (`room-log-v2.md` section 6.6). A fold that rejects the admission entry raises `invalid_entry`. Both alerts stop the device from sending (`room-log-v2.md` section 6.6). From this fold on, the device uses only the folded authority state; the pre-admission chain is discarded.
 
 ## 6. Short authentication string
 
@@ -416,7 +469,7 @@ A "Join request" card in the room's member list:
 
 - "Someone used the invite **for Sam** (created 10:42)." (the admin's own note)
 - "They call themselves: Sam laptop (self-reported)."
-- **Code: 015 136** in large digits.
+- **Code: 317 837** in large digits.
 - The number of earlier abandoned attempts on this invite, if any.
 - "Call or meet the person you invited and ask them to read their code. Admit only if it is the same. Do not compare codes in the chat or email where you sent the invite."
 - Buttons: **Admit** (enabled only once `sas.reveal` arrived), **Codes do not match**, **Cancel**.
@@ -425,7 +478,7 @@ A "Join request" card in the room's member list:
 
 ### 6.4 What the member sees
 
-- "Read this code to the room owner by voice or in person: **015 136**"
+- "Read this code to the room owner by voice or in person: **317 837**"
 - Room name, owner fingerprint (admin key `kid` display form), role and lanes from `terms`, all marked "(unverified until the codes match)".
 - Buttons: **Codes match**, **Codes do not match**, **Cancel**.
 - After "Codes match": "Waiting for the owner to admit you…".
@@ -442,7 +495,8 @@ SAS establishes that the device in the session is the device of the person the o
 
 ```
 open ──(valid proof, step 9)──▶ claimed ──(admitted)──▶ used
-  │                               │  ├─(abandoned: timeout, abort "cancelled", admin cancel, disconnect > expiresAt, failed resume)
+  │                               │  ├─(abandoned: timeout, abort "cancelled", admin cancel, disconnect > expiresAt, failed resume,
+  │                               │  │   reveal that does not open the commitment, changed sasCommit)
   │                               │  │      abandoned += 1 ──▶ burned (if abandoned = 3) | open (if exp not passed) | expired
   │                               │  ├─(SAS mismatch from either side)──▶ burned
   │                               │  └─(admin revokes invite)──▶ revoked (pending closed: invite_revoked)
@@ -508,7 +562,7 @@ Timers and observers are armed from the journal at plugin start (`contribute()` 
 | Admin revokes the invite during pending | Pending closes with `invite_revoked`; the member deletes its keys. |
 | Admin removes the member right after admission | Normal removal (`grants-v2.md` section 7). If `enroll.admitted` was not yet delivered, the next `enroll.resume` returns `access_ended removed`. |
 | Room closed during pending | `room_closed` to every pending session. |
-| Admin key rotated during pending | The admission is signed by the admin key valid at that time; the member folds authority entries delivered with `enroll.admitted`. |
+| Admin key rotated during pending | The admission is signed by the admin key valid at that time, which the pending's chain may not show. The member does not check that signature on `enroll.admitted`; the full fold over `log.fetch` checks it right after admission (section 5.7). |
 | Host restarts during pending | Pending survives (persisted). Member reconnects and resumes. |
 | Member restarts during pending | Journal state `pending` or `confirmed`; member resumes with the same DH key. |
 | Member presses "Codes match" after the admin pressed "Codes do not match" | `enroll.closed rejected` wins; the confirm gets `enroll_closed`. |

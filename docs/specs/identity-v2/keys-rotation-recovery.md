@@ -106,6 +106,7 @@ Optional and offered by default at room creation; it can also be added later, an
 
 1. The host generates a new key.
 2. An admin appends `host.key.rotated` (admin-signed) with `KeyChange` (old host key as `old`), the new key's `newKeySig` and `oldValidTo = now + 24 h` (grants only).
+   The host refuses (`not_permitted`) a submitted `host.key.rotated` whose new key it does not hold. Sequencing it would leave no key able to sign the next entry, since the old key may not sign after the rotation entry (step 3).
 3. The entry that carries this statement is the last one signed with the old key. Every later entry is signed with the new key; an entry after it that names the old `hostKid` is invalid (section 3). The host signs new grants with the new key at once.
 4. Members and lane endpoints verify grants against both keys until the old key's `oldValidTo`.
 5. No MLS change (the host is not an MLS member).
