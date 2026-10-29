@@ -1,0 +1,9 @@
+{
+  "id": "rooms",
+  "name": "Rooms",
+  "description": "Share an agent read-only with other Paseo users through their own daemons, with invites and live revocation.",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.13.2"
+  }
+}

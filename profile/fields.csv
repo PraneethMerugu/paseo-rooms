@@ -1,0 +1,260 @@
+object,field,action,reason
+hello,type,gateway,constant "hello"
+hello,sessionPermissions,gateway,constant ceiling [workspace.read]
+hello,routed,drop,viewer routing flag; the upstream is a direct loopback session
+hello,producer,drop,viewer producer identity is never forwarded
+hello,clientId,gateway,"fixed per (lane, member, route slot); never derived from the viewer (C-2)"
+hello,clientType,gateway,constant "browser"
+hello,protocolVersion,redact,integer 1..16 from the viewer else 1
+hello,auth,gateway,local credential of the owner daemon (viewer auth is dropped)
+hello,appVersion,redact,kept only if it is a plain semver (compat gates); else omitted
+hello,capabilities,nested,rebuilt from hello.capabilities
+hello.capabilities,voice,drop,voice is not in the watch profile
+hello.capabilities,hello_rejection,force,gateway handles hello.rejected
+hello.capabilities,pushNotifications,drop,push tokens never reach the owner daemon
+hello.capabilities,explicit_event_subscriptions,force,"modern mode; otherwise the daemon broadcasts every event (C-2)"
+hello.capabilities,all_providers,drop,provider catalogs are not in the watch profile
+hello.capabilities,reasoning_merge_enum,keep,rendering format of timeline items
+hello.capabilities,selective_agent_timeline,force,"modern mode; otherwise all agent streams are broadcast (C-2)"
+hello.capabilities,custom_mode_icons,keep,rendering format of agent modes
+hello.capabilities,terminal_reflowable_snapshot,drop,terminals are denied
+hello.capabilities,provider_subagents,drop,provider subagent messages are denied
+hello.capabilities,project_updates,drop,project updates are denied
+hello.capabilities,compact_provider_snapshots,drop,provider snapshots are denied
+hello.capabilities,provider_snapshot_references,drop,provider snapshots are denied
+hello.capabilities,timeline_replacement_invalidation,keep,rendering format of timeline replacement
+hello.capabilities,timeline_notifications,keep,rendering format of timeline items
+hello.capabilities,browser_host,drop,browser automation host registration is never forwarded
+hello.capabilities,owned_subscriptions,force,"modern mode; subscriptions owned by this session only (C-2)"
+hello.capabilities,plugin_timeline_items,keep,rendering format of timeline items
+hello.capabilities,projected_subagent_timeline,keep,rendering format of timeline items
+hello.capabilities,workspace_setup_observation,drop,workspace setup is not in the watch profile
+hello.capabilities,workspace_setup_blocked,drop,workspace setup is not in the watch profile
+in:fetch_agent_request,type,keep,
+in:fetch_agent_request,requestId,keep,
+in:fetch_agent_request,agentId,keep,exact-id bound to the lane agent
+in:fetch_agent_timeline_request,type,keep,
+in:fetch_agent_timeline_request,agentId,keep,exact-id bound to the lane agent
+in:fetch_agent_timeline_request,requestId,keep,
+in:fetch_agent_timeline_request,direction,keep,
+in:fetch_agent_timeline_request,cursor,keep,
+in:fetch_agent_timeline_request,limit,redact,"clamped: 0 (all) and values above the limit become maxTimelineLimit (P-17)"
+in:fetch_agent_timeline_request,projection,keep,
+in:fetch_agent_timeline_request,mergeWindow,keep,
+in:agent.timeline.set_subscription.request,type,keep,
+in:agent.timeline.set_subscription.request,agentIds,keep,every id bound to the lane agent
+in:agent.timeline.set_subscription.request,requestId,keep,
+in:session.events.set_subscription.request,type,keep,
+in:session.events.set_subscription.request,requestId,keep,
+in:session.events.set_subscription.request,events,redact,narrowed to ALLOWED_SESSION_EVENTS
+in:session.events.set_subscription.request,notifications,redact,forced false
+in:subscription.release.request,type,keep,
+in:subscription.release.request,requestId,keep,
+in:subscription.release.request,subscriptionId,keep,acts on this session's own subscriptions only
+in:fetch_agents_request,type,keep,
+in:fetch_agents_request,requestId,keep,
+in:fetch_agents_request,scope,keep,result rebuilt by the gateway
+in:fetch_agents_request,includeBackground,drop,background agents are never listed
+in:fetch_agents_request,filter,nested,
+in:fetch_agents_request,sort,keep,result rebuilt by the gateway
+in:fetch_agents_request,page,nested,
+in:fetch_agents_request,subscribe,nested,
+in:fetch_agents_request,sync,drop,"the daemon always answers with a snapshot; sequence numbers are rebased per route (P-26)"
+in:fetch_agents_request.filter,labels,keep,applied again by the gateway on the rebuilt entry
+in:fetch_agents_request.filter,projectKeys,keep,applied again by the gateway on the rebuilt entry
+in:fetch_agents_request.filter,statuses,keep,applied again by the gateway on the rebuilt entry
+in:fetch_agents_request.filter,includeArchived,keep,applied again by the gateway on the rebuilt entry
+in:fetch_agents_request.filter,requiresAttention,keep,applied again by the gateway on the rebuilt entry
+in:fetch_agents_request.filter,thinkingOptionId,drop,not applied by the gateway
+in:fetch_agents_request.filter,includeInternal,drop,internal agents are never listed
+in:fetch_agents_request.filter,includeBackground,drop,background agents are never listed
+in:fetch_agents_request.page,limit,keep,
+in:fetch_agents_request.page,cursor,keep,
+in:fetch_agents_request.subscribe,subscriptionId,keep,
+in:fetch_workspaces_request,includeBackground,drop,background workspaces are never listed
+in:fetch_workspaces_request,type,keep,
+in:fetch_workspaces_request,requestId,keep,
+in:fetch_workspaces_request,filter,nested,
+in:fetch_workspaces_request,sort,keep,result rebuilt by the gateway
+in:fetch_workspaces_request,page,nested,
+in:fetch_workspaces_request,subscribe,nested,
+in:fetch_workspaces_request,sync,drop,"the daemon always answers with a snapshot; sequence numbers are rebased per route (P-26)"
+in:fetch_workspaces_request.filter,query,keep,applied again by the gateway on the rebuilt entry
+in:fetch_workspaces_request.filter,projectId,keep,applied again by the gateway on the rebuilt entry
+in:fetch_workspaces_request.filter,idPrefix,drop,prefix resolution is never forwarded
+in:fetch_workspaces_request.filter,includeInternal,drop,internal workspaces are never listed
+in:fetch_workspaces_request.filter,includeBackground,drop,background workspaces are never listed
+in:fetch_workspaces_request.page,limit,keep,
+in:fetch_workspaces_request.page,cursor,keep,
+in:fetch_workspaces_request.subscribe,subscriptionId,keep,
+out:fetch_agent_response,requestId,keep,
+out:fetch_agent_response,agent,redact,AgentSnapshot allowlist
+out:fetch_agent_response,project,redact,ProjectPlacement allowlist
+out:fetch_agent_response,error,redact,"generic text (C-16); the full text goes to the owner-only lane error log"
+out:fetch_agents_response,requestId,keep,
+out:fetch_agents_response,subscriptionId,keep,
+out:fetch_agents_response,entries,gateway,"lane entry only, AgentListEntry allowlist"
+out:fetch_agents_response,pageInfo,gateway,single page
+out:fetch_agents_response,sync,gateway,"removals scoped, headSeq rebased per route (P-26)"
+out:fetch_workspaces_response,requestId,keep,
+out:fetch_workspaces_response,subscriptionId,keep,
+out:fetch_workspaces_response,entries,gateway,"lane workspace only, WorkspaceDescriptor allowlist"
+out:fetch_workspaces_response,emptyProjects,gateway,always empty
+out:fetch_workspaces_response,pageInfo,gateway,single page
+out:fetch_workspaces_response,sync,gateway,"removals scoped, headSeq rebased per route (P-26)"
+out:agent_update,subscriptionId,keep,
+out:agent_update,kind,keep,
+out:agent_update,agent,redact,AgentSnapshot allowlist
+out:agent_update,project,redact,ProjectPlacement allowlist
+out:agent_update,generation,gateway,"per-route generation, so rebased sequence numbers never mix across routes (P-26)"
+out:agent_update,seq,gateway,rebased per route (P-26)
+out:agent_update,agentId,keep,lane agent only
+out:agent_status,agentId,keep,lane agent only
+out:agent_status,status,keep,
+out:agent_status,info,redact,AgentSnapshot allowlist
+out:workspace_update,subscriptionId,keep,
+out:workspace_update,kind,keep,
+out:workspace_update,workspace,redact,WorkspaceDescriptor allowlist
+out:workspace_update,generation,gateway,"per-route generation, so rebased sequence numbers never mix across routes (P-26)"
+out:workspace_update,seq,gateway,rebased per route (P-26)
+out:workspace_update,id,keep,lane workspace only
+out:workspace_update,emptyProject,drop,describes another project
+out:workspace_update,removedProjectId,drop,describes another project
+out:agent_stream,subscriptionId,keep,
+out:agent_stream,agentId,keep,lane agent only
+out:agent_stream,event,redact,"watch content; attention notification serverId rewritten to the lane (C-6); turn_failed error and timeline error items become generic text, the full text goes to the owner-only lane error log"
+out:agent_stream,timestamp,keep,
+out:agent_stream,seq,keep,per-agent timeline sequence
+out:agent_stream,epoch,keep,per-agent timeline epoch
+out:agent.timeline.replacement,subscriptionId,keep,
+out:agent.timeline.replacement,agentId,keep,lane agent only
+out:agent.timeline.replacement,epoch,keep,
+out:agent_attention_required,subscriptionId,keep,
+out:agent_attention_required,agentId,keep,lane agent only
+out:agent_attention_required,reason,keep,
+out:agent_attention_required,timestamp,keep,
+out:agent_attention_required,shouldNotify,keep,
+out:agent_attention_required,notification,redact,serverId rewritten to the lane (C-6)
+out:agent_permission_request,subscriptionId,keep,
+out:agent_permission_request,agentId,keep,lane agent only
+out:agent_permission_request,request,keep,watch content (tool input)
+out:agent_permission_resolved,subscriptionId,keep,
+out:agent_permission_resolved,agentId,keep,lane agent only
+out:agent_permission_resolved,requestId,keep,
+out:agent_permission_resolved,resolution,keep,
+out:rpc_error,requestId,keep,only for forwarded request ids
+out:rpc_error,requestType,keep,
+out:rpc_error,error,redact,"generic text; daemon exception text can carry paths (C-16); the full text goes to the owner-only lane error log"
+out:rpc_error,code,redact,kept only if it is a short [a-z_] code
+out:fetch_agent_timeline_response,requestId,keep,
+out:fetch_agent_timeline_response,agentId,keep,lane agent only
+out:fetch_agent_timeline_response,agent,redact,AgentSnapshot allowlist
+out:fetch_agent_timeline_response,direction,keep,
+out:fetch_agent_timeline_response,projection,keep,
+out:fetch_agent_timeline_response,epoch,keep,
+out:fetch_agent_timeline_response,reset,keep,
+out:fetch_agent_timeline_response,staleCursor,keep,
+out:fetch_agent_timeline_response,gap,keep,
+out:fetch_agent_timeline_response,window,keep,
+out:fetch_agent_timeline_response,startCursor,keep,
+out:fetch_agent_timeline_response,endCursor,keep,
+out:fetch_agent_timeline_response,hasOlder,keep,
+out:fetch_agent_timeline_response,hasNewer,keep,
+out:fetch_agent_timeline_response,mergeWindow,keep,
+out:fetch_agent_timeline_response,entries,redact,"watch content (timeline of the lane agent); error items become generic text, the full text goes to the owner-only lane error log"
+out:fetch_agent_timeline_response,error,redact,"generic text (C-16); the full text goes to the owner-only lane error log"
+out:agent.timeline.set_subscription.response,subscriptionId,keep,
+out:agent.timeline.set_subscription.response,agentIds,keep,
+out:agent.timeline.set_subscription.response,requestId,keep,
+out:session.events.set_subscription.response,requestId,keep,
+out:session.events.set_subscription.response,subscriptionId,keep,
+out:subscription.release.response,requestId,keep,
+out:subscription.release.response,subscriptionId,keep,
+AgentListEntry,agent,redact,AgentSnapshot allowlist
+AgentListEntry,project,redact,ProjectPlacement allowlist
+AgentListEntry,searchScore,drop,search is not in the watch profile
+AgentListEntry,searchMatches,drop,search is not in the watch profile
+AgentListEntry,syncSeq,gateway,rebased per route (P-26)
+AgentSnapshot,id,keep,
+AgentSnapshot,provider,keep,
+AgentSnapshot,cwd,redact,"absolute path -> /room/<basename> (C-3); basename keyed-hashed unless the room shows project names"
+AgentSnapshot,workspaceId,keep,
+AgentSnapshot,model,keep,
+AgentSnapshot,features,keep,provider feature toggles for rendering
+AgentSnapshot,thinkingOptionId,keep,
+AgentSnapshot,effectiveThinkingOptionId,keep,
+AgentSnapshot,createdAt,keep,
+AgentSnapshot,updatedAt,keep,
+AgentSnapshot,lastUserMessageAt,keep,
+AgentSnapshot,status,keep,
+AgentSnapshot,activeTurn,keep,
+AgentSnapshot,capabilities,keep,
+AgentSnapshot,currentModeId,keep,
+AgentSnapshot,availableModes,keep,
+AgentSnapshot,pendingPermissions,keep,watch content (tool input)
+AgentSnapshot,persistence,redact,"null: metadata carries systemPrompt, daemon-wide appended prompt, toolPolicy, cwd and the provider session id (C-3)"
+AgentSnapshot,runtimeInfo,nested,
+AgentSnapshot,lastUsage,keep,
+AgentSnapshot,lastError,redact,"generic text when present (C-16); the full text goes to the owner-only lane error log"
+AgentSnapshot,title,keep,
+AgentSnapshot,labels,redact,"only rooms.* labels; drops paseo.parent-agent-id and owner labels (C-3)"
+AgentSnapshot,requiresAttention,keep,
+AgentSnapshot,attentionReason,keep,
+AgentSnapshot,attentionTimestamp,keep,
+AgentSnapshot,archivedAt,keep,
+AgentSnapshot,providerUnavailable,keep,
+AgentSnapshot,internal,drop,private helper marker
+AgentSnapshot.runtimeInfo,provider,keep,
+AgentSnapshot.runtimeInfo,sessionId,redact,null: provider session id (C-3)
+AgentSnapshot.runtimeInfo,model,keep,
+AgentSnapshot.runtimeInfo,thinkingOptionId,keep,
+AgentSnapshot.runtimeInfo,modeId,keep,
+AgentSnapshot.runtimeInfo,extra,drop,provider-specific runtime data
+ProjectPlacement,projectKey,redact,"lane-scoped opaque key; the daemon key is a git remote or host:<serverId>:<path> (C-3, C-6)"
+ProjectPlacement,projectName,redact,"display name (may be owner/repo of the remote): neutral lane label unless the room shows project names (decisions round 2)"
+ProjectPlacement,workspaceName,redact,"kept, except a name equal to the project or project folder name becomes the neutral label unless the room shows project names"
+ProjectPlacement,checkout,nested,
+ProjectPlacement.checkout,cwd,redact,"absolute path -> /room/<basename>; basename keyed-hashed unless the room shows project names"
+ProjectPlacement.checkout,isGit,keep,
+ProjectPlacement.checkout,currentBranch,keep,branch name of the shared workspace (accepted under D1)
+ProjectPlacement.checkout,remoteUrl,redact,null: git remote (C-3)
+ProjectPlacement.checkout,worktreeRoot,redact,"absolute path -> /room/<basename>; basename keyed-hashed unless the room shows project names"
+ProjectPlacement.checkout,isPaseoOwnedWorktree,keep,
+ProjectPlacement.checkout,mainRepoRoot,redact,"absolute path -> /room/<basename> (kept null when null); basename keyed-hashed unless the room shows project names"
+WorkspaceDescriptor,id,keep,
+WorkspaceDescriptor,projectId,keep,opaque daemon project id
+WorkspaceDescriptor,projectDisplayName,redact,"display name: neutral lane label unless the room shows project names (decisions round 2)"
+WorkspaceDescriptor,projectCustomName,redact,"owner-chosen project name: neutral lane label (null stays null) unless the room shows project names"
+WorkspaceDescriptor,projectCustomIconRevision,drop,icon fetch is denied
+WorkspaceDescriptor,projectRootPath,redact,"absolute path -> /room/<basename> (C-3); basename keyed-hashed unless the room shows project names"
+WorkspaceDescriptor,workspaceDirectory,redact,"absolute path -> /room/<basename> (C-3); basename keyed-hashed unless the room shows project names"
+WorkspaceDescriptor,setupStatus,drop,workspace setup is not in the watch profile
+WorkspaceDescriptor,worktreeSlug,keep,"basename of a Paseo worktree; not checked against the project name (open item)"
+WorkspaceDescriptor,projectKind,keep,
+WorkspaceDescriptor,workspaceKind,keep,
+WorkspaceDescriptor,name,redact,"kept, except a name equal to the project or project folder name becomes the neutral label unless the room shows project names"
+WorkspaceDescriptor,title,redact,"kept, except a title equal to the project or project folder name becomes the neutral label unless the room shows project names"
+WorkspaceDescriptor,pinnedAt,drop,owner UI preference
+WorkspaceDescriptor,labels,drop,owner workspace labels
+WorkspaceDescriptor,internal,drop,private helper marker
+WorkspaceDescriptor,background,drop,private helper marker
+WorkspaceDescriptor,archivingAt,keep,
+WorkspaceDescriptor,status,gateway,"derived from the lane agent only; the daemon aggregates every agent in the workspace (C-3)"
+WorkspaceDescriptor,statusEnteredAt,gateway,lane agent updatedAt
+WorkspaceDescriptor,activityAt,gateway,lane agent updatedAt
+WorkspaceDescriptor,createdAt,keep,
+WorkspaceDescriptor,lastUserMessageAt,gateway,lane agent lastUserMessageAt
+WorkspaceDescriptor,diffStat,redact,null: aggregate of the whole checkout (C-3)
+WorkspaceDescriptor,scripts,redact,"[]: ports, terminal ids and proxy URLs (C-3)"
+WorkspaceDescriptor,gitRuntime,nested,
+WorkspaceDescriptor,githubRuntime,redact,"null: PR, checks and repo owner (C-3)"
+WorkspaceDescriptor,forge,drop,forge name
+WorkspaceDescriptor,project,redact,ProjectPlacement allowlist
+WorkspaceDescriptor,syncSeq,gateway,rebased per route (P-26)
+WorkspaceDescriptor.gitRuntime,currentBranch,keep,branch name of the shared workspace (accepted under D1)
+WorkspaceDescriptor.gitRuntime,remoteUrl,drop,git remote (C-3)
+WorkspaceDescriptor.gitRuntime,isPaseoOwnedWorktree,keep,
+WorkspaceDescriptor.gitRuntime,isDirty,drop,reveals edits by other agents in the checkout
+WorkspaceDescriptor.gitRuntime,aheadBehind,drop,reveals activity outside the lane
+WorkspaceDescriptor.gitRuntime,aheadOfOrigin,drop,reveals activity outside the lane
+WorkspaceDescriptor.gitRuntime,behindOfOrigin,drop,reveals activity outside the lane

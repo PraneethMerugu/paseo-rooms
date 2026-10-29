@@ -1,0 +1,450 @@
+type,direction,daemon_permission,future_role,m1_watch,binding_or_reason
+abort_request,inbound,workspace.write,steer,deny,steer role is Milestone 2
+agent.config.apply.request,inbound,"[workspace.write, hub.execute]",owner,deny,phase0 flag: write op; steer/maintain are not in M1
+agent.create.request,inbound,"[workspace.write, hub.execute]",never,deny,default deny
+agent.detach.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+agent.fork_context.request,inbound,workspace.read,steer,deny,steer role is Milestone 2
+agent.provider_subagents.list.request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+agent.provider_subagents.timeline.get.request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+agent.rewind.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+agent.skills.get_status.request,inbound,daemon.read,never,deny,default deny
+agent.skills.import_legacy_selection.request,inbound,daemon.manage,never,deny,default deny
+agent.skills.reconcile.request,inbound,daemon.manage,never,deny,default deny
+agent.skills.save_selection.request,inbound,daemon.manage,never,deny,default deny
+agent.skills.uninstall.request,inbound,daemon.manage,never,deny,default deny
+agent.timeline.append.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+agent.timeline.list_prompts.request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+agent.timeline.search.request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+agent.timeline.set_subscription.request,inbound,"[workspace.read, hub.execute]",watch,forward,"agentIds is a non-empty array, every id == lane.agentId"
+agent_permission_response,inbound,workspace.write,approve,deny,approve role is Milestone 2
+archive_agent_request,inbound,"[workspace.write, hub.execute]",owner,deny,phase0 flag: write op; steer/maintain are not in M1
+archive_workspace_request,inbound,"[workspace.manage, hub.execute]",owner,deny,default deny
+audio_played,inbound,workspace.write,never,deny,default deny
+branch_suggestions_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+browser.automation.execute.response,inbound,workspace.write,never,deny,default deny
+browser.host.register.request,inbound,[workspace.write],never,deny,default deny
+cancel_agent_request,inbound,"[workspace.write, hub.execute]",steer,deny,steer role is Milestone 2
+capture_terminal_request,inbound,workspace.read,owner,deny,terminal I/O is code execution; owner-only
+chat/create,inbound,workspace.write,never,deny,default deny
+chat/delete,inbound,workspace.write,never,deny,default deny
+chat/inspect,inbound,workspace.read,never,deny,default deny
+chat/list,inbound,workspace.read,never,deny,default deny
+chat/post,inbound,workspace.write,never,deny,default deny
+chat/read,inbound,workspace.read,never,deny,default deny
+chat/wait,inbound,workspace.read,never,deny,default deny
+checkout.commits.file_diff.request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+checkout.commits.list.request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+checkout.diff.get.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+checkout.discard_changes.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout.forge.get_check_details.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+checkout.forge.set_auto_merge.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout.github.get_check_details.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+checkout.github.set_auto_merge.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout.refresh.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+checkout.rename_branch.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_commit_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_merge_from_base_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_merge_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_pr_create_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_pr_merge_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_pr_status_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+checkout_pull_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_push_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+checkout_status_request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+checkout_switch_branch_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+clear_agent_attention,inbound,workspace.write,steer,deny,steer role is Milestone 2
+client_heartbeat,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+close_items_request,inbound,workspace.manage,owner,deny,default deny
+create_agent_request,inbound,"[workspace.write, hub.execute]",never,deny,default deny
+create_paseo_worktree_request,inbound,workspace.manage,never,deny,default deny
+create_terminal_request,inbound,workspace.write,owner,deny,terminal I/O is code execution; owner-only
+creation.subscribe.request,inbound,workspace.read,never,deny,default deny
+daemon.config.reload.request,inbound,daemon.manage,never,deny,default deny
+daemon.get_pairing_offer.request,inbound,access.manage,never,deny,default deny
+daemon.get_status.request,inbound,daemon.read,never,deny,default deny
+daemon.update.request,inbound,daemon.manage,never,deny,default deny
+delete_agent_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+diagnostics.request,inbound,daemon.read,never,deny,default deny
+dictation_stream_cancel,inbound,workspace.write,never,deny,default deny
+dictation_stream_chunk,inbound,workspace.write,never,deny,default deny
+dictation_stream_finish,inbound,workspace.write,never,deny,default deny
+dictation_stream_start,inbound,workspace.write,never,deny,default deny
+directory_suggestions_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+fetch_agent_history_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+fetch_agent_request,inbound,"[workspace.read, hub.execute]",watch,forward,agentId == lane.agentId (exact; daemon resolves prefixes/titles otherwise)
+fetch_agent_timeline_request,inbound,"[workspace.read, hub.execute]",watch,forward,agentId == lane.agentId (exact)
+fetch_agents_request,inbound,"[workspace.read, hub.execute]",watch,gateway,forwarded for subscription/sync metadata; entries rebuilt by the gateway from fetch_agent
+fetch_recent_provider_sessions_request,inbound,workspace.read,never,deny,default deny
+fetch_workspaces_request,inbound,"[workspace.read, hub.execute]",watch,gateway,forwarded for subscription/sync metadata; entries rebuilt by the gateway
+file.upload.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+file_download_token_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+file_explorer_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+forge.search.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+fs.entry.create.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+fs.entry.delete.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+fs.entry.duplicate.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+fs.entry.rename.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+fs.file.subscribe.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+fs.file.unsubscribe.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+fs.file.write.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+get_daemon_config_request,inbound,daemon.read,never,deny,default deny
+get_providers_snapshot_request,inbound,"[daemon.read, hub.execute]",never,deny,default deny
+github_search_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+hosts.add.request,inbound,tunnel.manage,never,deny,default deny
+hosts.link.open.request,inbound,null,never,deny,default deny
+hosts.list.request,inbound,daemon.read,never,deny,default deny
+hosts.remove.request,inbound,tunnel.manage,never,deny,default deny
+hosts.route.close.request,inbound,null,never,deny,default deny
+hosts.route.frame.request,inbound,null,never,deny,default deny
+hosts.route.open.request,inbound,null,never,deny,default deny
+hosts.update.request,inbound,tunnel.manage,never,deny,default deny
+hub.execution.agent.create.request,inbound,hub.execute,never,deny,default deny
+hub.execution.agent.validate.request,inbound,hub.execute,never,deny,default deny
+hub.execution.control.request,inbound,hub.execute,never,deny,default deny
+hub.management.daemon.connect.request,inbound,tunnel.manage,never,deny,default deny
+hub.management.daemon.disconnect.request,inbound,tunnel.manage,never,deny,default deny
+hub.management.daemon.get_status.request,inbound,tunnel.manage,never,deny,default deny
+hub.management.daemon.permissions.update.request,inbound,access.manage,never,deny,default deny
+import_agent_request,inbound,workspace.write,never,deny,default deny
+kill_terminal_request,inbound,workspace.write,owner,deny,terminal I/O is code execution; owner-only
+list_available_editors_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+list_available_providers_request,inbound,daemon.read,never,deny,default deny
+list_commands_request,inbound,daemon.read,never,deny,default deny
+list_provider_features_request,inbound,daemon.read,never,deny,default deny
+list_provider_models_request,inbound,daemon.read,never,deny,default deny
+list_provider_modes_request,inbound,daemon.read,never,deny,default deny
+list_terminals_request,inbound,workspace.read,owner,deny,terminal I/O is code execution; owner-only
+loop/inspect,inbound,automation.manage,never,deny,default deny
+loop/list,inbound,automation.manage,never,deny,default deny
+loop/logs,inbound,automation.manage,never,deny,default deny
+loop/run,inbound,automation.manage,never,deny,default deny
+loop/stop,inbound,automation.manage,never,deny,default deny
+open_in_editor_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+open_project_request,inbound,workspace.manage,owner,deny,default deny
+paseo_worktree_archive_request,inbound,workspace.manage,owner,deny,default deny
+paseo_worktree_list_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+ping,inbound,daemon.read,never,deny,default deny
+plugin.catalog.get.request,inbound,daemon.manage,never,deny,default deny
+plugin.directory.inspect.request,inbound,daemon.manage,never,deny,default deny
+plugin.directory.install.request,inbound,daemon.manage,never,deny,default deny
+plugin.disable.request,inbound,daemon.manage,never,deny,default deny
+plugin.enable.request,inbound,daemon.manage,never,deny,default deny
+plugin.list.request,inbound,daemon.manage,never,deny,default deny
+plugin.logs.get.request,inbound,daemon.manage,never,deny,default deny
+plugin.reload.request,inbound,daemon.manage,never,deny,default deny
+plugin.remove.request,inbound,daemon.manage,never,deny,default deny
+plugin.rpc.invoke.request,inbound,daemon.manage,never,deny,default deny
+plugin.source.install.request,inbound,daemon.manage,never,deny,default deny
+plugin.source.status.request,inbound,daemon.manage,never,deny,default deny
+plugin.source.update.apply.request,inbound,daemon.manage,never,deny,default deny
+plugin.source.update.preview.request,inbound,daemon.manage,never,deny,default deny
+plugin.source.update.request,inbound,daemon.manage,never,deny,default deny
+project.add.request,inbound,workspace.manage,never,deny,default deny
+project.create_directory.request,inbound,workspace.manage,never,deny,default deny
+project.github.clone.request,inbound,workspace.manage,never,deny,default deny
+project.icon.get.request,inbound,workspace.read,never,deny,default deny
+project.icon.set.request,inbound,workspace.manage,never,deny,default deny
+project.list.request,inbound,workspace.read,never,deny,default deny
+project.remove.request,inbound,workspace.manage,never,deny,default deny
+project.rename.request,inbound,workspace.manage,never,deny,default deny
+project_icon_request,inbound,workspace.read,never,deny,default deny
+provider.usage.list.request,inbound,daemon.read,never,deny,default deny
+provider_diagnostic_request,inbound,daemon.read,never,deny,default deny
+pull_request_timeline_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+push.unregister.request,inbound,workspace.read,never,deny,default deny
+read_project_config_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+refresh_agent_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+refresh_providers_snapshot_request,inbound,"[daemon.read, hub.execute]",never,deny,default deny
+register_push_token,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+restart_server_request,inbound,daemon.manage,never,deny,default deny
+resume_agent_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+schedule/create,inbound,automation.manage,never,deny,default deny
+schedule/delete,inbound,automation.manage,never,deny,default deny
+schedule/inspect,inbound,automation.manage,never,deny,default deny
+schedule/list,inbound,automation.manage,never,deny,default deny
+schedule/logs,inbound,automation.manage,never,deny,default deny
+schedule/pause,inbound,automation.manage,never,deny,default deny
+schedule/resume,inbound,automation.manage,never,deny,default deny
+schedule/run-once,inbound,automation.manage,never,deny,default deny
+schedule/update,inbound,automation.manage,never,deny,default deny
+send_agent_message_request,inbound,"[workspace.write, hub.execute]",steer,deny,steer role is Milestone 2
+session.events.set_subscription.request,inbound,"[workspace.read, daemon.read, hub.execute]",watch,forward,events narrowed to the agent-scoped allowlist; notifications forced false
+set_agent_feature_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+set_agent_mode_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+set_agent_model_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+set_agent_thinking_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+set_daemon_config_request,inbound,daemon.manage,never,deny,default deny
+set_voice_mode,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+shutdown_server_request,inbound,daemon.manage,never,deny,default deny
+start_workspace_script_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+stash_list_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+stash_pop_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+stash_save_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+subscribe_checkout_diff_request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+subscribe_terminal_request,inbound,workspace.read,owner,deny,terminal I/O is code execution; owner-only
+subscribe_terminals_request,inbound,workspace.read,owner,deny,terminal I/O is code execution; owner-only
+subscription.release.request,inbound,null,watch,forward,id-free; releases only the viewer's own subscriptions on its own upstream session
+terminal.rename.request,inbound,workspace.write,owner,deny,terminal I/O is code execution; owner-only
+terminal_input,inbound,workspace.write,owner,deny,terminal I/O is code execution; owner-only
+unsubscribe_checkout_diff_request,inbound,workspace.read,watch,deny,"watch candidate (diffs, search, subagents); scope binding not implemented in M1"
+unsubscribe_terminal_request,inbound,workspace.read,owner,deny,terminal I/O is code execution; owner-only
+unsubscribe_terminals_request,inbound,workspace.read,owner,deny,terminal I/O is code execution; owner-only
+update_agent_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+usage.list_reports.request,inbound,daemon.read,never,deny,default deny
+validate_branch_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+voice_audio_chunk,inbound,workspace.write,never,deny,default deny
+wait_for_finish_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+workspace.clear_attention.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+workspace.create.request,inbound,workspace.manage,never,deny,default deny
+workspace.github.search_repositories.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+workspace.label.assignment.set.request,inbound,workspace.manage,owner,deny,default deny
+workspace.label.delete.inspect.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+workspace.label.delete.request,inbound,workspace.manage,owner,deny,default deny
+workspace.label.list.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+workspace.label.update.request,inbound,workspace.manage,owner,deny,default deny
+workspace.mark_unread.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+workspace.pin.set.request,inbound,workspace.manage,owner,deny,default deny
+workspace.recovery.inspect.request,inbound,"[workspace.read, hub.execute]",never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+workspace.recovery.restore.request,inbound,"[workspace.manage, hub.execute]",owner,deny,default deny
+workspace.script.list.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+workspace.script.start.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+workspace.script.stop.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+workspace.setup.run.request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+workspace.setup.subscribe.request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+workspace.title.set.request,inbound,"[workspace.manage, hub.execute]",owner,deny,default deny
+workspace_setup_status_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
+write_project_config_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
+activity_log,outbound,workspace.read,never,deny,default deny
+agent.config.apply.response,outbound,"[workspace.write, hub.execute]",owner,deny,default deny
+agent.create.response,outbound,"[workspace.write, hub.execute]",never,deny,default deny
+agent.create.update,outbound,"[workspace.write, hub.execute]",never,deny,default deny
+agent.detach.response,outbound,workspace.write,owner,deny,default deny
+agent.fork_context.response,outbound,workspace.read,steer,deny,steer role is Milestone 2
+agent.provider_subagents.list.response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+agent.provider_subagents.timeline.get.response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+agent.provider_subagents.update,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+agent.rewind.response,outbound,workspace.write,owner,deny,default deny
+agent.skills.get_status.response,outbound,daemon.read,never,deny,default deny
+agent.skills.import_legacy_selection.response,outbound,daemon.manage,never,deny,default deny
+agent.skills.reconcile.response,outbound,daemon.manage,never,deny,default deny
+agent.skills.save_selection.response,outbound,daemon.manage,never,deny,default deny
+agent.skills.uninstall.response,outbound,daemon.manage,never,deny,default deny
+agent.timeline.append.response,outbound,workspace.write,owner,deny,default deny
+agent.timeline.list_prompts.response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+agent.timeline.replacement,outbound,"[workspace.read, hub.execute]",watch,forward,agentId == lane.agentId
+agent.timeline.search.response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+agent.timeline.set_subscription.response,outbound,"[workspace.read, hub.execute]",watch,forward,response to a forwarded request
+agent_archived,outbound,"[workspace.read, hub.execute]",never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+agent_attention_required,outbound,"[workspace.read, hub.execute]",watch,forward,agentId == lane.agentId
+agent_deleted,outbound,"[workspace.read, hub.execute]",never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+agent_permission_request,outbound,"[workspace.read, hub.execute]",watch,forward,agentId == lane.agentId (read-only display)
+agent_permission_resolved,outbound,"[workspace.write, hub.execute]",watch,forward,agentId == lane.agentId (clears the displayed prompt)
+agent_status,outbound,"[workspace.read, hub.execute]",watch,forward,agentId == lane.agentId
+agent_stream,outbound,"[workspace.read, hub.execute]",watch,forward,agentId == lane.agentId
+agent_update,outbound,"[workspace.read, hub.execute]",watch,forward,upsert: agent.id == lane.agentId; remove: agentId == lane.agentId
+archive_workspace_response,outbound,"[workspace.manage, hub.execute]",owner,deny,default deny
+artifact,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+assistant_chunk,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+audio_output,outbound,workspace.write,never,deny,default deny
+branch_suggestions_response,outbound,workspace.read,never,deny,default deny
+browser.automation.execute.request,outbound,workspace.write,never,deny,default deny
+browser.host.register.response,outbound,[workspace.write],never,deny,default deny
+cancel_agent_response,outbound,"[workspace.write, hub.execute]",steer,deny,steer role is Milestone 2
+capture_terminal_response,outbound,workspace.read,owner,deny,default deny
+chat/create/response,outbound,workspace.write,never,deny,default deny
+chat/delete/response,outbound,workspace.write,never,deny,default deny
+chat/inspect/response,outbound,workspace.read,never,deny,default deny
+chat/list/response,outbound,workspace.read,never,deny,default deny
+chat/post/response,outbound,workspace.write,never,deny,default deny
+chat/read/response,outbound,workspace.read,never,deny,default deny
+chat/wait/response,outbound,workspace.read,never,deny,default deny
+checkout.commits.file_diff.response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+checkout.commits.list.response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+checkout.diff.get.response,outbound,workspace.read,never,deny,default deny
+checkout.discard_changes.response,outbound,workspace.write,owner,deny,default deny
+checkout.forge.get_check_details.response,outbound,workspace.read,never,deny,default deny
+checkout.forge.set_auto_merge.response,outbound,workspace.write,owner,deny,default deny
+checkout.github.get_check_details.response,outbound,workspace.read,never,deny,default deny
+checkout.github.set_auto_merge.response,outbound,workspace.write,owner,deny,default deny
+checkout.refresh.response,outbound,workspace.read,never,deny,default deny
+checkout.rename_branch.response,outbound,workspace.write,owner,deny,default deny
+checkout_commit_response,outbound,workspace.write,owner,deny,default deny
+checkout_diff_update,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+checkout_merge_from_base_response,outbound,workspace.write,owner,deny,default deny
+checkout_merge_response,outbound,workspace.write,owner,deny,default deny
+checkout_pr_create_response,outbound,workspace.write,owner,deny,default deny
+checkout_pr_merge_response,outbound,workspace.write,owner,deny,default deny
+checkout_pr_status_response,outbound,workspace.read,never,deny,default deny
+checkout_pull_response,outbound,workspace.write,owner,deny,default deny
+checkout_push_response,outbound,workspace.write,owner,deny,default deny
+checkout_status_response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+checkout_status_update,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+checkout_switch_branch_response,outbound,workspace.write,owner,deny,default deny
+clear_agent_attention_response,outbound,workspace.write,never,deny,default deny
+close_items_response,outbound,workspace.manage,owner,deny,default deny
+create_paseo_worktree_response,outbound,workspace.manage,never,deny,default deny
+create_terminal_response,outbound,workspace.write,owner,deny,default deny
+creation.subscribe.response,outbound,workspace.read,never,deny,default deny
+daemon.config.reload.response,outbound,daemon.manage,never,deny,default deny
+daemon.get_pairing_offer.response,outbound,access.manage,never,deny,default deny
+daemon.get_status.response,outbound,daemon.read,never,deny,default deny
+daemon.update.progress,outbound,daemon.manage,never,deny,default deny
+daemon.update.response,outbound,daemon.manage,never,deny,default deny
+diagnostics.response,outbound,daemon.read,never,deny,default deny
+dictation_stream_ack,outbound,workspace.write,never,deny,default deny
+dictation_stream_error,outbound,workspace.write,never,deny,default deny
+dictation_stream_final,outbound,workspace.write,never,deny,default deny
+dictation_stream_finish_accepted,outbound,workspace.write,never,deny,default deny
+dictation_stream_partial,outbound,workspace.write,never,deny,default deny
+directory_suggestions_response,outbound,workspace.read,never,deny,default deny
+fetch_agent_history_response,outbound,workspace.read,never,deny,default deny
+fetch_agent_response,outbound,"[workspace.read, hub.execute]",watch,forward,response to a forwarded request; agent.id == lane.agentId
+fetch_agent_timeline_response,outbound,"[workspace.read, hub.execute]",watch,forward,response to a forwarded request; agentId == lane.agentId
+fetch_agents_response,outbound,"[workspace.read, hub.execute]",watch,gateway,entries replaced by gateway-built lane entry; pageInfo emptied; sync removals filtered
+fetch_recent_provider_sessions_response,outbound,workspace.read,never,deny,default deny
+fetch_workspaces_response,outbound,"[workspace.read, hub.execute]",watch,gateway,entries replaced by gateway-built lane workspace; emptyProjects emptied
+file.upload.response,outbound,workspace.write,owner,deny,default deny
+file_download_token_response,outbound,workspace.read,never,deny,default deny
+file_explorer_response,outbound,workspace.read,never,deny,default deny
+forge.search.response,outbound,workspace.read,never,deny,default deny
+fs.entry.create.response,outbound,workspace.write,owner,deny,default deny
+fs.entry.delete.response,outbound,workspace.write,owner,deny,default deny
+fs.entry.duplicate.response,outbound,workspace.write,owner,deny,default deny
+fs.entry.rename.response,outbound,workspace.write,owner,deny,default deny
+fs.file.subscribe.response,outbound,workspace.read,never,deny,default deny
+fs.file.unsubscribe.response,outbound,workspace.read,never,deny,default deny
+fs.file.update,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+fs.file.write.response,outbound,workspace.write,owner,deny,default deny
+get_daemon_config_response,outbound,daemon.read,never,deny,default deny
+get_providers_snapshot_response,outbound,"[daemon.read, hub.execute]",never,deny,default deny
+github_search_response,outbound,workspace.read,never,deny,default deny
+hosts.add.response,outbound,tunnel.manage,never,deny,default deny
+hosts.changed,outbound,daemon.read,never,deny,default deny
+hosts.link.open.response,outbound,null,never,deny,default deny
+hosts.list.response,outbound,daemon.read,never,deny,default deny
+hosts.remove.response,outbound,tunnel.manage,never,deny,default deny
+hosts.route.closed,outbound,null,never,deny,default deny
+hosts.route.frame,outbound,null,never,deny,default deny
+hosts.route.open.response,outbound,null,never,deny,default deny
+hosts.update.response,outbound,tunnel.manage,never,deny,default deny
+hub.execution.agent.create.response,outbound,hub.execute,never,deny,default deny
+hub.execution.agent.stream,outbound,hub.execute,never,deny,default deny
+hub.execution.agent.update,outbound,hub.execute,never,deny,default deny
+hub.execution.agent.validate.response,outbound,hub.execute,never,deny,default deny
+hub.execution.control.response,outbound,hub.execute,never,deny,default deny
+hub.management.daemon.connect.response,outbound,tunnel.manage,never,deny,default deny
+hub.management.daemon.disconnect.response,outbound,tunnel.manage,never,deny,default deny
+hub.management.daemon.get_status.response,outbound,tunnel.manage,never,deny,default deny
+hub.management.daemon.permissions.update.response,outbound,access.manage,never,deny,default deny
+kill_terminal_response,outbound,workspace.write,owner,deny,default deny
+list_available_editors_response,outbound,workspace.read,never,deny,default deny
+list_available_providers_response,outbound,daemon.read,never,deny,default deny
+list_commands_response,outbound,daemon.read,never,deny,default deny
+list_provider_features_response,outbound,daemon.read,never,deny,default deny
+list_provider_models_response,outbound,daemon.read,never,deny,default deny
+list_provider_modes_response,outbound,daemon.read,never,deny,default deny
+list_terminals_response,outbound,workspace.read,owner,deny,default deny
+loop/inspect/response,outbound,automation.manage,never,deny,default deny
+loop/list/response,outbound,automation.manage,never,deny,default deny
+loop/logs/response,outbound,automation.manage,never,deny,default deny
+loop/run/response,outbound,automation.manage,never,deny,default deny
+loop/stop/response,outbound,automation.manage,never,deny,default deny
+open_in_editor_response,outbound,workspace.read,owner,deny,default deny
+open_project_response,outbound,workspace.manage,owner,deny,default deny
+paseo_worktree_archive_response,outbound,workspace.manage,owner,deny,default deny
+paseo_worktree_list_response,outbound,workspace.read,never,deny,default deny
+plugin.catalog.get.response,outbound,daemon.manage,never,deny,default deny
+plugin.directory.inspect.response,outbound,daemon.manage,never,deny,default deny
+plugin.directory.install.response,outbound,daemon.manage,never,deny,default deny
+plugin.disable.response,outbound,daemon.manage,never,deny,default deny
+plugin.enable.response,outbound,daemon.manage,never,deny,default deny
+plugin.list.response,outbound,daemon.manage,never,deny,default deny
+plugin.logs.get.response,outbound,daemon.manage,never,deny,default deny
+plugin.reload.response,outbound,daemon.manage,never,deny,default deny
+plugin.remove.response,outbound,daemon.manage,never,deny,default deny
+plugin.rpc.invoke.response,outbound,daemon.manage,never,deny,default deny
+plugin.source.install.response,outbound,daemon.manage,never,deny,default deny
+plugin.source.status.response,outbound,daemon.manage,never,deny,default deny
+plugin.source.update.apply.response,outbound,daemon.manage,never,deny,default deny
+plugin.source.update.preview.response,outbound,daemon.manage,never,deny,default deny
+plugin.source.update.response,outbound,daemon.manage,never,deny,default deny
+pong,outbound,daemon.read,never,deny,default deny
+project.add.response,outbound,workspace.manage,never,deny,default deny
+project.create_directory.response,outbound,workspace.manage,never,deny,default deny
+project.github.clone.response,outbound,workspace.manage,never,deny,default deny
+project.icon.get.response,outbound,workspace.read,never,deny,default deny
+project.icon.set.response,outbound,workspace.manage,never,deny,default deny
+project.list.response,outbound,workspace.read,never,deny,default deny
+project.remove.response,outbound,workspace.manage,never,deny,default deny
+project.rename.response,outbound,workspace.manage,never,deny,default deny
+project.update,outbound,workspace.read,never,deny,default deny
+project_icon_response,outbound,workspace.read,never,deny,default deny
+provider.usage.list.response,outbound,daemon.read,never,deny,default deny
+provider_diagnostic_response,outbound,daemon.read,never,deny,default deny
+providers_snapshot_update,outbound,"[daemon.read, hub.execute]",never,deny,default deny
+pull_request_timeline_response,outbound,workspace.read,never,deny,default deny
+push.unregister.response,outbound,workspace.read,never,deny,default deny
+read_project_config_response,outbound,workspace.read,never,deny,default deny
+refresh_providers_snapshot_response,outbound,"[daemon.read, hub.execute]",never,deny,default deny
+rpc_error,outbound,null,watch,forward,only for requestIds the viewer was allowed to send
+schedule/create/response,outbound,automation.manage,never,deny,default deny
+schedule/delete/response,outbound,automation.manage,never,deny,default deny
+schedule/inspect/response,outbound,automation.manage,never,deny,default deny
+schedule/list/response,outbound,automation.manage,never,deny,default deny
+schedule/logs/response,outbound,automation.manage,never,deny,default deny
+schedule/pause/response,outbound,automation.manage,never,deny,default deny
+schedule/resume/response,outbound,automation.manage,never,deny,default deny
+schedule/run-once/response,outbound,automation.manage,never,deny,default deny
+schedule/update/response,outbound,automation.manage,never,deny,default deny
+script_status_update,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+send_agent_message_response,outbound,"[workspace.write, hub.execute]",steer,deny,steer role is Milestone 2
+session.events.set_subscription.response,outbound,"[workspace.read, daemon.read, hub.execute]",watch,forward,response to a forwarded request
+set_agent_feature_response,outbound,workspace.write,owner,deny,default deny
+set_agent_mode_response,outbound,workspace.write,owner,deny,default deny
+set_agent_model_response,outbound,workspace.write,owner,deny,default deny
+set_agent_thinking_response,outbound,workspace.write,owner,deny,default deny
+set_daemon_config_response,outbound,daemon.manage,never,deny,default deny
+set_voice_mode_response,outbound,workspace.write,never,deny,default deny
+start_workspace_script_response,outbound,workspace.write,owner,deny,default deny
+stash_list_response,outbound,workspace.read,never,deny,default deny
+stash_pop_response,outbound,workspace.read,owner,deny,default deny
+stash_save_response,outbound,workspace.read,owner,deny,default deny
+status,outbound,daemon.read,watch,gateway,"only server_info, rewritten (lane serverId, workspace.read, feature allowlist)"
+subscribe_checkout_diff_response,outbound,workspace.read,watch,deny,phase0 watch candidate; filter not implemented in M1 => deny
+subscribe_terminal_response,outbound,workspace.read,owner,deny,default deny
+subscription.release.response,outbound,null,watch,forward,response to a forwarded request
+terminal.rename.response,outbound,workspace.write,owner,deny,default deny
+terminal_attention_required,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+terminal_stream_exit,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+terminals_changed,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+transcription_result,outbound,workspace.write,never,deny,default deny
+update_agent_response,outbound,workspace.write,owner,deny,default deny
+usage.list_reports.response,outbound,daemon.read,never,deny,default deny
+usage.list_reports.update,outbound,daemon.read,never,deny,default deny
+validate_branch_response,outbound,workspace.read,never,deny,default deny
+voice_input_state,outbound,workspace.write,never,deny,default deny
+wait_for_finish_response,outbound,workspace.read,never,deny,default deny
+workspace.clear_attention.response,outbound,workspace.write,owner,deny,default deny
+workspace.create.response,outbound,workspace.manage,never,deny,default deny
+workspace.create.update,outbound,workspace.manage,never,deny,default deny
+workspace.github.search_repositories.response,outbound,workspace.read,never,deny,default deny
+workspace.label.assignment.set.response,outbound,workspace.manage,owner,deny,default deny
+workspace.label.delete.inspect.response,outbound,workspace.read,never,deny,default deny
+workspace.label.delete.response,outbound,workspace.manage,owner,deny,default deny
+workspace.label.list.response,outbound,workspace.read,never,deny,default deny
+workspace.label.update,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+workspace.label.update.response,outbound,workspace.manage,owner,deny,default deny
+workspace.mark_unread.response,outbound,workspace.write,owner,deny,default deny
+workspace.pin.set.response,outbound,workspace.manage,owner,deny,default deny
+workspace.recovery.inspect.response,outbound,"[workspace.read, hub.execute]",never,deny,default deny
+workspace.recovery.restore.response,outbound,"[workspace.manage, hub.execute]",owner,deny,default deny
+workspace.script.list.response,outbound,workspace.read,never,deny,default deny
+workspace.script.start.response,outbound,workspace.write,owner,deny,default deny
+workspace.script.stop.response,outbound,workspace.write,owner,deny,default deny
+workspace.setup.run.response,outbound,workspace.write,owner,deny,default deny
+workspace.setup.subscribe.response,outbound,workspace.read,never,deny,default deny
+workspace.title.set.response,outbound,"[workspace.manage, hub.execute]",owner,deny,default deny
+workspace_setup_progress,outbound,workspace.read,never,deny,phase0 flag: push without a lane-scoped filter; unclear => deny in M1
+workspace_setup_status_response,outbound,workspace.read,never,deny,default deny
+workspace_update,outbound,"[workspace.read, hub.execute]",watch,forward,upsert: workspace.id == lane.workspaceId; remove: id == lane.workspaceId
+write_project_config_response,outbound,workspace.write,owner,deny,default deny
