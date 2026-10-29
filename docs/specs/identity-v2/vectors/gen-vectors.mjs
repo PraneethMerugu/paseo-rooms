@@ -750,7 +750,7 @@ function statement(producerKey, producerKind, type, data, ts, base) {
 const bodyHashOf = (stmtSigned) => b64u(dhash("log-body", rjcsBytes(stmtSigned)));
 
 // ------------------------------------------------------------------ log entries (room-log-v2.md section 3)
-function entryFor(seq, prevHashBytes, stmtSigned, hts, epoch) {
+function entryFor(seq, prevHashBytes, stmtSigned, hts, epoch, hostKey = keys.host) {
   const entry = {
     v: 2,
     typ: "log-entry",
@@ -762,11 +762,11 @@ function entryFor(seq, prevHashBytes, stmtSigned, hts, epoch) {
     cls: "stmt",
     type: stmtSigned.body.type,
     bodyHash: bodyHashOf(stmtSigned),
-    hostKid: kidOf("ed25519", keys.host.pub),
+    hostKid: kidOf("ed25519", hostKey.pub),
   };
   const eb = rjcsBytes(entry);
   const hash = dhash("log-entry", eb);
-  const hsig = sigOf(keys.host, "log-entry", eb);
+  const hsig = sigOf(hostKey, "log-entry", eb);
   return { entry, hash: b64u(hash), hsig: b64u(hsig), hashBytes: hash, statement: stmtSigned };
 }
 const gid = `g_${detHex("grant-id", 16)}`;
@@ -797,7 +797,11 @@ const publicEntry = ({ entry, hash, hsig }) => ({ entry, hash, hsig });
 // field versions (section 4.0), the creator rule for seq 0, device denylist and retired keys, device holds
 // for adds and rekeys (24 h, 72 h for a sole device), vetoes, conflicts and cancellation (R-8), admin lineages and closure
 // (section 5.2), and one level of revocation re-fold with the roster position rule (section 5.1, R-7).
-// It is a checking aid, not the full fold: nested or competing revocations are not modelled.
+// Decision round 8 adds: positional host keys and host.key.rotated, keys that never return after a re-fold
+// (retired keys, devices with retired keys, the host-key table kept with an uncertified mark), the revocation
+// nesting depth cap of 8, and device.leaf.repair.requested with its rate limits.
+// It is a checking aid, not the full fold: nested or competing revocations are not modelled (the production
+// fold's fixed point over flat passes is tested against these vectors instead).
 const HOUR = 3600000;
 const kidEd = (pub) => kidOf("ed25519", pub);
 const sortById = (arr, k) => [...arr].sort((a, b) => (a[k] < b[k] ? -1 : a[k] > b[k] ? 1 : 0));
@@ -814,6 +818,9 @@ function initState() {
     retired: new Set(),
     admins: new Map([[a, { pub: keys.adminA.pub, fromSeq: 0, since: 0, root: a, addedBy: null, revokedAt: null }]]),
     recovery: { kid: kidEd(keys.recovery.pub), pub: keys.recovery.pub, fromSeq: 0, since: 0 },
+    hostKeys: [{ kid: kidEd(keys.host.pub), pub: keys.host.pub, fromSeq: 0, toSeq: null, uncertified: false }],
+    repairs: [], // device.leaf.repair.requested of the last 24 h: { deviceId, scope, generation, hts }
+    revDepths: [], // { seq, depth } of every admin.key.revoked entry
     policy: { ...policy0 },
     versions: new Map(),
     maxBase: new Map(),
@@ -842,7 +849,10 @@ function producerPub(st, body) {
     return a && a.revokedAt === null ? a.pub : null;
   }
   if (kind === "recovery") return st.recovery && st.recovery.kid === kid ? st.recovery.pub : null;
-  if (kind === "host") return kid === kidEd(keys.host.pub) ? keys.host.pub : null;
+  if (kind === "host") {
+    const h = st.hostKeys.find((x) => x.kid === kid && x.toSeq === null);
+    return h ? h.pub : null;
+  }
   if (kind === "device") {
     const pub = producerKeys.get(kid);
     return pub && findDevice(st, pub) ? pub : null;
@@ -1098,6 +1108,33 @@ function apply(st, body, pub, entry, bodyHash) {
       st.closed = true;
       return null;
     }
+    case "host.key.rotated": {
+      // keys-rotation-recovery.md section 4.5: this entry is the last one the old key signs.
+      if (kind !== "admin") return "producer_not_allowed";
+      const c = d.change;
+      const cur = st.hostKeys.find((x) => x.toSeq === null);
+      if (c.subject.kind !== "host" || c.old !== cur.kid) return "stale_version";
+      const newPub = fromB64uStrict(c.newSig, 32);
+      if (st.retired.has(c.newSig)) return "key_reused";
+      if (!verifySig(newPub, "key-change-new", rjcsBytes(c), fromB64uStrict(d.newKeySig, 64))) return "new_key_sig";
+      cur.toSeq = seq;
+      st.retired.add(b64u(cur.pub));
+      st.hostKeys.push({ kid: kidEd(newPub), pub: newPub, fromSeq: seq + 1, toSeq: null, uncertified: false });
+      return null;
+    }
+    case "device.leaf.repair.requested": {
+      // room-log-v2.md section 4.3 (decision round 8, item 1): the device itself, for its own leaf; one per
+      // group per hour and at most 8 per device in 24 h of hts. Scopes are not modelled here (scope null only).
+      const f = findDevice(st, pub);
+      if (kind !== "device" || !f || f.member.memberId !== d.memberId || f.device.deviceId !== d.deviceId) return "not_permitted";
+      if (d.group.scope !== null) return "not_in_scope";
+      st.repairs = st.repairs.filter((r) => hts - r.hts < 24 * HOUR);
+      const mine = st.repairs.filter((r) => r.deviceId === d.deviceId);
+      if (mine.some((r) => r.scope === d.group.scope && r.generation === d.group.generation && hts - r.hts < HOUR)) return "repair_too_soon";
+      if (mine.length >= 8) return "repair_rate";
+      st.repairs.push({ deviceId: d.deviceId, scope: d.group.scope, generation: d.group.generation, hts });
+      return null;
+    }
     case "admin.key.revoked":
       return null; // handled in the main loop (bounds and re-fold)
     case "lane.created":
@@ -1125,7 +1162,13 @@ function run(entries, revs, refold) {
     if (entry.prev !== b64u(prev)) return fail("prev_mismatch");
     const eh = dhash("log-entry", eb);
     if (b64u(eh) !== hash) return fail("entry_hash");
-    if (!verifySig(keys.host.pub, "log-entry", eb, fromB64uStrict(hsig, 64))) return fail("hsig");
+    // Host keys are judged by position (keys-rotation-recovery.md section 3). A re-fold pass does not re-check
+    // entries: they were verified when they were appended.
+    if (!refold) {
+      const hk = st.hostKeys.find((x) => x.kid === entry.hostKid && x.fromSeq <= entry.seq && (x.toSeq === null || entry.seq <= x.toSeq));
+      if (!hk) return fail("unknown_host_key");
+      if (!verifySig(hk.pub, "log-entry", eb, fromB64uStrict(hsig, 64))) return fail("hsig");
+    }
     const bodyHash = bodyHashOf(stm);
     if (entry.bodyHash !== bodyHash) return fail("body_hash");
     const { body } = stm;
@@ -1135,7 +1178,8 @@ function run(entries, revs, refold) {
     if (body.base.hash !== expected) return fail("base_mismatch");
     if (st.seen.has(bodyHash)) return fail("duplicate_statement");
     const pub = producerPub(st, body);
-    if (!pub || !verifySig(pub, stmtCtx(body.type), rjcsBytes(body), fromB64uStrict(stm.sig, 64))) return fail("statement_sig");
+    if (!pub) return fail("unknown_producer");
+    if (!verifySig(pub, stmtCtx(body.type), rjcsBytes(body), fromB64uStrict(stm.sig, 64))) return fail("statement_sig");
     const kid = body.producer.kid;
     if (st.maxBase.has(kid) && !(body.base.seq > st.maxBase.get(kid))) return fail("base_regressed");
     st.maxBase.set(kid, body.base.seq);
@@ -1158,6 +1202,10 @@ function run(entries, revs, refold) {
       if (!target || target.revokedAt !== null || d.kid === kid) err = "bad_revocation";
       else if (!(d.fromSeq <= entry.seq) || d.fromSeq < target.fromSeq) err = "bad_revocation";
       else if (d.fromSeq < signer.since) err = "revocation_before_since";
+      // Nesting depth (section 5.1, step 8): 1 + the largest depth among revocation entries in [fromSeq, r).
+      let depth = 1;
+      for (const x of st.revDepths) if (x.seq >= d.fromSeq && x.seq < entry.seq) depth = Math.max(depth, x.depth + 1);
+      if (!err && !refold && depth > 8) err = "revocation_too_deep";
       if (err) {
         if (refold) continue;
         return fail(err);
@@ -1167,12 +1215,34 @@ function run(entries, revs, refold) {
         const r = run(entries.slice(0, i), newRevs, true);
         if (!r.ok) return fail(`refold_${r.error}`);
         const rosterSeqBefore = st.rosterSeq;
-        r.state.seen.add(bodyHash);
-        r.state.hashes.push(hash);
-        r.state.maxBase = st.maxBase;
-        st = r.state;
+        const re = r.state;
+        re.seen.add(bodyHash);
+        re.hashes.push(hash);
+        re.maxBase = st.maxBase;
+        re.revDepths = [...st.revDepths, { seq: entry.seq, depth }];
+        // Decision round 8, item 3: nothing retired before r returns. Ids, retired keys and the device
+        // denylist only grow; admin keys revoked or removed before stay so; the host-key table is positional and
+        // stays as it was, with keys whose installing statement no longer applies marked uncertified.
+        for (const k of ["everMember", "everDevice", "denied", "retired"]) for (const x of st[k]) re[k].add(x);
+        for (const [kid, a] of st.admins) {
+          const ra = re.admins.get(kid);
+          if (!ra) re.admins.set(kid, { ...a, revokedAt: a.revokedAt ?? entry.seq });
+          else if (a.revokedAt !== null && ra.revokedAt === null) ra.revokedAt = a.revokedAt;
+        }
+        const certified = new Set(re.hostKeys.map((x) => x.kid));
+        re.hostKeys = st.hostKeys.map((x) => ({ ...x, uncertified: !certified.has(x.kid) }));
+        // Keys of the state before r that the re-fold leaves out of use are retired too.
+        for (const m of st.members.values()) for (const dev of m.devices) if (!findDevice(re, fromB64uStrict(dev.sig, 32))) re.denied.add(dev.sig).add(dev.dh);
+        // A device whose recomputed keys are retired does not come back.
+        for (const m of re.members.values()) {
+          const out = m.devices.filter((x) => re.denied.has(x.sig) || re.denied.has(x.dh) || re.retired.has(x.sig));
+          if (out.length) re.versions.set(`devices:${m.memberId}`, entry.seq);
+          for (const x of out) cancelPending(re, (p) => p.requester === x.deviceId || p.device.deviceId === x.deviceId);
+          m.devices = m.devices.filter((x) => !out.includes(x));
+        }
+        st = re;
         st.rosterSeq = rosterKey(st) !== before ? entry.seq : rosterSeqBefore;
-      }
+      } else st.revDepths = [...st.revDepths, { seq: entry.seq, depth }];
       const t = st.admins.get(d.kid);
       t.revokedAt = entry.seq;
       st.retired.add(b64u(t.pub));
@@ -1765,6 +1835,134 @@ const soleAdminCases = [
   };
 });
 
+// Leaf repair (decision round 8, item 1; room-log-v2.md section 4.3; mls-integration.md sections 4.3, 4.4).
+// Sam's laptop asks for its own leaf in the room group to be replaced at seq 4, naming the KeyPackageRef of
+// the package the replacement must add, and again 61 min later at seq 5. Rejected: a request signed by
+// another device, and a third request for the same group 10 min after the second.
+const LR_T = e3.entry.hts + HOUR;
+const repairData = (label) => ({ memberId, deviceId, group: { scope: null, generation: 0 }, keyPackageRef: b64u(det(label, 32)) });
+const leafRepair = statement(keys.devSig, "device", "device.leaf.repair.requested", repairData("leaf-repair-kp-1"), LR_T - 100, baseOf(e3));
+const lr4 = entryFor(4, e3.hashBytes, leafRepair, LR_T, 0);
+const leafRepair2 = statement(keys.devSig, "device", "device.leaf.repair.requested", repairData("leaf-repair-kp-2"), LR_T + 61 * 60000 - 100, baseOf(lr4));
+const lr5 = entryFor(5, lr4.hashBytes, leafRepair2, LR_T + 61 * 60000, 0);
+const leafRepairChain = [lr4, lr5];
+check(fold([...p3, ...leafRepairChain]).ok, `leaf repair chain folds (${fold([...p3, ...leafRepairChain]).error})`);
+const leafRepairCases = [
+  {
+    name: "otherDevice",
+    prefix: [...p3],
+    entry: entryFor(4, e3.hashBytes, statement(keys.creatorDevSig, "device", "device.leaf.repair.requested", repairData("leaf-repair-kp-x"), LR_T - 100, baseOf(e3)), LR_T, 0),
+    expect: "not_permitted",
+    note: "Alice's desktop asks for Sam's laptop's leaf: a device requests the repair of its own leaf only",
+  },
+  {
+    name: "tooSoon",
+    prefix: [...p3, ...leafRepairChain],
+    entry: entryFor(6, lr5.hashBytes, statement(keys.devSig, "device", "device.leaf.repair.requested", repairData("leaf-repair-kp-3"), LR_T + 71 * 60000 - 100, baseOf(lr5)), LR_T + 71 * 60000, 0),
+    expect: "repair_too_soon",
+    note: "a second request for the same group 10 min after the previous one",
+  },
+].map(({ name, prefix, entry, expect, note }) => {
+  const r = fold([...prefix, entry]);
+  check(!r.ok && r.error === expect && r.seq === entry.entry.seq, `leaf repair case ${name}: expected ${expect}, got ${r.error}`);
+  return { name, note, chain: prefix.slice(4).map((e) => ({ ...publicEntry(e), statement: e.statement })), entry: publicEntry(entry), statement: entry.statement, expect };
+});
+
+// Retired keys never return (decision round 8, item 3; room-log-v2.md section 5.1). R adds adminB (seq 4, the
+// closure chain's first entry). adminB, later known to be stolen, rotates the host key to host2 (seq 5, the last
+// entry host-1 signs) and removes Sam's laptop (seq 6). R revokes adminB from 5 (seq 7). Both statements are
+// suspect, but host-1 and the laptop's keys stay retired: host2 keeps signing entries, marked uncertified, and
+// Sam stays with no device, so the roster members are those of position 6 and the position does not move.
+const nrHostRotated = statement(
+  keys.adminB,
+  "admin",
+  "host.key.rotated",
+  { change: hostChange, newKeySig: b64u(hostNewKeySig), oldValidTo: Math.floor(T0 / 1000) + 3600 + 86400 },
+  T0 + 3600000 - 100,
+  baseOf(cl4),
+);
+const nr5 = entryFor(5, cl4.hashBytes, nrHostRotated, T0 + 3600000, 0);
+const nrRemoved = statement(keys.adminB, "admin", "device.removed", { memberId, deviceId, reason: "admin" }, T0 + 2 * 3600000 - 100, baseOf(nr5));
+const nr6 = entryFor(6, nr5.hashBytes, nrRemoved, T0 + 2 * 3600000, 0, keys.host2);
+const nrRevoked = statement(keys.recovery, "recovery", "admin.key.revoked", { kid: kidEd(keys.adminB.pub), fromSeq: 5 }, T0 + 3 * 3600000 - 100, baseOf(nr6));
+const nr7 = entryFor(7, nr6.hashBytes, nrRevoked, T0 + 3 * 3600000, 0, keys.host2);
+const nrFence = statement(keys.adminA, "admin", "producer.fence", {}, T0 + 4 * 3600000 - 100, baseOf(nr7));
+const nr8 = entryFor(8, nr7.hashBytes, nrFence, T0 + 4 * 3600000, 0, keys.host2);
+const noRevivalChain = [cl4, nr5, nr6, nr7, nr8];
+const noRevivalBefore = fold([...p3, cl4, nr5, nr6]);
+const noRevivalAfter = fold([...p3, ...noRevivalChain]);
+{
+  const st = noRevivalAfter.ok && noRevivalAfter.state;
+  check(noRevivalBefore.ok && noRevivalBefore.rosterSeq === 6, `no-revival: laptop removed at 6 (${noRevivalBefore.error})`);
+  check(noRevivalAfter.ok, `no-revival chain folds (${noRevivalAfter.error})`);
+  check(st && st.members.get(memberId).devices.length === 0 && st.denied.has(b64u(keys.devSig.pub)), "no-revival: the laptop stays out and denylisted");
+  check(st && noRevivalAfter.rosterSeq === 6 && noRevivalAfter.rosterHash === noRevivalBefore.rosterHash, "no-revival: roster and its position unchanged by the re-fold");
+  const [h1, h2] = st ? st.hostKeys : [];
+  check(st && h1.toSeq === 5 && h2 && h2.kid === kidEd(keys.host2.pub) && h2.toSeq === null && h2.uncertified === true, "no-revival: host-1 stays retired, host2 current and uncertified");
+}
+const noRevivalCases = [
+  {
+    name: "retiredHostKeySigns",
+    entry: entryFor(8, nr7.hashBytes, nrFence, T0 + 4 * 3600000, 0, keys.host),
+    expect: "unknown_host_key",
+    note: "host-1 was rotated out at 5 by a statement that is now suspect; it still may not sign",
+  },
+  {
+    name: "removedDeviceSigns",
+    entry: entryFor(8, nr7.hashBytes, statement(keys.devSig, "device", "producer.fence", {}, T0 + 4 * 3600000 - 100, baseOf(nr7)), T0 + 4 * 3600000, 0, keys.host2),
+    expect: "unknown_producer",
+    note: "the laptop was removed at 6 by a statement that is now suspect; its keys stay retired",
+  },
+].map(({ name, entry, expect, note }) => {
+  const r = fold([...p3, cl4, nr5, nr6, nr7, entry]);
+  check(!r.ok && r.error === expect && r.seq === 8, `no-revival case ${name}: expected ${expect}, got ${r.error}`);
+  return { name, note, entry: publicEntry(entry), statement: entry.statement, expect };
+});
+
+// Revocation nesting depth (decision round 8, item 4; room-log-v2.md section 5.1, step 8). R adds nine admin
+// keys (seq 4 to 12) and revokes them one by one from seq 13 (seq 13 to 20). The revocation at 13 + k has
+// depth k + 1, because its range [13, 13 + k) holds the k earlier ones; the ninth, at seq 21, has depth 9.
+const depthKeys = Array.from({ length: 9 }, (_, k) => edKey(`depth-admin-${k + 1}`));
+const DP_T = T0 + 10 * 3600000;
+const depthChain = [];
+{
+  let prevE = e3;
+  depthKeys.forEach((k, idx) => {
+    const ch = kc({ kind: "admin", id: creatorMemberId }, null, k, null);
+    const st = statement(keys.recovery, "recovery", "admin.added", { change: ch, newKeySig: b64u(sigOf(k, "key-change-new", rjcsBytes(ch))) }, DP_T + idx * 60000 - 100, baseOf(prevE));
+    prevE = entryFor(4 + idx, prevE.hashBytes, st, DP_T + idx * 60000, 0);
+    depthChain.push(prevE);
+  });
+  depthKeys.slice(0, 8).forEach((k, idx) => {
+    const st = statement(keys.recovery, "recovery", "admin.key.revoked", { kid: kidEd(k.pub), fromSeq: 13 }, DP_T + (9 + idx) * 60000 - 100, baseOf(prevE));
+    prevE = entryFor(13 + idx, prevE.hashBytes, st, DP_T + (9 + idx) * 60000, 0);
+    depthChain.push(prevE);
+  });
+}
+const depthLast = depthChain.at(-1);
+const depthTooDeep = entryFor(
+  21,
+  depthLast.hashBytes,
+  statement(keys.recovery, "recovery", "admin.key.revoked", { kid: kidEd(depthKeys[8].pub), fromSeq: 13 }, DP_T + 17 * 60000 - 100, baseOf(depthLast)),
+  DP_T + 17 * 60000,
+  0,
+);
+{
+  const r = fold([...p3, ...depthChain]);
+  check(r.ok && r.state.revDepths.map((x) => x.depth).join(",") === "1,2,3,4,5,6,7,8", `depth chain folds with depths 1 to 8 (${r.error})`);
+  const bad = fold([...p3, ...depthChain, depthTooDeep]);
+  check(!bad.ok && bad.error === "revocation_too_deep" && bad.seq === 21, `depth 9 rejected (${bad.error})`);
+  // The same revocation with fromSeq 21 (an empty range) has depth 1 and is accepted.
+  const shallow = entryFor(
+    21,
+    depthLast.hashBytes,
+    statement(keys.recovery, "recovery", "admin.key.revoked", { kid: kidEd(depthKeys[8].pub), fromSeq: 21 }, DP_T + 17 * 60000 - 100, baseOf(depthLast)),
+    DP_T + 17 * 60000,
+    0,
+  );
+  check(fold([...p3, ...depthChain, shallow]).ok, "the ninth revocation with an empty range is accepted");
+}
+
 // ------------------------------------------------------------------ MLS (mls-integration.md sections 2, 3, 5)
 const mlsIdentity = {
   v: 2,
@@ -1779,7 +1977,10 @@ const mlsIdentity = {
 const mlsIdSig = sigOf(keys.devSig, "mls-identity", rjcsBytes(mlsIdentity));
 const mlsCredentialIdentity = rjcs({ id: mlsIdentity, sig: b64u(mlsIdSig) });
 // Reference roster: last roster-changing entry before the head (seq 2), while the head is seq 3 (grant.issued).
-const mlsAad = { v: 2, typ: "mls-aad", roster: { seq: rosterAfter[3].rosterSeq, hash: rosterAfter[3].rosterHash }, logHead: { seq: 3, hash: e3.hash } };
+// Epoch anchor (decision round 8, item 2; mls-integration.md section 5.1). The epoch authenticator here is a
+// placeholder from a public label; in a group it is MLS's epoch_authenticator for that epoch (RFC 9420 section 8.7).
+const epochAuthenticator = det("mls-epoch-authenticator", 32);
+const mlsAad = { v: 2, typ: "mls-aad", roster: { seq: rosterAfter[3].rosterSeq, hash: rosterAfter[3].rosterHash }, logHead: { seq: 3, hash: e3.hash }, epochAuth: null };
 const adminSet = [b64u(keys.adminA.pub), b64u(keys.adminB.pub)].sort();
 const adminSetHash = b64u(dhash("admin-set", rjcsBytes(adminSet)));
 const authorityExtension = rjcs({ v: 2, genesisHash: b64u(genesisHash), adminSetHash, scope: null });
@@ -1791,6 +1992,9 @@ const groupIds = {
     groupIdHex: hex(dhash("mls-group", rjcsBytes({ genesisHash: b64u(genesisHash), scope: scopeId, generation: 0 }))),
   },
 };
+const epochAuthInput = { v: 2, typ: "mls-epoch-auth", groupId: b64u(dhash("mls-group", rjcsBytes({ genesisHash: b64u(genesisHash), generation: 0 }))), epoch: 0, auth: b64u(epochAuthenticator) };
+const epochAuth = b64u(dhash("mls-epoch-auth", rjcsBytes(epochAuthInput)));
+mlsAad.epochAuth = epochAuth;
 const witness = { v: 2, typ: "log-witness", roomId, deviceId, head: { seq: 3, hash: e3.hash }, roster: { seq: rosterAfter[3].rosterSeq, hash: rosterAfter[3].rosterHash } };
 const witnessSig = sigOf(keys.devSig, "stmt:log.witness", rjcsBytes(witness));
 const witnessPayload = { kind: "log.witness", witness, sig: b64u(witnessSig) };
@@ -1976,10 +2180,16 @@ const out = {
       "All secrets are derived from public labels. Never use these keys outside tests.",
       "Timestamps: unix seconds for createdAt/iat/exp/notBefore/oldValidTo; unix milliseconds for ts/hts.",
       "noise.ikCacophonyKeys uses the cacophony keys and matches the cacophony.txt IK entry byte for byte (noise.cacophonyChecks).",
-      "Statements outside log.entries name the head at seq 3 as their base unless they belong to a folded chain (deviceLink.chain, deviceRekey.chain, log.foldChecks, log.refold, log.closure); standalone ones are format examples.",
+      "Statements outside log.entries name the head at seq 3 as their base unless they belong to a folded chain (deviceLink.chain, deviceRekey.chain, deviceRekey.vetoed, deviceRekey.soleDeviceChangeAdmin, deviceLeafRepair.chain, log.foldChecks, log.refold, log.noRevival, log.revocationDepth, log.closure); standalone ones are format examples.",
       "Every folded chain starts with log.entries[0..3]; chains and cases list only the entries after seq 3.",
       "Field versions (ver) are log positions; -1 means the genesis value (room-log-v2.md section 4.0).",
       "MLS commit entries are omitted from log.entries; epoch is 0 throughout.",
+      "deviceRekey.vetoed: the device being rekeyed vetoes its own pending rekey at seq 5; an automatic approval 73 h after the request is rejected with vetoed (room-log-v2.md section 4.3).",
+      "deviceRekey.soleDeviceChangeAdmin: room.policy.changed sets soleDeviceChange to admin at seq 4; the sole device requests a rekey at seq 5; an interactive admin approval 1 h later is accepted at seq 6, and an automatic one even after 72 h is rejected with auto_not_allowed (identity-model.md section 6.3).",
+      "deviceLeafRepair: device.leaf.repair.requested by the device itself (decision round 8, item 1). keyPackageRef values are placeholders from public labels, not refs of real KeyPackages.",
+      "log.noRevival: keys retired before a revocation stay retired after its re-fold (decision round 8, item 3); entries from seq 6 on are signed by host2.",
+      "log.revocationDepth: nesting depth of admin.key.revoked is capped at 8 (decision round 8, item 4); the nine admin keys added there are derived from the labels depth-admin-1 to depth-admin-9 and are not listed in keys.",
+      "mls.epochAuth uses a placeholder epoch_authenticator from a public label; mls.authenticatedData carries its hash (decision round 8, item 2).",
     ],
   },
   domain: { prefix: DOMAIN, tbsLayout: "utf8(prefix) || 0x00 || utf8(ctx) || 0x00 || payload", contexts: CONTEXTS, statementContext: "stmt:<type>", hashContext: "h:<label>" },
@@ -2049,6 +2259,18 @@ const out = {
       cases: soleAdminCases,
     },
   },
+  deviceLeafRepair: {
+    statement: leafRepair,
+    chain: {
+      prefix: "log.entries[0..3], then these entries at seq 4 and 5",
+      entries: leafRepairChain.map((e) => ({ ...publicEntry(e), statement: e.statement })),
+      groupIntervalMs: HOUR,
+      windowMs: 24 * HOUR,
+      maxPerWindow: 8,
+      note: "Sam's laptop asks twice, 61 min apart, for its own leaf in the room group (scope null, generation 0) to be replaced",
+      cases: leafRepairCases,
+    },
+  },
   statements: {
     creatorAdmitted: s0,
     laneCreated: s1,
@@ -2071,6 +2293,7 @@ const out = {
     roomClosed,
     recoveryKeyProposed,
     recoveryKeyRotated,
+    deviceLeafRepairRequested: leafRepair,
     newKeySigCtx: "key-change-new",
   },
   log: {
@@ -2099,6 +2322,27 @@ const out = {
       ],
       rejectRevocationBeforeStart: { prefix: "log.entries[0..3], refold.entries[0]", entry: publicEntry(refoldBad), statement: refoldBad.statement, expect: "revocation_before_since" },
     },
+    noRevival: {
+      prefix: "log.entries[0..3], then these entries at seq 4 to 8",
+      entries: noRevivalChain.map((e) => ({ ...publicEntry(e), statement: e.statement })),
+      rosterBefore: { seq: noRevivalBefore.rosterSeq, hash: noRevivalBefore.rosterHash },
+      rosterAfter: { seq: noRevivalAfter.rosterSeq, hash: noRevivalAfter.rosterHash },
+      hostKeysAfter: noRevivalAfter.state.hostKeys.map((x) => ({ kid: x.kid, fromSeq: x.fromSeq, toSeq: x.toSeq, uncertified: x.uncertified })),
+      notes: [
+        "R adds adminB at 4; adminB rotates the host key to host2 at 5 and removes Sam's laptop at 6; R revokes adminB from 5 at 7; adminA signs a fence at 8.",
+        "Both statements of adminB are suspect, but host-1 and the laptop's keys stay retired: host2 keeps signing, uncertified, and Sam keeps no device.",
+        "Each case replaces seq 8 with case.entry.",
+      ],
+      cases: noRevivalCases,
+    },
+    revocationDepth: {
+      prefix: "log.entries[0..3], then these entries at seq 4 to 20",
+      entries: depthChain.map((e) => ({ ...publicEntry(e), statement: e.statement })),
+      depths: [1, 2, 3, 4, 5, 6, 7, 8],
+      maxDepth: 8,
+      notes: ["R adds nine admin keys at 4 to 12 and revokes eight of them from 13 at 13 to 20; the revocation at 13 + k has depth k + 1."],
+      rejectTooDeep: { entry: publicEntry(depthTooDeep), statement: depthTooDeep.statement, expect: "revocation_too_deep" },
+    },
     closure: {
       prefix: "log.entries[0..3], then these entries at seq 4, 5 and 6",
       entries: closureChain.map((e) => ({ ...publicEntry(e), statement: e.statement })),
@@ -2116,6 +2360,7 @@ const out = {
     identitySig: b64u(mlsIdSig),
     credentialIdentityBytes: mlsCredentialIdentity,
     authenticatedData: rjcs(mlsAad),
+    epochAuth: { input: rjcs(epochAuthInput), authenticatorHex: hex(epochAuthenticator), hash: epochAuth },
     adminSet,
     adminSetHash,
     authorityExtension,

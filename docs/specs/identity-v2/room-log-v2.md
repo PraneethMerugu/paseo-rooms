@@ -2,8 +2,8 @@
 
 - **Status:** proposed specification, not implemented.
 - **Resolves:** A7 (P-7, M-1), P-27, C-11; the log side of P-3 and P-10.
-- **Formats:** `signatures-and-encoding.md`. Vectors: `vectors/vectors.json` → `statements`, `log`, `deviceLink`, `deviceRekey`.
-- **Revised** 2026-10-29 after the independent review (`README.md` section 10): statement `base`, position-based revocation with re-fold, device hold and veto, invite references, fork only with proof. Revised again on 2026-10-29 after the re-review (`plugin/review/identity-v2-rereview.md`, decisions round 4): field versions instead of `prev*` values, producer `base` only moves forward, admin lineages and the closure rules, bounded recovery-key revocations, the 72 h hold for a sole device, and the roster position after a re-fold. Decision round 5, item 3 extends that hold, and policy `soleDeviceChange`, to rekeys (section 5). Decision round 6 (after Spike A): `device.rekey.approved` is submitted only together with its MLS commit and sequenced adjacent to it (section 2, section 4.3); the fold is unchanged.
+- **Formats:** `signatures-and-encoding.md`. Vectors: `vectors/vectors.json` → `statements`, `log`, `deviceLink`, `deviceRekey`, `deviceLeafRepair`.
+- **Revised** 2026-10-29 after the independent review (`README.md` section 10): statement `base`, position-based revocation with re-fold, device hold and veto, invite references, fork only with proof. Revised again on 2026-10-29 after the re-review (`plugin/review/identity-v2-rereview.md`, decisions round 4): field versions instead of `prev*` values, producer `base` only moves forward, admin lineages and the closure rules, bounded recovery-key revocations, the 72 h hold for a sole device, and the roster position after a re-fold. Decision round 5, item 3 extends that hold, and policy `soleDeviceChange`, to rekeys (section 5). Decision round 6 (after Spike A): `device.rekey.approved` is submitted only together with its MLS commit and sequenced adjacent to it (section 2, section 4.3); the fold is unchanged. Decision round 8 (2026-10-29): `device.leaf.repair.requested` (section 4.3), keys that never return after a re-fold (section 5.1, step 9), a revocation nesting cap of 8 with a re-fold of linear cost (section 5.1, steps 3 and 8), the joiner's epoch alerts (section 6.6), and the rules the I-5 and I-6 implementation had chosen where this spec was silent (sections 4.1 to 4.4, 5, 5.1, 5.2).
 
 ## 1. Model
 
@@ -101,6 +101,7 @@ The first revision carried the old value of the changed field (`prevRole`, `prev
 - Statements with `ref` (`device.add.approved`, `device.add.vetoed`, `device.rekey.approved`, `device.rekey.vetoed`, `room.closed`, `recovery.key.rotated` with a proposal) name one pending request by its `bodyHash`, which is closed after one use.
 - Statements that create something (`member.admitted`, `lane.created`, `invite.created`, `device.added`, `admin.added`, `room.close.proposed`) are rejected if the object already exists or ever existed.
 - Host and node statements (`grant.*`, `invite.burned`, `enrollment.*`, `lane.degraded`, and so on) change no roster or authority state that another producer sets.
+- `device.leaf.repair.requested` changes no roster or authority state. Each one is a separate request, rate-limited per device and group, and used at most once by the MLS layer (section 4.3).
 
 The forward-base rule (section 2) adds a second, independent barrier: a held statement dies as soon as its producer's next statement is sequenced, whatever it changes.
 
@@ -114,14 +115,18 @@ The forward-base rule (section 2) adds a second, independent barrier: a held sta
 | `admin.added` | A or R | `{ change: KeyChange, newKeySig }` with `change.subject = {kind:"admin", id: memberId}` and `change.old = null` | Authority. Records `addedBy` and the new key's lineage (section 5.2). Rejected if the key is retired |
 | `admin.removed` | A (another admin) | `{ kid }` | Authority; `kid` to the admin-key denylist |
 | `admin.key.rotated` | A (old key) | `{ change: KeyChange, newKeySig }` | Authority; old key to the admin-key denylist |
-| `admin.key.revoked` | A (another admin) or R | `{ kid, fromSeq }` | Authority; section 5.1 (bounds apply to R as well). `kid` to the admin-key denylist |
+| `admin.key.revoked` | A (another admin) or R | `{ kid, fromSeq }` | Authority; section 5.1 (bounds and the nesting cap of 8 apply to R as well). `kid` to the admin-key denylist. A key that is already retired (rotated out or removed) may still be revoked, once, so that its statements in the window can be made suspect. Only R may leave the room with no active admin key (section 5.1, step 4) |
 | `recovery.key.proposed` | A | `{ change: KeyChange, newKeySig, exp }` with `change.old = null`; `exp` at most 7 days ahead. Valid only while the room has no recovery key | none; shown to every member |
 | `recovery.key.rotated` | R (old), or A when the room has no recovery key | `{ change: KeyChange, newKeySig, proposal: bodyHash \| null }`. `change.old` is `null` when adding the first recovery key. `proposal` is `null` when R signs or when the room has one admin lineage; with two or more lineages it names an unexpired `recovery.key.proposed` with the identical `change`, signed by an admin key independent of the signer (section 5.2) | Authority (`identity-model.md` section 5.4) |
 | `host.key.rotated` | A | `{ change: KeyChange, newKeySig, oldValidTo }` (`oldValidTo`: unix s, for grants only) | Authority |
-| `host.key.revoked` | A | `{ kid, fromSeq }` | Authority; section 5.1 |
+| `host.key.revoked` | A | `{ kid, fromSeq }` | Authority; section 5.1. `kid` must already be rotated out: the current host key is rotated with `host.key.rotated` first (`host_key_current`), because no key would be left to sign the next entry. The bounds of section 5.1 step 1 apply, including the revoking admin key's authority start. A host key is revoked at most once |
 | `endpoint.rotated` | A | `{ serverId, dh, relay, ver }` | Authority |
 | `endpoint.evicted` | H | `{ serverId, count, windowS }` | none (P-16 alert) |
 | `node.certified` | A | `{ key, nodeRef }` | Authority (reserved) |
+
+**Admin keys act with role `admin`.** An admin key is the authority of role `admin`, the highest role, whichever member's id its `KeyChange.subject` names. The rule "no role above the producing admin's own" (section 5) therefore never rejects a statement signed by an admin key; it exists for producers with a lower role (the reserved `maintain` statements).
+
+**New keys are fresh.** A key that a statement certifies or installs (`admin.added`, `admin.key.rotated`, `recovery.key.proposed`, `recovery.key.rotated`, `host.key.rotated`, `endpoint.rotated`, `lane.created`, `lane.offer.rotated`, and every device key) must be neither retired nor equal to any key currently in use in the room for any subject: admin, recovery, host, endpoint, lane and device keys, signing and DH alike. A device's signing and DH keys must also differ from each other (`key_reused`).
 
 `admin.reaffirmed` from the first draft is removed. Statements made suspect by a revocation no longer take effect at all (section 5.1); an admin who wants to keep one re-issues it as a new statement.
 
@@ -132,12 +137,12 @@ Invite and link ids never appear in the log or in MLS. The log carries `inviteRe
 | Type | Producer | Plaintext `data` | Effect |
 |---|---|---|---|
 | `invite.created` | A | `{ inviteRef, role, lanes, exp }` | none |
-| `invite.revoked` | A | `{ inviteRef }` | none |
+| `invite.revoked` | A, or D for a link | `{ inviteRef }` or `{ linkRef }` | none. An admin may revoke any invite or link. A device may revoke only a link (`linkRef`), and only one created by a device of its own member (`device.link.created` with the same `memberId`) |
 | `invite.expired` | H | `{ inviteRef }` | none |
 | `invite.burned` | H | `{ inviteRef, reason: "attempts" \| "abandoned" \| "sas_mismatch" }` | none |
 | `invite.contested` | H | `{ inviteRef, pendingId }` | none (alert) |
 | `enrollment.pending` | H | `{ inviteRef \| linkRef, pendingId, deviceKid }` | none |
-| `enrollment.closed` | H | `{ pendingId, reason }` | none |
+| `enrollment.closed` | H | `{ pendingId, reason }`, where `reason` takes exactly the values of `enroll.closed` (`enrollment-v2.md` section 5.2): `"rejected"`, `"timeout"`, `"invite_revoked"`, `"room_closed"`, `"aborted"`, `"vetoed"` | none |
 | `device.link.created` | D | `{ memberId, linkRef, exp }` | none |
 
 The same `.burned`, `.expired` and `.revoked` events with `linkRef` in place of `inviteRef` apply to device links (`identity-model.md` section 6.4).
@@ -151,8 +156,8 @@ The same `.burned`, `.expired` and `.revoked` events with `linkRef` in place of 
 | `member.lanes.changed` | A | `{ memberId, lanes, ver }` | Roster |
 | `member.removed` | A | `{ memberId, reason: "admin" \| "compromise" }` | Roster: remove member; all device keys to denylist; the member's pending adds and rekeys cancelled. With `reason: "compromise"` (or policy `rotateLaneOnRemove = "always"`) the admin also rotates the member's lanes (`keys-rotation-recovery.md` 4.7) |
 | `member.left` | D (the member's **only** active device) | `{ memberId }` | Roster: remove member; denylist; pending requests cancelled. A member with several devices leaves by removing each device (`device.removed`, self) until one is left |
-| `member.device.replaced` | A | `{ memberId, removed: [deviceId], added: DeviceEntry, ver }` | Roster. Also restores a member left with no devices (`removed: []`, section 5) |
-| `device.added` | D (an active device of the same member) | `{ memberId, device: DeviceEntry, change: KeyChange, newKeySig, addedBy: deviceId, confirmation: { method: "sas6", linkRef, transcript } }` with `change.old = null` | none until approved; starts the hold: 24 h, or 72 h when the requester is the member's only active device (`identity-model.md` 6.3) |
+| `member.device.replaced` | A | `{ memberId, removed: [deviceId], added: DeviceEntry, ver }` | Roster. Also restores a member left with no devices (`removed: []`, section 5). Cancels the pending requests and leaf repair requests of every removed device, as `device.removed` does |
+| `device.added` | D (an active device of the same member) | `{ memberId, device: DeviceEntry, change: KeyChange, newKeySig, addedBy: deviceId, confirmation: { method: "sas6", linkRef, transcript } }` with `change.old = null` | none until approved; starts the hold: 24 h, or 72 h when the requester is the member's only active device (`identity-model.md` 6.3). `addedBy` is the signing device. `linkRef` must name a `device.link.created` of the same member, and a link adds at most one device (`unknown_link`, `link_used`). The `deviceId` is reserved from this entry on, whether the add is later approved, vetoed or cancelled |
 | `device.add.vetoed` | D (any active device of the same member) | `{ memberId, ref: bodyHash }` | the add is cancelled; the member gets a device conflict |
 | `device.add.approved` | A | `{ memberId, deviceId, ref: bodyHash, mode: "auto" \| "admin" }` | Roster: add device |
 | `device.removed` | A, or D **for itself only** | `{ memberId, deviceId, reason: "lost" \| "admin" \| "compromise" \| "self" }` | Roster: remove device; denylist; cancels the device's own pending rekey and every pending add or rekey it requested. `"compromise"` triggers lane rotation as for `member.removed`. A device may not remove itself when it is the member's last device (it signs `member.left`); an admin may, which leaves the member with no devices (section 5) |
@@ -160,10 +165,24 @@ The same `.burned`, `.expired` and `.revoked` events with `linkRef` in place of 
 | `device.rekey.vetoed` | D (any active device of the same member) | `{ memberId, ref: bodyHash }` | the rekey is cancelled; the member gets a device conflict |
 | `device.rekey.approved` | A | `{ memberId, deviceId, ref: bodyHash, mode: "auto" \| "admin" }` | Roster: replace keys; old keys to denylist. The next entry is the MLS commit that replaces the device's leaf (section 2; `mls-integration.md` section 4.4) |
 | `device.conflict.resolved` | A | `{ memberId, ver }` | clears the member's device conflict; `ver` names the veto that opened it |
+| `device.leaf.repair.requested` | D (the affected device itself) | `{ memberId, deviceId, group: { scope: scopeId \| null, generation }, keyPackageRef }` | none in the fold. Asks that the device's leaf in that MLS group be replaced by a leaf built from the KeyPackage whose KeyPackageRef (RFC 9420 section 5.2) is `keyPackageRef`; any leaf of the group may then commit the replacement (`mls-integration.md` sections 4.3 and 4.5; decision round 8, item 1). Rules below |
 | `scope.membership.changed` | A | `{ scopeId, memberIds, ver }` | scope roster |
 | `seat.added`, `seat.removed` | A (or D with role `maintain`) | `{ memberId, device: DeviceEntry, agentRef }` / `{ deviceId }` | Roster (reserved) |
 
 A device conflict blocks every `mode: "auto"` approval for that member until `device.conflict.resolved`. A veto never removes a device: a device can remove only itself, and only an admin can remove another device (decision round 3).
+
+**Vetoes block every approval.** A vetoed request is closed: `apply` rejects an approval that names it in mode `"auto"` and in mode `"admin"` alike (`vetoed`). An admin who still wants the device approves nothing; the device is linked again with a new request after `device.conflict.resolved`.
+
+**Leaf repair requests** (decision round 8, item 1). `apply` accepts `device.leaf.repair.requested` only if:
+
+- it is signed by the device it names: the producer is the active device `deviceId` of member `memberId` (`not_permitted` otherwise). No device can ask for another device's leaf to be replaced, and an admin key cannot sign it;
+- `group.scope` is `null` (the room group) or a scope whose current member list contains `memberId` (`not_in_scope`);
+- the same device has no earlier request for the same group (`scope` and `generation`) less than 1 hour of `hts` before this entry (`repair_too_soon`);
+- the same device has fewer than 8 requests, for any groups, in the 24 hours of `hts` before this entry (`repair_rate`).
+
+A request is open for 24 hours of `hts` after its entry and is used at most once. It is cancelled in the fold when the device leaves the roster (`device.removed`, `member.device.replaced`, `member.removed`, `member.left`, or a re-fold that drops it) and when its rekey is approved, because the device's credential then changes. As with the holds, the `hts` limits catch a careless host; the host enforces the same limits on its own clock before sequencing.
+
+*Abuse analysis.* The statement can only name the signer's own leaf, so the worst a holder of one device's keys can do with it is to replace that device's leaf: at most once per group per hour and 8 times a day, each costing the group one commit. A thief who holds a device's signing key and session key could use it to swap the honest device's leaf for one of its own and so read that group's later messages as that device. The thief already has that device's signing key, which is the compromise case of `keys-rotation-recovery.md` section 6.3 (removal), and the statement adds no power over other devices. It is visible: every member sees the request (section 4.6), and the honest device, which never signed it, sees its own leaf removed by a replacement it did not ask for and raises `leaf_replaced_unrequested` (section 6.6), prompting the person to have the device removed.
 
 **Pending requests are cancelled in the fold** (re-review finding R-8). A pending `device.added` or `device.rekeyed` is cancelled when its requesting device is removed or its rekey is approved (the request was signed by a key that is no longer current), when the device being rekeyed is removed, or when the member is removed or leaves. A cancelled request cannot be approved in any mode; `apply` rejects an approval that names it. So an admin who removes a person's stolen only device also stops the thief's pending add, whatever the host does.
 
@@ -171,7 +190,7 @@ A device conflict blocks every `mode: "auto"` approval for that member until `de
 
 | Type | Producer | Plaintext `data` | Effect |
 |---|---|---|---|
-| `lane.created` | A | `{ laneId, owner: memberId, offer: { serverId, dh, relay }, visibility }` | Authority (lane table). `owner` is the member whose gateway serves the lane |
+| `lane.created` | A | `{ laneId, owner: memberId, offer: { serverId, dh, relay }, visibility: "room" \| "team" }` | Authority (lane table). `owner` is the member whose gateway serves the lane |
 | `lane.offer.rotated` | A | `{ laneId, offer, ver }` | Authority |
 | `lane.names.changed` | D of the lane's `owner` | `{ laneId, show, ver }` | Authority (lane table). `show: true` is rejected while `policy.projectNames = "hidden"` (`grants-v2.md` 13.2) |
 | `lane.degraded` | H or N | `{ laneId, reason: "agent_missing" \| "endpoint_failing" }` | none (C-13) |
@@ -179,6 +198,8 @@ A device conflict blocks every `mode: "auto"` approval for that member until `de
 | `grant.issued` | H | `{ memberId, deviceId, laneId, gid, exp }` | none |
 | `grant.revoked` | H | `{ gid, reason: "superseded" \| "removed" \| "role_changed" \| "lane_closed" \| "host_key_revoked" }` | none |
 | `grant.suspected_theft` | H | `{ memberId, deviceId, laneId, gid, reportedBy: "endpoint" \| "member" }` | none (alert) |
+
+**Lane existence.** `lane.offer.rotated`, `lane.names.changed`, `lane.degraded` and `lane.closed` need a lane that a `lane.created` made and that is not closed (`unknown_lane`, `lane_closed`). A closed lane never reopens; a new lane gets a new `laneId`. Lane lists in `member.admitted`, `member.lanes.changed` and `invite.created` are not checked against the lane table: they may name lanes created later or since closed, and access is decided when a grant is issued (`grants-v2.md`).
 
 ### 4.5 MLS and content
 
@@ -208,9 +229,9 @@ These events produce a visible notice in every member's room view, not only an e
 | Policy | `room.policy.changed` (each changed setting named, old and new value; a change that weakens a setting fixed by an org policy is marked) |
 | Room | `room.close.proposed` (with the earliest confirmation time), `room.closed` |
 | Authority keys | `admin.added`, `admin.removed`, `admin.key.rotated`, `admin.key.revoked`, `recovery.key.proposed`, `recovery.key.rotated`, `host.key.rotated`, `host.key.revoked`, `endpoint.rotated`, `lane.offer.rotated` |
-| Membership and devices | `member.admitted`, `member.removed`, `member.left`, `member.device.replaced`, `device.added` ("Sam is adding a device; it joins at <time>", and, when the requester is Sam's only device, "Sam has only one device in this room, and it is adding another"), `device.add.vetoed`, `device.add.approved` (with "added by their own device" or "approved by an admin"), `device.removed`, `device.rekeyed` (and, when the requester is Sam's only device, "Sam has only one device in this room, and it is changing its keys"), `device.rekey.vetoed`, `device.rekey.approved`, `device.conflict.resolved` |
+| Membership and devices | `member.admitted`, `member.removed`, `member.left`, `member.device.replaced`, `device.added` ("Sam is adding a device; it joins at <time>", and, when the requester is Sam's only device, "Sam has only one device in this room, and it is adding another"), `device.add.vetoed`, `device.add.approved` (with "added by their own device" or "approved by an admin"), `device.removed`, `device.rekeyed` (and, when the requester is Sam's only device, "Sam has only one device in this room, and it is changing its keys"), `device.rekey.vetoed`, `device.rekey.approved`, `device.conflict.resolved`, `device.leaf.repair.requested` ("Sam's laptop asked to repair its membership in *<group>*") |
 | Lane display | `lane.names.changed` |
-| Alerts | `grant.suspected_theft`, `endpoint.evicted`, `mls.stalled`, `lane.degraded`, and the detection results of section 6 (`fork`, `truncation`) |
+| Alerts | `grant.suspected_theft`, `endpoint.evicted`, `mls.stalled`, `lane.degraded`, the detection results of section 6 (`fork`, `truncation`), and a host key, room endpoint or lane offer left **uncertified** by a re-fold (section 5.1, step 9) |
 
 The member's own devices additionally get the veto prompt for `device.added` and `device.rekeyed` (`identity-model.md` section 6.3).
 
@@ -235,7 +256,7 @@ state = init(genesis)       // admins (lineage roots), recovery, host keys, endp
                             // empty denylists, retired keys, versions, pending requests; maxBase = {}
 for entry in chain (seq ascending):
     verify entry: prev link, entryHash, hsig with entry.hostKid valid at this position
-    if entry.cls == "mls": track epoch; continue
+    if entry.cls == "mls": record epoch; continue
     stmt = body; verify bodyHash, strict parse, schema
     base rule:    stmt.base.seq < entry.seq, and stmt.base.hash == entryHash(stmt.base.seq)
                   (genesisHash when stmt.base.seq == -1)
@@ -243,7 +264,8 @@ for entry in chain (seq ascending):
     require producer allowed for stmt.type in state (section 4); verify sig with the stored key
     forward rule: stmt.base.seq > maxBase[producer kid] (if present); then maxBase[producer kid] = stmt.base.seq
     ref rule:     if stmt has ref or proposal: stmt.base.seq >= seq of the entry that carries it
-    if stmt is admin.key.revoked or host.key.revoked: state = refold(...)   // section 5.1
+    depth rule:   if stmt is admin.key.revoked: its nesting depth is at most 8 (section 5.1, step 8)
+    if stmt is admin.key.revoked: state = refold(...)                      // section 5.1
     else: state = apply(state, stmt, entry)     // pure; checks versions, holds; rejects impossible changes
     if the roster members after this entry differ from those before it: rosterSeq = entry.seq
 Roster     = { roomId, seq: rosterSeq, members: sorted by memberId }
@@ -252,20 +274,27 @@ rosterHash = H("roster", RJCS(Roster))
 
 `rosterSeq` is always the `seq` of the **last roster-changing entry**. Entries that do not change the roster (for example `lane.created` or `grant.issued`) leave it unchanged. A revocation whose re-fold changes the roster is itself the roster-changing entry, so `rosterSeq = r` (re-review finding R-7); otherwise one roster position would have two hashes, the one members witnessed before the revocation and the recomputed one. Every reference to a roster position (MLS authenticated data, `log.witness`) uses this value (S-14; vectors: `log.rosterAfter`, where the head at `seq` 3 still has roster position 2, and `log.refold`, where the revocation entry becomes the roster position).
 
+**Epoch.** The fold records each entry's `epoch` and does not check it: it neither requires statement entries to repeat the previous epoch nor commit entries to advance it, because ReInit restarts the count and only members can judge commits (`mls-integration.md` section 4). Checks that need an epoch use the epoch inside the MLS message itself (`mls-integration.md` section 5.1).
+
 `maxBase` is updated for every statement that passes the signature check, whether it later takes effect, becomes suspect or is void, so the forward rule does not depend on re-folds.
 
 `apply` rejects (and the member raises `invalid_entry` and stops processing later entries, rather than skipping):
 
-- adding a device whose keys are in the device denylist, retired, or already in the roster; adding a `memberId`, `deviceId` or `laneId` that was ever used in the room;
-- adding or certifying a key that is **retired**: any key that was ever valid in this room for any subject and was then rotated out, removed or revoked (device, admin, recovery, host, endpoint and lane keys alike). The admin-key denylist and the device denylist are the parts of this set that existing rules already named;
-- removing the last admin;
+- adding a device whose keys are in the device denylist, retired, or already in the roster; adding a `memberId`, `deviceId` or `laneId` that was ever used in the room (a `deviceId` counts as used from the `device.added` that requested it);
+- adding or certifying a key that is **retired**: any key that was ever valid in this room for any subject and was then rotated out, removed or revoked (device, admin, recovery, host, endpoint and lane keys alike). The admin-key denylist and the device denylist are the parts of this set that existing rules already named. A re-fold never takes a key out of this set (section 5.1, step 9);
+- adding or certifying a key equal to any key currently in use in the room, for any subject (section 4.1, "New keys are fresh");
+- removing the last active admin key (`admin.removed`), or an `admin.key.revoked` signed by an admin key that would leave no active admin key; R may (section 5.1, step 4);
 - a role above the producing admin's own;
 - a `ver` that does not equal the current version of the field (section 4.0), or a `KeyChange.old` that does not name the subject's current key;
 - `member.admitted` with method `"creator"` anywhere but `seq` 0, or any other statement at `seq` 0;
 - `member.left` signed by a device of a different member, or by a member with more than one active device;
 - `device.removed` signed by a device for a device other than itself, or for itself when it is the member's last active device;
-- `device.add.approved` or `device.rekey.approved` whose `ref` is not a pending, uncancelled `device.added` or `device.rekeyed`; and, for `mode: "auto"`: policy `deviceAddApproval = "admin"`; for a **sole-device request** (an add or a rekey whose requesting device was the member's only active device when the request was sequenced), policy `soleDeviceChange = "admin"`; a veto for `ref` earlier in the chain; an open device conflict for the member; less than the **hold** of `hts` between the request entry and the approval entry, where the hold is 72 h for a sole-device request and 24 h otherwise (decision round 4, item 2, for adds; decision round 5, item 3, for rekeys); or (for adds) a requesting device that had been active for less than 24 h of `hts` when its request was sequenced;
-- `room.closed`, `recovery.key.rotated` from `null`, or `admin.key.revoked` that breaks the rules of sections 5.1 and 5.2;
+- `device.added` whose `addedBy` is not the signing device, whose `linkRef` names no `device.link.created` of the same member, or whose link already added a device;
+- `device.leaf.repair.requested` that breaks the rules of section 4.3 (own leaf only, scope, rate);
+- `device.add.approved` or `device.rekey.approved` whose `ref` is not a pending, uncancelled, unvetoed `device.added` or `device.rekeyed`, in any mode; and, for `mode: "auto"`: policy `deviceAddApproval = "admin"`; for a **sole-device request** (an add or a rekey whose requesting device was the member's only active device when the request was sequenced), policy `soleDeviceChange = "admin"`; a veto for `ref` earlier in the chain; an open device conflict for the member; less than the **hold** of `hts` between the request entry and the approval entry, where the hold is 72 h for a sole-device request and 24 h otherwise (decision round 4, item 2, for adds; decision round 5, item 3, for rekeys); or (for adds) a requesting device that had been active for less than 24 h of `hts` when its request was sequenced;
+- `room.closed`, `recovery.key.rotated` from `null`, `admin.key.revoked` or `host.key.revoked` that breaks the rules of sections 5.1 and 5.2;
+- `invite.revoked` signed by a device for an invite, or for a link of another member;
+- a statement naming a lane that does not exist or is closed (section 4.4, "Lane existence");
 - `lane.names.changed` from a device of a member other than the lane's `owner`, or with `show: true` under `projectNames = "hidden"`;
 - a `minVersion` decrease, a `grantTtl` above 43 200, or a `closeDelay` outside 0 to 518 400;
 - any statement after `room.closed`;
@@ -285,18 +314,42 @@ Revocation cut-offs are log positions, not times (S-8).
 
 `admin.key.revoked { kid, fromSeq }` at position `r`, signed by another admin key or by R:
 
-1. **Bounds.** `fromSeq ≤ r`; `fromSeq` is not earlier than the position where `kid` became valid; and not earlier than the **authority start** of the revoking key, whether it is an admin key or R (decision round 4, item 1; re-review finding R-3). A key's authority start is the position where it became valid, except that a key installed by rotation (`admin.key.rotated`, `recovery.key.rotated` from a non-null key) inherits the start of the key it replaced, because the old key signed the change. So a newly added admin key, or a recovery key installed later, cannot reach back before its own existence and void an honest admin's earlier statements, while a routine rotation loses no reach. A genesis key's start is 0.
+1. **Bounds.** `kid` is an admin key of the room that no revocation in effect names yet (a key that is already rotated out or removed may be revoked, once); `fromSeq ≤ r`; `fromSeq` is not earlier than the position where `kid` became valid; and not earlier than the **authority start** of the revoking key, whether it is an admin key or R (decision round 4, item 1; re-review finding R-3). A key's authority start is the position where it became valid, except that a key installed by rotation (`admin.key.rotated`, `recovery.key.rotated` from a non-null key) inherits the start of the key it replaced, because the old key signed the change. So a newly added admin key, or a recovery key installed later, cannot reach back before its own existence and void an honest admin's earlier statements, while a routine rotation loses no reach. A genesis key's start is 0.
 2. **Effect.** The state at `r` is recomputed as the fold of `chain[0..r)` in which every statement signed by `kid` at a position `≥ fromSeq` has **no effect**. Those statements are **suspect**: they stay in the log and history, marked, and never take effect again. Statements of other producers in that range are re-applied in order. One that no longer applies (because it depended on a suspect statement, or its `ver` no longer matches the recomputed version) is **void**: no effect, shown in history, no alert. From `r` on, `kid` is invalid and on the admin-key denylist.
-3. **Several revocations** compose: the fold keeps the set of `(kid, fromSeq)` pairs and recomputes with all of them. The result does not depend on the order in which a member learned of them.
-4. **Precedence of the recovery key.** R can always revoke an admin key within the bounds of step 1, and R cannot be revoked by an admin key. If a stolen admin key revoked the honest admin first, R revokes the stolen key with a `fromSeq` at or before that revocation. The re-fold then removes the stolen key's revocation, and the honest admin's key is valid again. Statements the honest admin made while revoked were refused by the host, so the honest admin re-submits them.
+3. **Several revocations** compose: the fold keeps the set `E` of `(kid, fromSeq)` pairs of the revocations in effect and recomputes with all of them. A revocation is **in effect** when it is neither suspect (its signer is covered by a pair of `E`) nor void (it breaks step 1 or step 4 in the recomputed state). Every member folds the same chain in the same order with the algorithm below, so all reach the same `E` and the same state. The algorithm is a fixed point over flat passes, never a recursion (decision round 8, item 4):
+
+   ```
+   E := pairs of the revocations in effect before r, plus (kid, fromSeq) of the new one
+   repeat at most 9 times:
+       pass := fold of chain[0..r) from genesis, with every pair of E imposed from the start:
+               a statement by a covered kid at a position >= that pair's fromSeq is suspect;
+               an earlier admin.key.revoked is classified as suspect, void or in effect,
+               and if in effect it only marks its target revoked at its own position (no replay)
+       E' := the new pair plus the pairs of the earlier revocations the pass found in effect
+       if E' == E: the result is pass; stop
+       E := E'
+   if no pass settled: reject the new revocation with revocation_too_deep
+   ```
+
+   Imposing an earlier revocation's pair from the start of the pass, instead of at its position, gives the same result, because a revoked key never signs again after its revocation (step 9), so all of its statements lie before it. Each pass costs one step per entry before `r`, so a re-fold costs at most 9 times the length of the chain: linear in the chain, whatever the nesting. A recursive replay, where each earlier revocation replays the chain again, costs exponential time in the number of revocations and is not allowed. A revocation that changes no earlier revocation's classification settles in one pass, and the unit tests' chains in which one earlier revocation becomes suspect settle in two. The bound of 9 passes is a deterministic limit that every member applies the same way; that every chain within the depth cap of step 8 settles within it is expected but not proven.
+4. **Precedence of the recovery key.** R can always revoke an admin key within the bounds of step 1, and R cannot be revoked by an admin key. If a stolen admin key revoked the honest admin first, R revokes the stolen key with a `fromSeq` at or before that revocation. The re-fold then makes the stolen key's revocation suspect: the honest admin's statements before it take effect again, but the honest admin's key does **not** return (step 9; decision round 8, item 3). R then adds a fresh key for the honest admin with `admin.added`, which starts its own lineage (section 5.2). Statements the honest admin made while revoked were refused by the host, so the honest admin re-submits them with the new key. Because no retired key returns, such a revocation may leave the room with no active admin key; **only R may do that**, since only R can then add a fresh one. An admin key may not leave the room without an active admin key (`last_admin`). In practice its own key stays active, because its authority start lies after the statement that installed it, so step 1 keeps that statement out of the revoked range; the rule still applies if a re-fold ever dropped it.
 5. **Without R** two admins can race: whichever revocation the host sequences first stands. This is a stated limit. Rooms that matter should have a recovery key (offered by default, `identity-model.md` section 5.4).
 
 6. **Roster position.** If the re-fold changes the roster members, `rosterSeq = r` (section 5, R-7).
-7. **Versions and pending items after a re-fold.** Versions, pending device requests, conflicts and open proposals are recomputed with the rest of the state. A suspect `room.close.proposed` or `recovery.key.proposed` is void, so it can no longer be confirmed.
+7. **Versions and pending items after a re-fold.** Versions, pending device requests, conflicts and open proposals are recomputed with the rest of the state. A suspect `room.close.proposed` or `recovery.key.proposed` is void, so it can no longer be confirmed. A member whose devices step 9 drops gets `r` as the version of its device set.
+8. **Nesting depth** (decision round 8, item 4). Each `admin.key.revoked` entry has a nesting depth: 1 plus the largest depth among the earlier `admin.key.revoked` entries at positions in `[fromSeq, r)`, or 1 if there is none. Every revocation entry in the chain counts, whether it is in effect, suspect or void, so the depth depends on positions only and is computed before the re-fold. `apply` rejects a revocation of depth greater than 8 with `revocation_too_deep`. A revocation whose range reaches back over many earlier revocations is then split: R or an admin first revokes the innermost keys, then the outer ones with a `fromSeq` after them. Vector: `log.revocationDepth` (depths 1 to 8 accepted, 9 rejected).
+9. **Retired keys never return** (decision round 8, item 3). A re-fold recomputes the state, but it never puts a retired key back into use, even when it voids the rotation, removal or revocation that retired it. After the passes:
+   - every id used and every key retired, denylisted or rotated out before `r` stays so, and every key that was in use before `r` and is not in the recomputed state is retired (device keys also denylisted);
+   - an admin key that was revoked, removed or rotated out before `r` stays inactive, even if the statement that ended it is now suspect or void (step 4 gives the recovery path);
+   - a device whose recomputed signing or DH key is retired is dropped from the roster, with its pending requests and leaf repair requests cancelled: for example a device removed by a suspect statement, or a device whose rekey approval is suspect (its old keys were retired at the approval, its new keys leave use now). A pending request whose new keys are retired is cancelled. The member gets the device back only through a fresh statement: `member.device.replaced` by a valid admin, or a new device link;
+   - **host keys are positional:** the host-key table of the state before `r` is kept, so a host key rotated out before `r` never signs again and the current key can sign the entry that fixes it. A host key, the room endpoint, or a lane offer whose installing statement is suspect or void after the re-fold keeps the key it had before `r` and is marked **uncertified**. Members and lane endpoints refuse grants signed by an uncertified host key, as for a revoked one; members show the uncertified endpoint or lane offer as an alert (section 4.6) and keep using it only to reach the room, until a valid admin rotates it with `host.key.rotated`, `endpoint.rotated` or `lane.offer.rotated`. Those statements name the current (uncertified) key or the recomputed version as usual. A lane closed before `r` stays closed;
+   - the recovery key cannot return either: one installed by a statement that is now suspect or void is gone and its key retired.
+
+   The room then needs a fresh statement from a valid admin key or R for each subject it wants back. Vector: `log.noRevival` (a host-key rotation and a device removal by a stolen key; after the re-fold the old host key and the device's keys stay retired, and the new host key signs on, uncertified).
 
 Suspect roster changes are therefore never part of the reference roster. A ghost device admitted by a stolen key leaves the roster at the re-fold, which makes its MLS leaf a pending removal (`mls-integration.md` section 4.2).
 
-`host.key.revoked { kid, fromSeq }` at position `r`: entries signed by `kid` at positions in `[fromSeq, r)` are **suspect for ordering**. The statements inside them keep their producers' signatures and stay valid if those producers' keys were valid, so the roster is not recomputed. Members compare heads with other members (section 6) to find equivocation in that range. Entries after `r` signed by `kid` are invalid. Grants signed by `kid` are refused once the revocation is applied, whatever their `iat` (`keys-rotation-recovery.md` section 3).
+`host.key.revoked { kid, fromSeq }` at position `r`: `kid` must be a host key that was already rotated out (the current key is rotated first), not yet revoked, and `fromSeq` must meet the bounds of step 1, including the revoking admin key's authority start. Entries signed by `kid` at positions in `[fromSeq, r)` are **suspect for ordering**. The statements inside them keep their producers' signatures and stay valid if those producers' keys were valid, so the roster is not recomputed. Members compare heads with other members (section 6) to find equivocation in that range. Entries after `r` signed by `kid` are invalid. Grants signed by `kid` are refused once the revocation is applied, whatever their `iat` (`keys-rotation-recovery.md` section 3).
 
 ### 5.2 Admin lineages, recovery-key installation and closure
 
@@ -316,8 +369,8 @@ Two admin keys are **independent** when their roots differ. A ghost member admit
 **Closure by admins.** `room.closed {proposal}` signed by admin key C is valid only if all of these hold at its position:
 
 1. `proposal` names a `room.close.proposed` entry `p` that is not suspect or void, whose `exp` has not passed, and that no earlier `room.closed` used;
-2. the proposing key P and C are both active and independent (different roots);
-3. C was already valid at `p` (`C.fromSeq ≤ p`), so a key added after the proposal cannot confirm it;
+2. the proposing key P and C are both active and independent (different roots). A proposal whose key is rotated, removed or revoked before the confirmation is void, even after a routine rotation; the admin proposes again with the new key;
+3. C was already valid at `p` by its own first valid position (`C.fromSeq ≤ p`), so a key added after the proposal cannot confirm it, and neither can a key installed by rotation after the proposal, although its lineage existed then;
 4. the `hts` of the confirmation entry is at least `closeDelay` seconds after the `hts` of `p`, where `closeDelay` is the larger of `policy.closeDelay` at `p` and at the confirmation. Default 86 400 (24 h), on by default (decision round 4, item 1). The delay gives R or another admin time to revoke a thief before the closure; it is not an undo window, since a closure stays final.
 
 The confirming admin's daemon enforces the delay on its own clock: the Rooms UI shows "Closure proposed by *<admin>*. It can be confirmed after *<time>*" and refuses to sign earlier.
@@ -391,6 +444,9 @@ A head claim from another member is that member's statement, not the host's. Onl
 | `roster_mismatch` | the member; evidence to admins | stop advancing MLS (`mls-integration.md` section 9) |
 | `invalid_entry` | the member; evidence to admins | stop processing later entries; show "This room's history contains an invalid entry. The host may be misbehaving." |
 | `suspect` statements | everyone | marked in history; they have no effect (section 5.1) |
+| `uncertified_key` (a host key, the room endpoint or a lane offer left uncertified by a re-fold) | everyone; admins are asked to rotate it | keep working; refuse grants signed by an uncertified host key; show "A key of this room was set by a revoked admin key. An admin must replace it." (section 5.1, step 9) |
+| `leaf_replaced_unrequested` (a device sees its own leaf replaced under a `device.leaf.repair.requested` it did not sign) | the device; evidence to admins | stop sending in that group; show "Someone used this device's identity to replace its membership. Ask an admin to remove this device." (section 4.3) |
+| `epoch_fork`, `epoch_anchor_mismatch`, `epoch_unconfirmed` (joiner's epoch check) | as in `mls-integration.md` section 5.1 | `epoch_fork`: stop sending application messages in that group; the others as stated there |
 
 No alert removes the member or deletes data automatically. Recovery is a human decision (`keys-rotation-recovery.md` section 6).
 

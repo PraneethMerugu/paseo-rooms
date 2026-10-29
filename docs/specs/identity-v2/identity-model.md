@@ -133,11 +133,12 @@ AuthorityState = {
                root: kid, addedBy: kid | "recovery" | null, since} ],   // room-log-v2 5.1, 5.2
   recovery: {kid, pub, fromSeq, since} | null,
   hostKeys: [ {kid, pub, fromSeq, toSeq|null, suspectFromSeq|null,
-               validFrom, validTo|null, revoked} ],      // unix s fields: grants only
+               validFrom, validTo|null, revoked, uncertified} ],   // unix s fields: grants only
   adminKeyDenylist: [kid...],
-  retiredKeys: [pub...],                                 // every key rotated out, removed or revoked
-  endpoint: { serverId, dh, relay },
-  lanes: { laneId -> {owner, serverId, dh, relay, status, showNames} },
+  retiredKeys: [pub...],                                 // every key rotated out, removed or revoked; only grows
+  endpoint: { serverId, dh, relay }, endpointUncertified,
+  lanes: { laneId -> {owner, serverId, dh, relay, visibility, status, showNames, uncertified} },
+  revocations: [ {kid, fromSeq, seq} ],                  // admin-key revocations in effect, room-log-v2 5.1
   policy,
   versions: { <field> -> seq | -1 },                     // room-log-v2 section 4.0
   pendingClose: [ { proposal: bodyHash, kid, seq, hts, exp } ],
@@ -146,7 +147,7 @@ AuthorityState = {
 }
 ```
 
-Key validity for statements and log entries is expressed in log positions (`fromSeq`, `toSeq`), never in time (review finding S-8; `keys-rotation-recovery.md` section 3). Only the host key's grant window uses unix seconds. `root` is the key's lineage root and `since` its authority start, which bounds how far back its revocations reach (`room-log-v2.md` sections 5.1 and 5.2).
+Key validity for statements and log entries is expressed in log positions (`fromSeq`, `toSeq`), never in time (review finding S-8; `keys-rotation-recovery.md` section 3). Only the host key's grant window uses unix seconds. `root` is the key's lineage root and `since` its authority start, which bounds how far back its revocations reach (`room-log-v2.md` sections 5.1 and 5.2). `uncertified` marks a host key, the endpoint or a lane offer whose installing statement a re-fold made suspect or void (`room-log-v2.md` section 5.1, step 9). Leaf repair requests (`device.leaf.repair.requested`) are kept with the roster state for 24 h of `hts`, for the rate limits and for the MLS layer (`room-log-v2.md` section 4.3).
 
 Only admin statements (and recovery-key statements for admin changes and room closure) modify it, apart from `lane.names.changed`, which the lane owner's device signs. The table in `room-log-v2.md` section 4 lists which producer may emit which statement.
 
@@ -295,7 +296,7 @@ LinkRecord = { linkId, tokenKey, memberId, createdBy: deviceId, createdAt, exp,
 4. The host sends B `enroll.pending` with `Nh = Nc` and the assigned `deviceId`. B verifies it (`enrollment-v2.md` section 5.5), signs `KeyChange { subject: {kind:"device", id: deviceId}, old: null, newSig, newDh }` with its new signing key, and sends `sas.reveal { Nm, newKeySig }`.
 5. The host checks the commitment and forwards `link.reveal { pendingId, Nm, newKeySig }` to A. A checks `H("sas-commit", Nm)` against the pinned commitment itself, computes the SAS from the pinned `h`, `Nm`, `Nc` and the info object with `linkId` (`enrollment-v2.md` section 6.2), verifies `newKeySig`, and shows the SAS.
 6. The person compares the two screens. On A, **Codes match** makes A sign `device.added` and send `link.confirm { id, pendingId, statement }`. On B, **Codes match** sends `enroll.confirm`. **Codes do not match** on either device aborts and burns the link: B sends `enroll.abort {reason: "sas_mismatch"}`, and A sends `link.abort { id, linkId, pendingId, reason: "sas_mismatch" }`. A also marks the link burned in its own sealed state, whatever the host does.
-7. When both confirmations are in, the host logs `device.added` and sends B `enroll.held { pendingId, entry, effectiveAfter }` (or `effectiveAfter: null` while it waits for an admin). B's journal moves to `held` and B may disconnect.
+7. When both confirmations are in, the host logs `device.added`. The fold accepts it only if `linkRef` names a `device.link.created` of the same member and that link has not added a device yet; one link adds one device. B's `deviceId` is reserved from this entry on, so a vetoed or cancelled add burns it and a later link uses a new one (`room-log-v2.md` sections 4.3 and 5). The host then sends B `enroll.held { pendingId, entry, effectiveAfter }` (or `effectiveAfter: null` while it waits for an admin). B's journal moves to `held` and B may disconnect.
 8. When `device.add.approved` is logged, B's next `enroll.resume` returns `enroll.admitted` carrying that statement. A veto, the removal of A or of the member (which cancels the add in the fold, `room-log-v2.md` section 4.3), or 48 hours without approval after the hold ends close the pending enrollment (`enroll.closed vetoed | rejected | timeout`). Under admin approval with no hold, the 48 hours count from `device.added`.
 
 The host tells A when a pending enrollment on its link ends: `link.closed { linkId, pendingId, reason }`, with `reason` as in `enroll.closed` plus `"abandoned"`.

@@ -154,6 +154,18 @@ export const STATEMENT_TYPES = {
   "device.rekey.vetoed": { producers: [D], data: RefData },
   "device.rekey.approved": { producers: [A], data: ApprovalData },
   "device.conflict.resolved": { producers: [A], data: z.strictObject({ memberId: MemberId, ver: Ver }) },
+  // Decision round 8, item 1: a device asks for its own dead leaf in one group to be replaced
+  // (mls-integration.md sections 4.3 and 4.4). `group` names the MLS group by scope and generation;
+  // `keyPackageRef` is the RFC 9420 KeyPackageRef of the package the replacement must add.
+  "device.leaf.repair.requested": {
+    producers: [D],
+    data: z.strictObject({
+      memberId: MemberId,
+      deviceId: DeviceId,
+      group: z.strictObject({ scope: ScopeId.nullable(), generation: nonNegInt() }),
+      keyPackageRef: Hash32,
+    }),
+  },
   "scope.membership.changed": {
     producers: [A],
     data: z.strictObject({

@@ -1,8 +1,10 @@
 // Identity v2 milestone I-6: key changes, revocation and re-fold, lineages and closure, device
-// holds. Read directly from docs/specs/identity-v2/vectors/vectors.json (log.refold, log.closure,
-// deviceLink.chain(.cases), deviceRekey.chain(.cases), deviceRekey.vetoed,
-// deviceRekey.soleDeviceChangeAdmin, the recovery-key statements), so the tests and the spec cannot
-// drift. Further cases build small chains signed with the vector's test-only seeds.
+// holds; round 8: leaf repair requests, keys that never return after a re-fold, the revocation depth
+// cap and the linear re-fold. Read directly from docs/specs/identity-v2/vectors/vectors.json
+// (log.refold, log.closure, log.noRevival, log.revocationDepth, deviceLink.chain(.cases),
+// deviceRekey.chain(.cases), deviceRekey.vetoed, deviceRekey.soleDeviceChangeAdmin,
+// deviceLeafRepair, the recovery-key statements), so the tests and the spec cannot drift. Further
+// cases build small chains signed with the vector's test-only seeds.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -13,11 +15,12 @@ import { foldLog, FoldError, RoomLogFold, type FoldInputEntry, type FoldReason }
 import { verifyGenesis } from "../../server/authority/genesis";
 import { HOLD_MS, SOLE_HOLD_MS } from "../../server/authority/holds";
 import { lineageCount } from "../../server/authority/lineage";
+import { MAX_REFOLD_PASSES, refoldCounters } from "../../server/authority/refold";
 import { rosterHash } from "../../server/authority/roster";
 import { parseSignedStatement, verifyNewKeySig, type KeyChange, type SignedStatement } from "../../server/authority/statements";
 import { b64u } from "../../server/proto/b64u";
 import { CTX_GENESIS, CTX_KEY_CHANGE_NEW, CTX_LOG_ENTRY, stmtContext } from "../../server/proto/contexts";
-import { ed25519PrivateKeyFromSeed } from "../../server/proto/keys";
+import { ed25519PrivateKeyFromSeed, kid as kidOf, rawPublicKey } from "../../server/proto/keys";
 import { rjcs } from "../../server/proto/rjcs";
 import { sign } from "../../server/proto/tbs";
 
@@ -343,24 +346,32 @@ test("host.key.rotated and host.key.revoked: position decides; the current key i
 
 // ---- revocations ----
 
-test("revocation: R wins the race; the stolen key's revocation of the honest admin becomes suspect", () => {
+test("revocation: R wins the race; the stolen key's revocation becomes suspect, but the honest key does not return", () => {
   const fold = base4();
   // R adds adminB (own root) at 4; adminB (stolen) revokes adminA from 5 at 5.
   add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminB", null), "recovery"));
   add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminA.kid, fromSeq: 5 }, "adminB"));
   expectFold(() => add(fold, build(fold, "producer.fence", {}, "adminA")), "unknown_producer");
-  // adminA may not revoke back; R revokes adminB from 5 at 6.
+  // R revokes adminB from 5 at 6. adminB's revocation is suspect, yet adminA stays retired (round 8,
+  // item 3), so the room has no active admin key: only R may cause that.
   add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminB.kid, fromSeq: 5 }, "recovery"));
-  assert.equal(fold.state.marks[5], "suspect");
+  const st = fold.state;
+  assert.equal(st.marks[5], "suspect");
   assert.deepEqual(
-    fold.state.auth.revocations.map((r) => r.kid),
+    st.auth.revocations.map((r) => r.kid),
     [KEYS.adminB.kid],
   );
-  add(fold, build(fold, "producer.fence", {}, "adminA"));
+  assert.ok(st.auth.adminKeyDenylist[KEYS.adminA.kid] && st.auth.retiredKeys[KEYS.adminA.pub]);
+  assert.equal(lineageCount(st.auth), 0);
+  expectFold(() => add(fold, build(fold, "producer.fence", {}, "adminA")), "unknown_producer");
   expectFold(() => add(fold, build(fold, "producer.fence", {}, "adminB")), "unknown_producer");
+  // The fresh statement: R adds a new key for the honest admin, which starts its own lineage.
+  expectFold(() => add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminA", null), "recovery")), "key_reused");
+  add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminA2", null), "recovery"));
+  add(fold, build(fold, "producer.fence", {}, "adminA2"));
   // An admin key never revokes R, nor itself.
-  expectFold(() => add(fold, build(fold, "admin.key.revoked", { kid: KEYS.recovery.kid, fromSeq: 8 }, "adminA")), "unknown_key");
-  expectFold(() => add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminA.kid, fromSeq: 8 }, "adminA")), "not_permitted");
+  expectFold(() => add(fold, build(fold, "admin.key.revoked", { kid: KEYS.recovery.kid, fromSeq: 8 }, "adminA2")), "unknown_key");
+  expectFold(() => add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminA2.kid, fromSeq: 8 }, "adminA2")), "not_permitted");
 });
 
 test("revocation: statements depending on suspect ones are void; versions and keys are recomputed", () => {
@@ -388,16 +399,30 @@ test("revocation: statements depending on suspect ones are void; versions and ke
   add(fold, build(fold, "member.role.changed", { memberId: BOB, role: "steer", ver: 2 }, "adminA"));
 });
 
-test("revocation: bounds; the last admin key is never revoked or removed", () => {
+test("revocation: bounds; an admin key never removes or revokes the last active admin key, R may revoke it", () => {
   const fold = base4();
   expectFold(() => add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminA.kid, fromSeq: 5 }, "recovery")), "revocation_out_of_bounds");
-  expectFold(() => add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminA.kid, fromSeq: 0 }, "recovery")), "last_admin");
   expectFold(() => add(fold, build(fold, "admin.removed", { kid: KEYS.adminA.kid }, "adminA")), "not_permitted");
   add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminB", null), "recovery")); // 4
   add(fold, build(fold, "admin.removed", { kid: KEYS.adminB.kid }, "adminA")); // 5
   expectFold(() => add(fold, build(fold, "producer.fence", {}, "adminB")), "unknown_producer");
   // Re-adding a removed key is refused.
   expectFold(() => add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminB", null), "recovery")), "key_reused");
+  // A removed (already retired) key may still be revoked, once, within its window.
+  add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminB.kid, fromSeq: 5 }, "adminA")); // 6
+  expectFold(() => add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminB.kid, fromSeq: 5 }, "adminA")), "already_revoked");
+
+  // R revokes adminA from 4, which also drops adminC (added by adminA at 4): no admin key is left,
+  // which only R may cause (round 8, item 3). An admin revoker always stays active itself, because
+  // its authority start lies after its own installation.
+  const f2 = base4();
+  add(f2, build(f2, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminC", null), "adminA")); // 4
+  expectFold(() => add(f2, build(f2, "admin.key.revoked", { kid: KEYS.adminA.kid, fromSeq: 4 }, "adminC")), "revocation_before_since");
+  add(f2, build(f2, "admin.key.revoked", { kid: KEYS.adminA.kid, fromSeq: 4 }, "recovery")); // 5
+  assert.equal(f2.state.marks[4], "suspect");
+  assert.equal(lineageCount(f2.state.auth), 0);
+  add(f2, build(f2, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminB", null), "recovery"));
+  add(f2, build(f2, "producer.fence", {}, "adminB"));
 });
 
 // ---- closure ----
@@ -583,7 +608,7 @@ test("device requests: link checks, key-change checks, rekey keys fresh; member.
   expectFold(() => add(fold, build(fold, "member.left", { memberId: BOB }, "devSig", { hts: T + 1000 })), "not_sole_device");
 });
 
-test("refold: an approved rekey made suspect puts the request back to pending with its new keys usable", () => {
+test("refold: an approved rekey made suspect does not give back the old keys; the device leaves and is re-added fresh", () => {
   const fold = base4();
   const T = ADMITTED_HTS + 48 * HOUR;
   add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminC", null), "adminA", { hts: T })); // 4
@@ -594,23 +619,192 @@ test("refold: an approved rekey made suspect puts the request back to pending wi
   assert.equal(fold.state.members[BOB].devices[0].sig, KEYS.devSig2.pub);
   add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminC.kid, fromSeq: 6 }, "recovery", { hts: T + 2000 })); // 7
   const st = fold.state;
-  assert.equal(st.members[BOB].devices[0].sig, KEYS.devSig.pub, "old keys back");
-  assert.equal(st.pending[ref5].status, "pending");
-  assert.ok(!st.deviceDenylist[KEYS.devSig2.pub] && !st.auth.retiredKeys[KEYS.devSig2.pub]);
+  // Old keys were retired at 6 and new keys leave use at 7: neither returns, so the device is out.
+  assert.equal(st.marks[6], "suspect");
+  assert.equal(st.members[BOB].devices.length, 0);
+  assert.equal(st.pending[ref5].status, "cancelled");
+  for (const k of [KEYS.devSig.pub, KEYS.devDh.pub, KEYS.devSig2.pub, KEYS.devDh2.pub]) assert.ok(st.auth.retiredKeys[k] && st.deviceDenylist[k]);
   assert.equal(fold.roster().seq, 7);
-  add(fold, build(fold, "device.rekey.approved", { memberId: BOB, deviceId: BOB_DEV, ref: ref5, mode: "admin" }, "adminA", { hts: T + 3000 }));
-  assert.equal(fold.state.members[BOB].devices[0].sig, KEYS.devSig2.pub);
+  assert.equal(st.auth.versions[`devices:${BOB}`], 7);
+  expectFold(() => add(fold, build(fold, "device.rekey.approved", { memberId: BOB, deviceId: BOB_DEV, ref: ref5, mode: "admin" }, "adminA", { hts: T + 3000 })), "request_cancelled");
+  expectFold(() => add(fold, build(fold, "producer.fence", {}, "devSig2")), "unknown_producer");
+  // Recovery: a fresh statement by a valid admin, with fresh keys and a fresh device id.
+  const fresh = { deviceId: devId("ee"), kind: "person", sig: KEYS.phoneSig.pub, dh: KEYS.phoneDh.pub };
+  expectFold(() => add(fold, build(fold, "member.device.replaced", { memberId: BOB, removed: [], added: { ...fresh, deviceId: BOB_DEV }, ver: 7 }, "adminA", { hts: T + 3000 })), "id_reused");
+  add(fold, build(fold, "member.device.replaced", { memberId: BOB, removed: [], added: fresh, ver: 7 }, "adminA", { hts: T + 3000 }));
+  add(fold, build(fold, "producer.fence", {}, "phoneSig"));
 });
 
-test("refold: a device removed by a suspect statement returns, and its keys are not denylisted", () => {
+test("refold: a device removed by a suspect statement does not return; its keys stay retired", () => {
   const fold = base4();
   add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminC", null), "adminA")); // 4
   add(fold, build(fold, "device.removed", { memberId: BOB, deviceId: BOB_DEV, reason: "compromise" }, "adminC")); // 5
   assert.equal(fold.state.members[BOB].devices.length, 0);
   add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminC.kid, fromSeq: 5 }, "recovery")); // 6
   const st = fold.state;
-  assert.equal(st.members[BOB].devices[0].sig, KEYS.devSig.pub);
-  assert.ok(!st.deviceDenylist[KEYS.devSig.pub] && !st.auth.retiredKeys[KEYS.devDh.pub]);
-  assert.equal(fold.roster().seq, 6);
-  add(fold, build(fold, "producer.fence", {}, "devSig"));
+  assert.equal(st.marks[5], "suspect");
+  assert.equal(st.members[BOB].devices.length, 0);
+  assert.ok(st.deviceDenylist[KEYS.devSig.pub] && st.auth.retiredKeys[KEYS.devDh.pub]);
+  // The roster is the one members already witnessed at 5, so its position does not move.
+  assert.equal(fold.roster().seq, 5);
+  expectFold(() => add(fold, build(fold, "producer.fence", {}, "devSig")), "unknown_producer");
+});
+
+// ---- round 8: leaf repair requests (room-log-v2.md 4.3; mls-integration.md 4.3, 4.4) ----
+
+test("deviceLeafRepair.chain: the device asks for its own leaf twice, 61 min apart; the cases are rejected", () => {
+  const lr = V.deviceLeafRepair;
+  assert.deepEqual(V.statements.deviceLeafRepairRequested, lr.statement);
+  const { fold, error } = foldLog(GENESIS, [...mainPrefix(), ...lr.chain.entries.map(input)]);
+  assert.equal(error, null);
+  const open = Object.values(fold.state.repairs);
+  assert.equal(open.length, 2);
+  assert.ok(open.every((r) => r.status === "open" && r.deviceId === BOB_DEV && r.scope === null && r.generation === 0));
+  assert.equal(fold.state.repairs[lr.chain.entries[0].entry.bodyHash].keyPackageRef, lr.statement.body.data.keyPackageRef);
+  assert.equal(fold.roster().seq, 2, "a repair request changes no roster");
+  assert.equal(lr.chain.cases.length, 2);
+  for (const c of lr.chain.cases) {
+    expectCase([...mainPrefix(), ...c.chain.map(input)], { ...c.entry, statement: c.statement }, c.expect, c.entry.entry.seq);
+  }
+});
+
+test("leaf repair: scope membership, the 24 h cap, and cancellation when the device leaves", () => {
+  const fold = base4();
+  const T = ADMITTED_HTS + 48 * HOUR;
+  const scope = "scp_" + "ab".repeat(16);
+  const req = (scopeId: string | null, generation: number, hts: number, signer = "devSig") =>
+    build(fold, "device.leaf.repair.requested", { memberId: BOB, deviceId: BOB_DEV, group: { scope: scopeId, generation }, keyPackageRef: ref(`kp/${hts}/${generation}`) }, signer, { hts });
+  expectFold(() => add(fold, req(scope, 0, T)), "not_in_scope");
+  add(fold, build(fold, "scope.membership.changed", { scopeId: scope, memberIds: [BOB].sort(), ver: -1 }, "adminA", { hts: T }));
+  add(fold, req(scope, 0, T + 1000));
+  // Another device of another member may not ask for Bob's leaf.
+  expectFold(() => add(fold, req(null, 0, T + 2000, "creatorDevSig")), "not_permitted");
+  // Eight per device in 24 h, whatever the group: seven more groups (generations) fill the window.
+  for (let g = 1; g <= 7; g++) add(fold, req(null, g, T + 2000 + g * 1000));
+  expectFold(() => add(fold, req(null, 8, T + 20_000)), "repair_rate");
+  // Requests older than 24 h no longer count.
+  add(fold, req(null, 8, T + 1000 + 24 * HOUR));
+  // Removing the device cancels its open requests.
+  add(fold, build(fold, "device.removed", { memberId: BOB, deviceId: BOB_DEV, reason: "lost" }, "adminA", { hts: T + 25 * HOUR }));
+  assert.ok(Object.values(fold.state.repairs).every((r) => r.status === "cancelled"));
+});
+
+// ---- round 8: retired keys never return (room-log-v2.md 5.1) ----
+
+/** A test-only Ed25519 key from a label, registered for `build`. */
+function extraKey(name: string, kind: "admin" | "host" | "device" | "recovery"): string {
+  const seed = createHash("sha256").update(`paseo-rooms/v2/unit-test-seed/${name}`).digest();
+  const pub = rawPublicKey(ed25519PrivateKeyFromSeed(seed));
+  KEYS[name] = { alg: "ed25519", seedHex: seed.toString("hex"), pub: b64u(pub), kid: kidOf("ed25519", pub) };
+  KIND[name] = kind;
+  return name;
+}
+
+test("log.noRevival: host-1 and the laptop stay retired after the re-fold; host2 signs on, uncertified", () => {
+  const nr = L.noRevival;
+  const { fold, error } = foldLog(GENESIS, [...mainPrefix(), ...nr.entries.map(input)]);
+  assert.equal(error, null);
+  const st = fold.state;
+  assert.deepEqual(
+    st.auth.hostKeys.map((h) => ({ kid: h.kid, fromSeq: h.fromSeq, toSeq: h.toSeq, uncertified: h.uncertified })),
+    nr.hostKeysAfter,
+  );
+  assert.deepEqual([st.marks[5], st.marks[6]], ["suspect", "suspect"]);
+  assert.deepEqual({ seq: fold.roster().seq, hash: fold.rosterHash() }, nr.rosterAfter);
+  assert.deepEqual(nr.rosterAfter, nr.rosterBefore);
+  assert.equal(st.members[BOB].devices.length, 0);
+  assert.ok(st.auth.retiredKeys[KEYS.host.pub] && st.deviceDenylist[KEYS.devSig.pub]);
+  for (const c of nr.cases) expectCase([...mainPrefix(), ...nr.entries.slice(0, 4).map(input)], { ...c.entry, statement: c.statement }, c.expect, 8);
+
+  // Recovery: a valid admin rotates the uncertified host key; the new key is certified.
+  const host3 = extraKey("host3", "host");
+  const rot = keyChange({ kind: "host", id: "host" }, KEYS.host2.kid, host3, null);
+  add(fold, build(fold, "host.key.rotated", { ...rot, oldValidTo: 1793400000 }, "adminA", { host: "host2" }));
+  const [, h2, h3] = fold.state.auth.hostKeys;
+  assert.deepEqual([h2.toSeq, h2.uncertified, h3.kid, h3.uncertified], [9, true, KEYS.host3.kid, false]);
+  add(fold, build(fold, "producer.fence", {}, "adminA", { host: host3 }));
+  expectFold(() => add(fold, build(fold, "producer.fence", {}, "adminA", { host: "host" })), "unknown_host_key");
+});
+
+test("refold: the endpoint and a lane offer rotated by a suspect statement keep their new keys, uncertified; old keys stay retired", () => {
+  const fold = base4();
+  const lane = L.bodies[1].statement.body.data.laneId as string;
+  add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminC", null), "adminA")); // 4
+  const oldEndpoint = clone(fold.state.auth.endpoint);
+  const oldLane = clone(fold.state.auth.lanes[lane].offer);
+  const ep = { ...oldEndpoint, dh: { alg: "x25519", kid: KEYS.devDh2.kid, pub: KEYS.devDh2.pub }, ver: -1 };
+  add(fold, build(fold, "endpoint.rotated", ep, "adminC")); // 5
+  add(fold, build(fold, "lane.offer.rotated", { laneId: lane, offer: { ...oldLane, dh: { alg: "x25519", kid: KEYS.ghostDh.kid, pub: KEYS.ghostDh.pub } }, ver: 1 }, "adminC")); // 6
+  add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminC.kid, fromSeq: 5 }, "recovery")); // 7
+  const a = fold.state.auth;
+  assert.deepEqual([a.endpoint.dh.pub, a.endpointUncertified], [KEYS.devDh2.pub, true]);
+  assert.deepEqual([a.lanes[lane].offer.dh.pub, a.lanes[lane].uncertified], [KEYS.ghostDh.pub, true]);
+  assert.ok(a.retiredKeys[oldEndpoint.dh.pub] && a.retiredKeys[oldLane.dh.pub]);
+  // The versions are recomputed without the suspect statements; a valid admin rotates again with them.
+  assert.deepEqual([a.versions.endpoint, a.versions[`laneOffer:${lane}`]], [undefined, 1]);
+  expectFold(() => add(fold, build(fold, "endpoint.rotated", { ...oldEndpoint, ver: -1 }, "adminA")), "key_reused");
+  add(fold, build(fold, "endpoint.rotated", { ...oldEndpoint, dh: { alg: "x25519", kid: KEYS.phoneDh.kid, pub: KEYS.phoneDh.pub }, ver: -1 }, "adminA"));
+  assert.equal(fold.state.auth.endpointUncertified, false);
+});
+
+// ---- round 8: nesting depth cap and linear re-fold cost (room-log-v2.md 5.1) ----
+
+test("log.revocationDepth: depths 1 to 8 are accepted; depth 9 is rejected with revocation_too_deep", () => {
+  const d = L.revocationDepth;
+  const prefix = [...mainPrefix(), ...d.entries.map(input)];
+  const { fold, error } = foldLog(GENESIS, prefix);
+  assert.equal(error, null);
+  assert.equal(fold.state.auth.revocations.length, 8);
+  assert.equal(d.maxDepth, 8);
+  expectCase(prefix, { ...d.rejectTooDeep.entry, statement: d.rejectTooDeep.statement }, d.rejectTooDeep.expect, 21);
+});
+
+test("re-fold cost is linear: 40 revocations take one pass each, never a nested replay", () => {
+  const fold = base4();
+  const n = 40;
+  const names = Array.from({ length: n }, (_, k) => extraKey(`lin-admin-${k}`, "admin"));
+  for (const name of names) add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, name, null), "recovery"));
+  refoldCounters.passes = 0;
+  refoldCounters.steps = 0;
+  let positions = 0;
+  for (const name of names) {
+    positions += fold.head.seq + 1;
+    add(fold, build(fold, "admin.key.revoked", { kid: KEYS[name].kid, fromSeq: fold.head.seq + 1 }, "recovery"));
+  }
+  assert.equal(fold.state.auth.revocations.length, n);
+  // Each revocation is one pass over the entries before it (a recursive replay would need 2^40 steps).
+  assert.equal(refoldCounters.passes, n);
+  assert.equal(refoldCounters.steps, positions);
+  assert.ok(refoldCounters.steps <= MAX_REFOLD_PASSES * positions);
+});
+
+test("re-fold: a revocation made suspect lets the statements it suspended apply again; settled in two passes", () => {
+  // R adds adminB (4) and adminC (5), separate lineages. adminC changes Bob's role (6); adminB revokes adminC
+  // from 6 (7), so the role change is suspect. R then revokes adminB from 7 (8): adminB's revocation becomes
+  // suspect, the role change applies again, and adminC stays retired anyway (round 8, item 3). Finally R
+  // revokes adminC from 6 (9): a retired key whose revocation became suspect may be revoked again, once.
+  const fold = base4();
+  add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminB", null), "recovery")); // 4
+  add(fold, build(fold, "admin.added", keyChange({ kind: "admin", id: CREATOR }, null, "adminC", null), "recovery")); // 5
+  add(fold, build(fold, "member.role.changed", { memberId: BOB, role: "steer", ver: 2 }, "adminC")); // 6
+  add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminC.kid, fromSeq: 6 }, "adminB")); // 7
+  assert.equal(fold.state.members[BOB].role, "watch");
+  expectFold(() => add(fold, build(fold, "producer.fence", {}, "adminC")), "unknown_producer");
+  // R revokes adminB from 7: adminB's revocation of adminC is suspect, so adminC's role change applies again,
+  // while adminC stays retired.
+  refoldCounters.passes = 0;
+  add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminB.kid, fromSeq: 7 }, "recovery")); // 8
+  const st = fold.state;
+  assert.deepEqual([st.marks[6], st.marks[7]], [undefined, "suspect"]);
+  assert.equal(st.members[BOB].role, "steer");
+  assert.deepEqual(
+    st.auth.revocations.map((r) => r.kid),
+    [KEYS.adminB.kid],
+  );
+  assert.ok(st.auth.adminKeyDenylist[KEYS.adminC.kid] && st.auth.adminKeyDenylist[KEYS.adminB.kid]);
+  assert.equal(refoldCounters.passes, 2, "the first pass drops adminB's revocation; the second confirms the set");
+  // R revokes adminC from 6 after all: the role change is suspect again and adminB's revocation, still suspect, stays out.
+  add(fold, build(fold, "admin.key.revoked", { kid: KEYS.adminC.kid, fromSeq: 6 }, "recovery")); // 9
+  assert.equal(fold.state.members[BOB].role, "watch");
+  assert.deepEqual([fold.state.marks[6], fold.state.marks[7]], ["suspect", "suspect"]);
 });

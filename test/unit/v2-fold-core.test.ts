@@ -136,7 +136,7 @@ test("statements: strict at every level; unknown types and bad field values are 
   const noDevices = clone(s.memberAdmitted);
   noDevices.body.data.member.devices = [];
   assert.equal(reason(noDevices), "bad_statement");
-  assert.equal(STATEMENT_TYPE_NAMES.length, 49);
+  assert.equal(STATEMENT_TYPE_NAMES.length, 50);
 });
 
 // ---- log.entries, log.rosterAfter ----

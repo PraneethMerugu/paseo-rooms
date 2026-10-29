@@ -23,7 +23,19 @@ import { bodyHash, EntryError, verifyChainedEntry, type LogEntry, type SignedEnt
 import { verifyGenesis } from "./genesis";
 import { byOrForDevice, cancelRequests, checkApproval, openRequest, resolveConflict, vetoRequest, YOUNG_DEVICE_MS } from "./holds";
 import { confirmClose, confirmFirstRecovery, proposeClose, proposeRecovery } from "./lineage";
-import { checkAdminRevocation, finishAdminRevocation, hostKeyAt, replay, revokeHostKey, type Imposed, type Rec, type Step } from "./refold";
+import {
+  checkAdminRevocation,
+  checkLastAdmin,
+  finishAdminRevocation,
+  hostKeyAt,
+  markRevoked,
+  MAX_REVOCATION_DEPTH,
+  refold,
+  revocationDepth,
+  revokeHostKey,
+  type Rec,
+  type Step,
+} from "./refold";
 import { buildRoster, membersFingerprint, rosterHash, sortDevices, type Roster } from "./roster";
 import type { DeviceEntry, RosterEntry } from "./schema";
 import { activeAdmins, edKid, FoldError, initState, keysInUse, versionKey, type Fail, type LaneState, type RoomState } from "./state";
@@ -53,6 +65,7 @@ export type {
   PendingRequest,
   RecoveryKeyState,
   RecoveryProposal,
+  RepairRequest,
   Revocation,
   RoomState,
   Set_,
@@ -60,6 +73,10 @@ export type {
 
 /** Hold for `lane.closed` by the host after `lane.degraded` (room-log-v2.md 4.4), in ms of `hts`. */
 export const LANE_DEGRADED_CLOSE_MS = 24 * 60 * 60 * 1000;
+/** `device.leaf.repair.requested` rate limits (room-log-v2.md 4.3; decision round 8, item 1), in ms of `hts`. */
+export const REPAIR_GROUP_INTERVAL_MS = 60 * 60 * 1000;
+export const REPAIR_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const REPAIR_MAX_PER_WINDOW = 8;
 
 /** Marked "(reserved)" in the catalogue: no defined effect yet. */
 const RESERVED = new Set<StatementType>(["node.certified", "seat.added", "seat.removed"]);
@@ -116,12 +133,14 @@ export class RoomLogFold {
   private readonly maxBase = new Map<string, number>();
   /** Accepted statement entries, for the re-fold (section 5.1). */
   private readonly records: Rec[] = [];
+  /** Every accepted `admin.key.revoked` entry with its nesting depth (section 5.1, step 8). */
+  private readonly revocationDepths: { seq: number; depth: number }[] = [];
   private readonly step: Step;
 
   private constructor(state: RoomState) {
     this.initial = state;
     this.st = structuredClone(state);
-    this.step = makeStep(this.initial, this.records);
+    this.step = makeStep(this.initial, this.records).live;
   }
 
   static fromGenesis(genesis: Uint8Array | unknown): RoomLogFold {
@@ -228,10 +247,18 @@ export class RoomLogFold {
       if (sb.base.seq < refSeq) throw new FoldError(seq, "base_before_ref", `base.seq ${sb.base.seq} precedes the ref at ${refSeq}`);
     }
 
+    // Nesting depth of a revocation, from positions only (section 5.1, step 8), before any re-fold.
+    let depth = 0;
+    if (sb.type === "admin.key.revoked") {
+      depth = revocationDepth(this.revocationDepths, (sb.data as StatementData<"admin.key.revoked">).fromSeq, seq);
+      if (depth > MAX_REVOCATION_DEPTH) throw new FoldError(seq, "revocation_too_deep", `nesting depth ${depth} exceeds ${MAX_REVOCATION_DEPTH}`);
+    }
+
     const rec: Rec = { entry, stmt: sb };
-    const next = this.step(this.st, rec, []);
+    const next = this.step(this.st, rec);
 
     if (!commit) return;
+    if (depth > 0) this.revocationDepths.push({ seq, depth });
     this.st = next;
     this.hashes.push(signed.hash);
     this.bodySeq.set(entry.bodyHash, seq);
@@ -257,37 +284,48 @@ export function foldLog(genesis: Uint8Array | unknown, entries: readonly FoldInp
 // ---- one statement: apply or re-fold, then the roster position ----
 
 /**
- * The step shared by the live fold and every replay: it resolves the producer in `s` (a key that a
- * suspect statement installed is gone in a replay, so its statements become void), applies the
- * statement to a copy of `s` and returns it, or throws FoldError.
+ * The step of the live fold and of every re-fold pass. It resolves the producer in `s` (a key that a
+ * suspect statement installed is gone in a pass, so its statements become void), applies the
+ * statement to a copy of `s` and returns it, or throws FoldError. Only the live step re-folds; inside
+ * a pass an earlier revocation is checked and marks its target, and never replays (section 5.1).
  */
-function makeStep(initial: RoomState, records: readonly Rec[]): Step {
-  const step: Step = (s: RoomState, rec: Rec, imposed: Imposed): RoomState => {
-    const { entry, stmt: sb } = rec;
-    const seq = entry.seq;
-    const fail: Fail = (reason, message) => {
-      throw new FoldError(seq, reason, message);
+function makeStep(initial: RoomState, records: readonly Rec[]): { live: Step; inPass: Step } {
+  const make = (live: boolean): Step => {
+    const step: Step = (s: RoomState, rec: Rec): RoomState => {
+      const { entry, stmt: sb } = rec;
+      const seq = entry.seq;
+      const fail: Fail = (reason, message) => {
+        throw new FoldError(seq, reason, message);
+      };
+      const producer = resolveProducer(s, sb, seq) ?? fail("unknown_producer", `no active ${sb.producer.kind} key with that kid`);
+      preApply(s, sb, seq, fail);
+      const before = membersFingerprint(s.members);
+      let next: RoomState;
+      if (sb.type === "admin.key.revoked") {
+        const d = sb.data as StatementData<"admin.key.revoked">;
+        checkAdminRevocation(s, d, producer, seq, fail);
+        if (live) {
+          const re = refold(initial, records, seq, s.auth.revocations, { kid: d.kid, fromSeq: d.fromSeq, seq }, inPass, fail);
+          // A re-fold that changes the roster makes the revocation the roster position (R-7).
+          re.rosterSeq = s.rosterSeq;
+          next = finishAdminRevocation(s, re, d, seq, producer.kind, fail);
+        } else {
+          next = structuredClone(s);
+          markRevoked(next, d, seq);
+          checkLastAdmin(next, producer.kind, fail);
+        }
+      } else {
+        next = structuredClone(s);
+        applyStatement(next, sb, entry, producer, fail);
+      }
+      if (membersFingerprint(next.members) !== before) next.rosterSeq = seq;
+      next.epoch = entry.epoch;
+      return next;
     };
-    const producer = resolveProducer(s, sb, seq) ?? fail("unknown_producer", `no active ${sb.producer.kind} key with that kid`);
-    preApply(s, sb, seq, fail);
-    const before = membersFingerprint(s.members);
-    let next: RoomState;
-    if (sb.type === "admin.key.revoked") {
-      const d = sb.data as StatementData<"admin.key.revoked">;
-      checkAdminRevocation(s, d, producer, seq, fail);
-      const re = replay(initial, records, seq, [...imposed, { kid: d.kid, fromSeq: d.fromSeq }], step);
-      // A re-fold that changes the roster makes the revocation the roster position (R-7).
-      re.rosterSeq = s.rosterSeq;
-      next = finishAdminRevocation(s, re, d, seq, fail);
-    } else {
-      next = structuredClone(s);
-      applyStatement(next, sb, entry, producer, fail);
-    }
-    if (membersFingerprint(next.members) !== before) next.rosterSeq = seq;
-    next.epoch = entry.epoch;
-    return next;
+    return step;
   };
-  return step;
+  const inPass = make(false);
+  return { live: make(true), inPass };
 }
 
 /** Rules that hold for every statement type. */
@@ -340,6 +378,10 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
   };
   const retireKey = (pub: string) => {
     s.auth.retiredKeys[pub] = true;
+  };
+  /** Open leaf repair requests end when the device leaves the roster or its keys change. */
+  const cancelRepairs = (match: (deviceId: string, memberId: string) => boolean) => {
+    for (const r of Object.values(s.repairs)) if (r.status === "open" && match(r.deviceId, r.memberId)) r.status = "cancelled";
   };
   /** A key the room certifies now: never retired, and not used for anything else. */
   const freshKey = (pub: string) => {
@@ -444,7 +486,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       cur.toSeq = seq;
       cur.validTo = d.oldValidTo;
       retireKey(cur.pub);
-      s.auth.hostKeys.push({ kid: edKid(pub), pub, fromSeq: seq + 1, toSeq: null, suspectFromSeq: null, validFrom: Math.floor(hts / 1000), validTo: null, revoked: false });
+      s.auth.hostKeys.push({ kid: edKid(pub), pub, fromSeq: seq + 1, toSeq: null, suspectFromSeq: null, validFrom: Math.floor(hts / 1000), validTo: null, revoked: false, uncertified: false });
       return;
     }
     case "host.key.revoked": {
@@ -509,6 +551,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       for (const dev of m.devices) retireDevice(dev);
       delete s.members[d.memberId];
       cancelRequests(s, (p) => p.memberId === d.memberId);
+      cancelRepairs((_, memberId) => memberId === d.memberId);
       return;
     }
     case "member.left": {
@@ -519,6 +562,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       for (const dev of m.devices) retireDevice(dev);
       delete s.members[d.memberId];
       cancelRequests(s, (p) => p.memberId === d.memberId);
+      cancelRepairs((_, memberId) => memberId === d.memberId);
       return;
     }
     case "member.device.replaced": {
@@ -532,6 +576,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       for (const dev of removed) {
         retireDevice(dev);
         cancelRequests(s, byOrForDevice(dev.deviceId));
+        cancelRepairs((deviceId) => deviceId === dev.deviceId);
       }
       m.devices = sortDevices([...kept, d.added]);
       s.used.devices[d.added.deviceId] = true;
@@ -624,8 +669,9 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       dev.dh = p.device.dh;
       s.auth.versions[versionKey.devices(d.memberId)] = seq;
       p.status = "approved";
-      // Requests signed by the old key are cancelled (section 4.3, R-8).
+      // Requests signed by the old key are cancelled (section 4.3, R-8); so are its repair requests.
       cancelRequests(s, (q) => q.requester === d.deviceId);
+      cancelRepairs((deviceId) => deviceId === d.deviceId);
       return;
     }
     case "device.removed": {
@@ -642,6 +688,31 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       s.auth.versions[versionKey.devices(d.memberId)] = seq;
       // Cancels the device's own pending rekey and every pending request it made (R-8).
       cancelRequests(s, byOrForDevice(d.deviceId));
+      cancelRepairs((deviceId) => deviceId === d.deviceId);
+      return;
+    }
+    case "device.leaf.repair.requested": {
+      // Decision round 8, item 1 (room-log-v2.md 4.3 and 5; mls-integration.md 4.3, 4.4).
+      const d = sb.data as StatementData<"device.leaf.repair.requested">;
+      if (producer.kind !== "device" || producer.memberId !== d.memberId || producer.deviceId !== d.deviceId) {
+        fail("not_permitted", "a device requests the repair of its own leaf only");
+      }
+      if (d.group.scope !== null && !(s.auth.scopes[d.group.scope] ?? []).includes(d.memberId)) fail("not_in_scope", "the member is not in that scope");
+      for (const [h, r] of Object.entries(s.repairs)) if (hts - r.hts >= REPAIR_WINDOW_MS) delete s.repairs[h];
+      const mine = Object.values(s.repairs).filter((r) => r.deviceId === d.deviceId);
+      const sameGroup = mine.filter((r) => r.scope === d.group.scope && r.generation === d.group.generation);
+      if (sameGroup.some((r) => hts - r.hts < REPAIR_GROUP_INTERVAL_MS)) fail("repair_too_soon", "one repair request per device and group per hour");
+      if (mine.length >= REPAIR_MAX_PER_WINDOW) fail("repair_rate", `at most ${REPAIR_MAX_PER_WINDOW} repair requests per device per 24 h`);
+      s.repairs[entry.bodyHash] = {
+        memberId: d.memberId,
+        deviceId: d.deviceId,
+        scope: d.group.scope,
+        generation: d.group.generation,
+        keyPackageRef: d.keyPackageRef,
+        seq,
+        hts,
+        status: "open",
+      };
       return;
     }
     case "scope.membership.changed": {
@@ -668,6 +739,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       freshKey(d.dh.pub);
       retireKey(s.auth.endpoint.dh.pub);
       s.auth.endpoint = { serverId: d.serverId, dh: d.dh, relay: d.relay };
+      s.auth.endpointUncertified = false;
       s.auth.versions[versionKey.endpoint()] = seq;
       return;
     }
@@ -676,7 +748,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       const d = sb.data as StatementData<"lane.created">;
       if (s.used.lanes[d.laneId]) fail("id_reused", "laneId was used before in this room");
       freshKey(d.offer.dh.pub);
-      s.auth.lanes[d.laneId] = { owner: d.owner, offer: d.offer, visibility: d.visibility, status: "open", degradedAtHts: null, showNames: false };
+      s.auth.lanes[d.laneId] = { owner: d.owner, offer: d.offer, visibility: d.visibility, status: "open", degradedAtHts: null, showNames: false, uncertified: false };
       s.used.lanes[d.laneId] = true;
       s.auth.versions[versionKey.laneNames(d.laneId)] = seq;
       s.auth.versions[versionKey.laneOffer(d.laneId)] = seq;
@@ -690,6 +762,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       freshKey(d.offer.dh.pub);
       retireKey(l.offer.dh.pub);
       l.offer = d.offer;
+      l.uncertified = false;
       s.auth.versions[versionKey.laneOffer(d.laneId)] = seq;
       return;
     }

@@ -79,7 +79,12 @@ export type FoldReason =
   | "conflict_open"
   | "requester_too_young"
   | "hold_not_elapsed"
-  | "no_conflict";
+  | "no_conflict"
+  // round 8: leaf repair requests and the revocation depth cap
+  | "not_in_scope"
+  | "repair_too_soon"
+  | "repair_rate"
+  | "revocation_too_deep";
 
 export class FoldError extends Error {
   constructor(
@@ -127,6 +132,12 @@ export type HostKeyState = {
   validTo: number | null;
   /** Once set, every grant signed by this key is refused, whatever its `iat`. */
   revoked: boolean;
+  /**
+   * Set by a re-fold when the statement that installed this key is suspect or void (decision round
+   * 8, item 3): the key keeps its positions for entries, but grants it signs are refused until a
+   * valid admin rotates it (room-log-v2.md section 5.1, "Retired keys after a re-fold").
+   */
+  uncertified: boolean;
 };
 export type LaneState = {
   owner: string;
@@ -135,9 +146,24 @@ export type LaneState = {
   status: "open" | "degraded" | "closed";
   degradedAtHts: number | null;
   showNames: boolean;
+  /** The offer was installed by a statement a re-fold made suspect or void (round 8, item 3). */
+  uncertified: boolean;
 };
 export type Set_ = Record<string, true>;
+/** An admin-key revocation in effect: the pair `(kid, fromSeq)` and the position `seq` of its entry. */
 export type Revocation = { kid: string; fromSeq: number; seq: number };
+/** A `device.leaf.repair.requested` (round 8, item 1), kept for 24 h of `hts` for the rate limits. */
+export type RepairRequest = {
+  memberId: string;
+  deviceId: string;
+  scope: string | null;
+  generation: number;
+  keyPackageRef: string;
+  seq: number;
+  hts: number;
+  /** Cancelled when the device leaves the roster or its keys change. Fulfilment is tracked by the MLS layer. */
+  status: "open" | "cancelled";
+};
 export type CloseProposal = { kid: string; seq: number; hts: number; exp: number; closeDelay: number; used: boolean };
 export type RecoveryProposal = { kid: string; seq: number; exp: number; change: string; used: boolean };
 
@@ -168,6 +194,8 @@ export type AuthorityState = {
   /** Public keys (b64u) of every key that was valid in the room and was rotated out, removed or revoked. */
   retiredKeys: Set_;
   endpoint: { serverId: string; dh: KeyRefValue; relay: { host: string; port: number; tls: true } };
+  /** The endpoint was installed by a statement a re-fold made suspect or void (round 8, item 3). */
+  endpointUncertified: boolean;
   lanes: Record<string, LaneState>;
   scopes: Record<string, string[]>;
   policy: Policy;
@@ -197,6 +225,8 @@ export type RoomState = {
   pending: Record<string, PendingRequest>;
   /** Open device conflicts: memberId -> seq of the veto that opened it. */
   conflicts: Record<string, number>;
+  /** Leaf repair requests of the last 24 h of `hts`, by bodyHash. */
+  repairs: Record<string, RepairRequest>;
   /** History marks after a re-fold: seq -> suspect (signed by a revoked key) or void (no longer applies). */
   marks: Record<string, "suspect" | "void">;
   rosterSeq: number;
@@ -226,10 +256,11 @@ export function initState(genesis: RoomGenesis, genesisHash: string, roomId: str
       // Genesis keys are their own lineage roots, with authority start 0 (section 5.1, 5.2).
       admins: g.admins.map((a) => ({ kid: a.kid, pub: a.pub, fromSeq: 0, toSeq: null, suspectFromSeq: null, root: a.kid, addedBy: null, since: 0, end: null })),
       recovery: g.recovery ? { kid: g.recovery.kid, pub: g.recovery.pub, fromSeq: 0, since: 0 } : null,
-      hostKeys: [{ kid: g.host.key.kid, pub: g.host.key.pub, fromSeq: 0, toSeq: null, suspectFromSeq: null, validFrom: g.host.notBefore, validTo: null, revoked: false }],
+      hostKeys: [{ kid: g.host.key.kid, pub: g.host.key.pub, fromSeq: 0, toSeq: null, suspectFromSeq: null, validFrom: g.host.notBefore, validTo: null, revoked: false, uncertified: false }],
       adminKeyDenylist: {},
       retiredKeys: {},
       endpoint: structuredClone(g.endpoint),
+      endpointUncertified: false,
       lanes: {},
       scopes: {},
       policy: structuredClone(g.policy),
@@ -245,6 +276,7 @@ export function initState(genesis: RoomGenesis, genesisHash: string, roomId: str
     deviceSince: {},
     pending: {},
     conflicts: {},
+    repairs: {},
     marks: {},
     rosterSeq: -1,
     epoch: null,
