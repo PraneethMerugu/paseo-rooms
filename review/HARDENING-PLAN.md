@@ -178,3 +178,9 @@ After Spike A (`spikes/security/RESULTS.md`):
 2. **Spec fixes from Spike A:** the device-continuity check runs after processing, not in the library callback; the `prevSig` exception applies only when joining (`joinGroup`); ts-mls ≥ 1.6.4.
 3. **Upstream:** ask ts-mls for credential change through the public `createCommit` (held with the other upstream requests until the user approves sending).
 4. **Next:** start implementation with I-1 and I-16 in parallel.
+
+## Decisions, round 7 (user approved, 2026-10-29)
+
+1. **`prevSig` removed entirely** (not limited to `joinGroup`), as the revised MLS spec has it.
+2. **Subgroups and pending adds:** options (b) and (c) of `mls-integration.md` section 4.4. Any scope device may commit an Add of a leaf the signed roster already contains (b), and roster equality tolerates pending adds that have no leaf yet (c, answers Q7). `kp.fetch` opens to scope devices, still under the per-device rate cap.
+3. **Test budget:** up to 20 small Claude Haiku calls for e2e runs on test daemons before asking again. Count tracked in `test/e2e/HAIKU-BUDGET.md`.
