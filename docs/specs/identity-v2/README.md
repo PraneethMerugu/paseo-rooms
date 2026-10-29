@@ -1,8 +1,8 @@
 # Identity v2 specifications (paseo-rooms)
 
 - **Date:** 2026-10-28
-- **Status:** proposed. Written from the M1 reviews and the user-approved decisions in `plugin/review/HARDENING-PLAN.md`, including "Decisions, round 2", "round 3", "round 4" and "round 5" (2026-10-29, section 7 below). **Not implemented.** Independently reviewed on 2026-10-29 (`plugin/review/identity-v2-review.md`, verdict "ready with fixes"), revised, re-reviewed (`plugin/review/identity-v2-rereview.md`, verdict "ready with small fixes") and revised again (section 10). Per round 4, item 4, the next step is a targeted check that each R finding is addressed and that the vectors regenerate, not another full review.
-- **Evidence labels:** statements about Paseo, the relay library and ts-mls cite the source files read. Statements about our design are specification, not results. The executed artifacts are the test-vector generator (`vectors/`), which runs and self-checks (including the cacophony NK and IK vectors), and the keyring spike (`spikes/keyring/RESULTS.md`).
+- **Status:** proposed. Written from the M1 reviews and the user-approved decisions in `plugin/review/HARDENING-PLAN.md`, including "Decisions, round 2", "round 3", "round 4", "round 5" and "round 6" (2026-10-29, section 7 below). **Not implemented.** Independently reviewed on 2026-10-29 (`plugin/review/identity-v2-review.md`, verdict "ready with fixes"), revised, re-reviewed (`plugin/review/identity-v2-rereview.md`, verdict "ready with small fixes") and revised again (section 10). Per round 4, item 4, the next step is a targeted check that each R finding is addressed and that the vectors regenerate, not another full review.
+- **Evidence labels:** statements about Paseo, the relay library and ts-mls cite the source files read. Statements about our design are specification, not results. The executed artifacts are the test-vector generator (`vectors/`), which runs and self-checks (including the cacophony NK and IK vectors), the keyring spike (`spikes/keyring/RESULTS.md`), and Spike A on ts-mls rekey behaviour (`spikes/security/RESULTS.md`, last section; `mls-integration.md` section 10, test 11).
 
 ## 1. What this covers
 
@@ -52,7 +52,9 @@ Suggested reading order: identity model, signatures and encoding, enrollment, gr
 | Grant **allowlist of the current gid** per (device, lane); one link per (device, lane); forced rotation at 75 % | grants 4, 5, 6 | P-9, P-12 |
 | **Enforce, then persist** with file and directory fsync; failures reported, never success | grants 7 | P-13 |
 | One log sequence for security events, commits and chat; **producer signatures** plus host-signed entries; heads gossiped inside MLS authenticated data | room log 1 to 6 | P-7 |
-| MLS **roster equality**: a commit must leave the leaf set equal to the admin-signed roster it names | MLS 4.2 | P-3 |
+| MLS **roster equality**: a commit must leave the leaf set, keyed by `(memberId, deviceId, deviceSig)`, equal to the admin-signed roster it names | MLS 4.2 | P-3 |
+| **Device rekey by the admin route**: the approving admin daemon removes the old leaf and adds the new KeyPackage in a commit sequenced next to the approval; public ts-mls APIs only | MLS 4.4; keys 4.1 | ts-mls 1.6.4 cannot send a credential change in an UpdatePath without a fork (Spike A); no rekey window, so no `prevSig` exception |
+| **KeyPackages** published by each device into two pools (current key, pending rekey key), fetched only by admin devices, single-use and deleted when served, with one last-resort package per pool and a per-device rate limit; the fetcher checks every package against the roster | MLS 6.4; enrollment 4, 5.1 | Every Add needs one, and a pending add blocks non-admin commits, so availability matters; the host is trusted for availability only |
 | One KEK behind a **KeyStore** abstraction (Keychain, Credential Manager, Secret Service; never kernel keyutils) seals every key file and MLS state; owner-only fallback file on every OS | identity 7.3, 7.5 | Decision 1, P-2, keyring spike |
 | **Owner-only files verified at startup on every OS** (POSIX modes, Windows DACL) and platform-aware durable writes | identity 7.8, 7.9; grants 7.3 | Cross-platform requirement (Linux, macOS, Windows, WSL, Docker) |
 | Room **policy** in genesis, changed only by signed `room.policy.changed`; org policy can fix stricter values | identity 5.2.1; room log 4.1, 4.6 | Decisions round 2 |
@@ -129,6 +131,7 @@ From the protocol review: a curious or malicious member, a revoked member, a hol
 5. Plugin API: a keyring API for plugins, ideally with per-plugin access control (identity Q3, Q4). This would also remove the native-packaging blocker.
 6. Plugin runtime: per-plugin permission scoping and a final, non-overridable hook phase (P-6).
 7. Plugin compiler and installer: document and support external native dependencies with platform `optionalDependencies` (identity Q3).
+8. ts-mls: allow a credential and signature-key change in an UpdatePath through the public `createCommit` (for example a new-leaf-credential option). Version 1.6.4 copies the old credential and signature key into every UpdatePath (`updatePath.js:37-40`; Spike A case a0). With it, a device could commit its own rekey without an admin online (MLS Q6). Held with the others (decisions round 6, item 3).
 
 None of these requests has been sent. Sending them needs the user's go-ahead.
 
@@ -177,6 +180,15 @@ Three spec follow-ups from the final revision pass were decided on 2026-10-29 ("
 | R5-2 | Revoke race in a room with no recovery key | Residual risk accepted and documented, not fixed: a thief who wins the revoke race can install a recovery key and close the room. Recovery keys are offered by default. | The mitigation is that recovery keys are offered by default at room creation. | room log 5.1, 5.2; keys 6.6; section 4.2 (A5) |
 | R5-3 | Rekeys requested by a person's only device | The 72 h hold of R4-2 also applies to automatic rekeys requested by a person's only active device. The org option covers both and is renamed `soleDeviceChange` (was `soleDeviceAdd`). | A thief holding a person's only device could otherwise rekey it after 24 h and denylist the keys the person still has. The person needs the same time to tell an admin, whose removal of the device cancels the pending rekey in the fold. | identity 5.2.1, 5.3, 6.3; keys 4.1; room log 4.3, 4.6, 5; vectors `deviceRekey` |
 
+After Spike A (`spikes/security/RESULTS.md`, section "Identity v2 Step 0, Spike A"), the user decided on 2026-10-29 ("Decisions, round 6"):
+
+| # | Question | Decision | Rationale | Applied in |
+|---|---|---|---|---|
+| R6-1 | How device rekeys reach MLS | Admin route: the admin daemon that signs `device.rekey.approved` removes the old leaf and adds the new KeyPackage in one commit, submitted with the approval and sequenced next to it. Public ts-mls APIs only; no fork of `createCommit`. | The public `createCommit` cannot put a new credential into an UpdatePath (Spike A case a0). A fork would couple the adapter to library internals across upgrades. An admin daemon already signs every approval. | MLS 1, 3, 4.3, 4.4, 6.1; keys 4.1, 4.2, 5; room log 2, 4.3; identity 4, 5.3 |
+| R6-2 | Spike A spec fixes | The continuity check runs after processing (sender's leaf before and after), not in the `IncomingMessageCallback`. The `prevSig` exception is removed, not just limited to `joinGroup`: with `deviceSig` in the roster-equality leaf identity and approval and application adjacent, no Welcome can be built over an unapplied rekey. ts-mls must be at least 1.6.4. | Observed: the callback never sees the UpdatePath leaf (case b); the round-4 "unchanged" rule let a stale UpdatePath through the `prevSig` exception (case a-stale); the removal check fails on 1.6.2 (case f). The decision allowed a `joinGroup`-only exception; the re-derivation in MLS 4.4 shows none is needed. | MLS 1, 4.1, 4.2, 4.4, 10 |
+| R6-3 | Upstream | Ask ts-mls for credential change through the public `createCommit`. Held with the other requests until the user approves sending. | Would allow a device to commit its own rekey later. | section 6, item 8 |
+| R6-4 | Next step | Start implementation with I-1 and I-16 in parallel. | | implementation plan |
+
 ## 8. Open questions
 
 Each document lists its own. These need the user or a test before implementation:
@@ -186,7 +198,7 @@ Each document lists its own. These need the user or a test before implementation
 3. **Org policy profiles** (identity Q7): format, distribution, and whether members can verify that a room was created under one.
 4. **License of `paseo-rooms`**: `plugin/package.json` declares none. Needed before vendoring Apache-2.0 code is released (enrollment 3.2.1).
 5. **SAS word format** (enrollment Q2) and **trust on first use** for low-stakes rooms (enrollment Q3, proposed: no).
-6. **ts-mls rekey behaviour** (MLS Q6, test 11): the expected behaviour comes from a static reading, not a run. The offline test `mls-rekey-updatepath-welcome` decides between the UpdatePath design and the admin fallback, and must run before the MLS adapter is written.
+6. **ts-mls rekey behaviour** (MLS Q6, test 11): resolved by Spike A and decision R6-1 (admin route). Open: a team subgroup with no admin device cannot apply a rekey or add a device, and then nobody in it can commit again (MLS 4.4, options (a) to (c)). Related: whether roster equality should tolerate pending adds (MLS Q7).
 
 ## 9. Verification still required before implementation
 
@@ -195,7 +207,7 @@ Each document lists its own. These need the user or a test before implementation
 | Noise IK against cacophony IK vectors | **done** 2026-10-29: generator engine and vendored Paseo + IK prototype match 6 of 6 messages (signatures 9.3). The production module must repeat it in its tests. |
 | Noise NK, Paseo relay 0.13.2 unchanged, against cacophony NK | **done** 2026-10-29, 6 of 6 messages |
 | RJCS against an RFC 8785 library in a second language | not done |
-| ts-mls 1.6.4: PrivateMessage commits and pre-decryption access to authenticated data | not checked (MLS Q2) |
+| ts-mls 1.6.4: PrivateMessage commits and pre-decryption access to authenticated data | **done** 2026-10-29, Spike A case (e): yes to both (MLS Q2) |
 | Paseo 0.13.2 connected-host link: a ping the destination side can send | not checked (grants Q2) |
 | Keyring access on Linux under Paseo's runtime | done (keyring spike) |
 | Native keyring packaging through Paseo's plugin compiler and installer | **not checked; blocker** (identity Q3) |
@@ -204,7 +216,7 @@ Each document lists its own. These need the user or a test before implementation
 | Narrow re-review of the revised sections and the new vectors | **done** 2026-10-29 (`plugin/review/identity-v2-rereview.md`); revisions in section 10 |
 | Targeted check of the R-1 to R-12 fixes (decisions round 4, item 4) | pending |
 | Vectors regenerated after the re-review revision, two runs byte-identical | **done** 2026-10-29 (signatures 9.1) |
-| ts-mls 1.6.4: credential change in an UpdatePath (device rekey), Welcome during a pending rekey, which leaves reach `validateCredential` | **not run**; static reading only (by the re-reviewer). Offline test `mls-rekey-updatepath-welcome` (MLS 10, test 11) must run first in implementation |
+| ts-mls 1.6.4: credential change in an UpdatePath (device rekey), Welcome during a pending rekey, which leaves reach `validateCredential` | **done** 2026-10-29, Spike A (MLS 10, test 11): receive side accepts and validates; public send API cannot; Welcome needs `prevSig` only if built over an unapplied rekey, which R6-1 prevents. The admin route itself (Remove plus Add, adjacent sequencing) is **not run**; MLS test 10 covers it |
 
 ## 10. Changes from review
 
@@ -222,7 +234,7 @@ The independent review (`plugin/review/identity-v2-review.md`, 2026-10-29) raise
 | S-8 | medium | Revocation cut-offs are log positions (`fromSeq`) with the suggested bounds; suspect statements have no effect, through a defined re-fold; recovery-key revocations take precedence. `room.closed` per decision R3-5: recovery key or a second admin, not reversible. **Differs:** `admin.reaffirmed` is removed; admins re-issue what they keep, because re-applying an old statement conflicts with the S-1 replay rules. | room log 4.1, 5.1; keys 3, 6.6, 6.8; identity 5.2 |
 | S-9 | medium | As suggested: role downgrades are access-reducing; the lane endpoint requires `claims.role` to equal the roster role. | grants 4, 7.1; room log 4.3 |
 | S-10 | medium | As suggested: a new session supersedes the old one only after key confirmation (first valid transport frame). | enrollment 3.5 |
-| S-11 | medium | First option of the suggestion: device rekey is an UpdatePath carrying a new credential, validated against the post-approval roster; an admin Remove plus Add is the fallback. Whether ts-mls 1.6.4 accepts a credential change in an UpdatePath is open (MLS Q6). | keys 4.1, 5; MLS 4.1, 4.3, 10, Q6 |
+| S-11 | medium | First option of the suggestion: device rekey is an UpdatePath carrying a new credential, validated against the post-approval roster; an admin Remove plus Add is the fallback. **Superseded** by decision R6-1 after Spike A: the admin route (Remove plus Add) is the only rekey path, because the public ts-mls API cannot send the UpdatePath. | keys 4.1, 5; MLS 4.1, 4.3, 4.4, 10, Q6 |
 | S-12 | medium | Second option: identity 5.3 now states that UI confirmation is a usability guard, not a boundary against same-user code; the README residual for A2 says so. A typed code would not help, because same-user code can read it through the same RPCs. | identity 5.3; README 4.2 |
 | S-13 | medium | As suggested: new identity section 6.4 with `DeviceLinkPayload`, `LinkRecord`, frames for device A (`link.request`, `link.nonce`, `link.reveal`, `link.confirm`), host states (including `held`), and `device.added` contents; `KeyChange.old` is nullable in three listed cases; `prl2.`, `device.added` and `device.add.approved` vectors. **Addition:** the confirming device A, not the host, chooses the confirmer nonce. Without this a malicious host could choose its own device's values to match the SAS and get A to sign its keys. | identity 6.4; keys 2; enrollment 5.2, 7.2, 7.3 |
 | S-14 | low | As suggested: `Roster.seq` is the last roster-changing entry; AAD and witnesses use it; vector `log.rosterAfter` and `mls.authenticatedData` show a non-roster entry in between. | identity 6.1; room log 5; MLS 4.2, 5 |
@@ -246,7 +258,7 @@ The narrow re-review (`plugin/review/identity-v2-rereview.md`, 2026-10-29) found
 | R-2 | high | As suggested: device A sends at most 1 `Nc` per pending, keeps at most 1 open pending, and sends at most 3 `Nc` per link, then burns it locally; counters and pinned inputs are sealed before `link.nonce`; changed inputs for a known `pendingId` abort; new frames `link.abort` and `link.closed`; required test. | identity 6.4; enrollment 4, 5.4 |
 | R-3 | high | Per decision R4-1. **Differs** from suggestion (a): independence is a different lineage root, because "not descended from the proposer" still lets one stolen key close with two keys it added; the first recovery key needs two independent admins when the room has two or more lineages (decision says "more than one admin"; reason in R4-1). (b) and (c) as suggested; (d) adopted as default-on `closeDelay` of 24 h. README R3-5 and keys 6.8 corrected: a single admin can close by first adding a recovery key. Vectors: `log.closure`, `log.refold.rejectRevocationBeforeStart`. | room log 4.1, 5.1, 5.2; keys 4.3, 4.4, 6.6, 6.8; identity 5.2, 5.2.1, 5.4 |
 | R-4 | medium | Both suggested options: the member records every session's `h` (`sentH`) before sending `enroll.request`, and `enroll.pending` carries the pinned `h`; the member accepts only an `h` it recorded. Test added. | enrollment 5.2, 5.6, 7.3 |
-| R-5 | medium | First suggestion, with the second as fallback: the reference roster keeps `prevSig` from rekey approval, and rule 6 accepts it for unchanged leaves (all Welcome leaves but the joiner's); the adapter decides "unchanged" by byte comparison, so the rule holds whatever ts-mls does; the 4.1 sentence on commit signers is corrected; continuity and role checks read the sender's leaf in the callback. **Not verified:** the expected ts-mls behaviour is from the re-reviewer's static reading; offline test `mls-rekey-updatepath-welcome` must run first, with stated fallbacks. | MLS 4.1, 4.3, 10, Q6; keys 4.1 |
+| R-5 | medium | First suggestion, with the second as fallback: the reference roster keeps `prevSig` from rekey approval, and rule 6 accepts it for unchanged leaves (all Welcome leaves but the joiner's); the adapter decides "unchanged" by byte comparison, so the rule holds whatever ts-mls does; the 4.1 sentence on commit signers is corrected; continuity and role checks read the sender's leaf in the callback. **Not verified:** the expected ts-mls behaviour is from the re-reviewer's static reading; offline test `mls-rekey-updatepath-welcome` must run first, with stated fallbacks. **Superseded** by decision R6-2: Spike A observed the expected receive-side behaviour, but also that the "unchanged" rule let a stale UpdatePath through `prevSig` and that the callback never sees the UpdatePath leaf. Under the admin route no Welcome is built over an unapplied rekey, so `prevSig` is removed and continuity is checked after processing. | MLS 4.1, 4.2, 4.3, 4.4, 10, Q6; keys 4.1 |
 | R-6 | medium | As suggested: ownership check before every append, atomic takeover by rename, 30 s wait, lock removed on clean shutdown; residual window stated. | grants 7.3 |
 | R-7 | low | As suggested: a revocation whose re-fold changes the roster sets `rosterSeq = r`. Vector `log.refold`. | room log 5, 5.1 |
 | R-8 | low | As suggested: removing or rekeying a requesting device, or removing the member, cancels its pending requests in the fold; a device cannot remove itself when it is the last one (it signs `member.left`); an admin may, leaving a member with 0 devices (documented 0..8), restored by `member.device.replaced` or removed. Vectors in `deviceLink.chain.cases`. | room log 4.3, 5; identity 6.1, 6.2, 6.3; keys 6.1, 6.3 |
@@ -263,6 +275,6 @@ Partial S findings from the re-review:
 | S-1 | No freshness bound for a signed, unsequenced statement; ABA on `prev*` values | R-1, R-9 |
 | S-3 | Restart in state `keys` left the member without the pinned `h` | R-4 |
 | S-8 | Unbounded R `fromSeq`; single-key closure bypass; roster position after a re-fold | R-3, R-7 |
-| S-11 | Welcome fails while a rekey is approved but not committed; ts-mls behaviour unverified | R-5 (design and fallback; verification is test 11, not yet run) |
+| S-11 | Welcome fails while a rekey is approved but not committed; ts-mls behaviour unverified | R-5, then R6-1 and R6-2 (test 11 run as Spike A; admin route makes approval and application adjacent) |
 | S-13 | Attempt limits counted only by the host | R-2 |
 | S-20 | Heartbeat lock without ownership check or atomic takeover; pruning may never happen | R-6, R-11 |

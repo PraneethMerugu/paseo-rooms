@@ -1,6 +1,6 @@
 # Identity model (identity v2)
 
-- **Status:** proposed specification, not implemented. Independently reviewed on 2026-10-29 (`review/identity-v2-review.md`), revised, re-reviewed (`review/identity-v2-rereview.md`) and revised again under decisions round 4 (`README.md` section 10). Decision round 5, item 3 extends the 72 h sole-device hold to rekeys (section 6.3). A targeted check of the R findings follows before code (decisions round 4, item 4).
+- **Status:** proposed specification, not implemented. Independently reviewed on 2026-10-29 (`review/identity-v2-review.md`), revised, re-reviewed (`review/identity-v2-rereview.md`) and revised again under decisions round 4 (`README.md` section 10). Decision round 5, item 3 extends the 72 h sole-device hold to rekeys (section 6.3). Decision round 6: the admin daemon that approves a device rekey also applies it in MLS (section 5.3; `mls-integration.md` section 4.4). A targeted check of the R findings follows before code (decisions round 4, item 4).
 - **Resolves:** A2 (P-3, P-29), A3 (P-4, P-14), A6 in part (P-22), A8 (P-2, M-6).
 - **Depends on:** `signatures-and-encoding.md` for every byte format named here.
 
@@ -46,7 +46,7 @@ All signing keys are Ed25519. All Diffie-Hellman keys are X25519. Every key that
 |---|---|---|---|---|---|---|
 | Device signing key | Ed25519 | device × room | device | signs enroll requests, the device's own statements, MLS identity bindings | admin, in the roster entry | `keys-rotation-recovery.md` 4.1 |
 | Device DH key | X25519 | device × room | device | Noise IK initiator static on the room endpoint | admin, in the roster entry (and proven in the IK handshake) | 4.1 |
-| MLS leaf signature key | Ed25519 | device × room | device | MLS leaf `signature_key` | device signing key (`mls-identity` binding) | MLS Update, 4.2 |
+| MLS leaf signature key | Ed25519 | device × room | device | MLS leaf `signature_key` | device signing key (`mls-identity` binding) | replaced with the leaf at each device rekey, 4.2 (no in-place rotation: ts-mls 1.6.4's public API cannot change it, Spike A) |
 | Admin key | Ed25519 | admin × room | an admin's device | signs genesis, admin statements | genesis, then admin key-change statements | 4.3 |
 | Recovery key (optional, offered by default) | Ed25519 | room | offline, chosen by the creator; escrowed copy if org policy requires (section 5.4) | may add, revoke or rotate admin keys, rotate itself, and close the room | genesis | 4.4 |
 | Host key | Ed25519 | room | host | signs log entries, lane grants and automatic statements | admin (`host.certified`) | 4.5 |
@@ -174,7 +174,7 @@ An admin changes policy with `room.policy.changed` (`room-log-v2.md` section 4.1
 In the embedded deployment the admin key sits on the owner's daemon, and the daemon signs on the owner's behalf. To address P-29 the plugin applies these rules:
 
 - **Interactive admin actions** (create invite, admit after SAS, remove member or device, change role or lane access, add or remove an admin, rotate host or endpoint keys, propose or confirm room closure, propose or confirm a first recovery key) require a confirmation in the Rooms UI. The RPC that performs them takes a one-time `confirmToken`, which a second RPC returns together with a description of what will be signed.
-- **Policy-automatic admin actions** (approve a device add or a device rekey after its hold, 24 h or, when the request comes from a member's only active device, 72 h; section 6.3) are signed without a prompt. The owner sees a notification and every member sees a notice in the room.
+- **Policy-automatic admin actions** (approve a device add or a device rekey after its hold, 24 h or, when the request comes from a member's only active device, 72 h; section 6.3) are signed without a prompt. The owner sees a notification and every member sees a notice in the room. For a device rekey the same daemon also builds the MLS commit that replaces the device's leaf and submits it with the approval (`mls-integration.md` section 4.4); it does not sign the approval when it cannot build that commit.
 
 **This is a usability guard, not a security boundary** (review finding S-12). It prevents accidental signing, and it makes an agent that calls `rooms.*` RPCs by mistake stop at a step a human normally takes. It does not stop deliberate same-user code: the CLI, an agent with a shell or another plugin can call the `confirmToken` RPC as easily as the UI does, and the daemon cannot tell those callers apart. A code shown in the app and typed back by the user does not help either, because the same code can read it through the same RPCs. Same-user code is out of scope by decision 1 (section 7.4). P-29 is therefore closed only to the extent of separating the admin key from the host key; protection against same-user callers needs the dedicated OS user (section 7.6) or an upstream per-caller confirmation primitive, which Paseo 0.13.2 does not offer as far as we know.
 

@@ -205,7 +205,8 @@ Who may call what depends on whether the initiator's static key (`rs` after the 
 | `grant.issue`, `grant.status`, `grant.report` | active device with lane access | `grants-v2.md` sections 3, 6 |
 | `device.link.create`, `link.nonce`, `link.confirm`, `link.abort` | active device (the link's creator for the last three) | `identity-model.md` 6.4. The host pushes `link.request` and `link.closed` to the creator |
 | `device.rekey` | active device | `keys-rotation-recovery.md` 4.1 |
-| `kp.publish`, `commit.submit`, `welcome.fetch`, `msg.send`, `msg.fetch` | active device | `mls-integration.md` section 6 |
+| `kp.publish`, `commit.submit`, `welcome.fetch`, `msg.send`, `msg.fetch` | active device (`kp.publish` for its own packages only) | `mls-integration.md` section 6 |
+| `kp.fetch` | admin device; `maintain` device for gateway targets only | `mls-integration.md` section 6.4. The host pushes `kp.low` to a device whose KeyPackages run low |
 
 A device whose `rs` is known but no longer active (removed, member left, room closed) may only receive `{t:"error", code:"access_ended", reason}` with `reason ∈ {removed, left, room_closed}`. This is disclosed only after the handshake proves possession of that device's DH key, so it is not an oracle for anyone else (P-23).
 
@@ -245,6 +246,8 @@ Member device (M)                         Host room endpoint (H)                
   ◀─ enroll.admitted {entry, statement, roster, head}
   verify; journal "admitted"; register lane hosts (section 8)
 ```
+
+After `enroll.admitted` the device is active. Before anything else on that session it publishes its MLS KeyPackages (`kp.publish`, `mls-integration.md` section 6.4), so that an admin daemon can fetch one and commit its Add. Until that Add, the device is a pending add in the room group (`mls-integration.md` section 4.2).
 
 The host waits for **both** confirmations. The admin may admit before the member confirms; the host then holds `enroll.admitted` until `enroll.confirm` arrives. Either side pressing "Codes do not match" ends the enrollment (section 7.2).
 

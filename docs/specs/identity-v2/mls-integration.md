@@ -3,14 +3,15 @@
 - **Status:** proposed specification, not implemented. Applies from Milestone 2 (room chat), but its formats are fixed now (P-3, P-7 and P-14 are M2 blockers).
 - **Resolves:** A2 on the MLS side (P-3, P-29), the MLS parts of A3, A5 and A7, and the spike findings (custom authentication service, state holds private keys, removal advisory).
 - **Inputs:** `spikes/security/RESULTS.md` Spike A; ts-mls 1.6.4 type definitions (`authenticationService.d.ts`, `clientConfig.d.ts`, `incomingMessageAction.d.ts`, `createCommit.d.ts`).
-- **Revised** 2026-10-29 after the independent review (`README.md` section 10): commits must name the current roster, device rekey by UpdatePath, roster position defined as the last roster-changing entry. Revised again after the re-review (decisions round 4): the rekey window (`prevSig`, R-5), which credentials ts-mls is expected to pass to the authentication service, and the offline test that must confirm it first (section 10, test 11).
+- **Revised** 2026-10-29 after the independent review (`README.md` section 10): commits must name the current roster, device rekey by UpdatePath, roster position defined as the last roster-changing entry. Revised again after the re-review (decisions round 4): the rekey window (`prevSig`, R-5), which credentials ts-mls is expected to pass to the authentication service, and the offline test that must confirm it first (section 10, test 11). Revised again after Spike A (decisions round 6, 2026-10-29): device rekeys use the admin route (section 4.4), the leaf identity used by roster equality includes `deviceSig`, the continuity check runs after processing, the `prevSig` exception is removed, and ts-mls must be at least 1.6.4. Follow-up the same day: KeyPackage publication, fetch, consumption and last-resort rules (section 6.4), pending adds (section 4.2), a commit carries every pending change, repair of a pending rekey (section 4.4), and a leaf replacement row (section 4.3).
 
 ## 1. Library and version policy
 
 | Rule | Detail |
 |---|---|
-| Library | `ts-mls`, pinned to **exactly `1.6.4`** in `package.json` (no range) and by lockfile integrity hash |
-| Explicit dependencies | `@noble/hashes` and `@noble/ciphers` at exact versions (ts-mls imports them without declaring them; spike surprise 3) |
+| Library | `ts-mls`, pinned to **exactly `1.6.4`** in `package.json` (no range) and by lockfile integrity hash. **Floor: 1.6.4.** No version below it is acceptable, because the removal check fails on 1.6.2 (observed in Spike A case (f) and in the earlier spike). |
+| Public API only | The adapter uses only the public ts-mls API. It does not fork `createCommit` or import library internals through the `./*.js` subpath exports. This is why device rekeys use the admin route (section 4.4; decisions round 6, item 1). |
+| Explicit dependencies | `@noble/hashes` and `@noble/ciphers` at exact versions (ts-mls imports them without declaring them; spike surprise 3). Spike A case (g) observed identical results with the plugin's `@noble/*` 2.4.0. Inferred, not tried: ts-mls's exact `@noble/ciphers` 2.1.1 peer will need an npm `overrides` entry. |
 | Suite | `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (suite 1) only. Groups with any other suite are refused. |
 | Config import | `defaultClientConfig` from `ts-mls/clientConfig.js`, then override `authService` and `keyRetentionConfig` (section 8.3). Never spread an `undefined` config. |
 | Adapter | All ts-mls calls go through `server/mls/adapter.ts` (create, keyPackage, commit, processMessage, encrypt, decrypt, encodeState, decodeState). Nothing else imports ts-mls. This keeps the 2.0 migration local. |
@@ -74,7 +75,8 @@ MlsIdentity = {
 identity = RJCS({ id: MlsIdentity, sig: b64u(Sign(deviceSigningKey, "mls-identity", RJCS(MlsIdentity))) })
 ```
 
-- The MLS leaf signature key is **separate** from the device signing key, so the device can rotate it with MLS Updates without an admin statement (`keys-rotation-recovery.md` section 4.2).
+- The MLS leaf signature key is **separate** from the device signing key. It is replaced together with the leaf at a device rekey (section 4.4). The public ts-mls API cannot change a leaf's credential or signature key in an UpdatePath (Spike A case a0, observed), so the device does not rotate it on its own (`keys-rotation-recovery.md` section 4.2).
+- **A leaf's credential never changes in place.** A leaf keeps its credential, byte for byte, from the commit that adds it to the commit that removes it. Only its HPKE key changes, through UpdatePaths.
 - The device signing key vouches for the MLS key; the admin-signed roster vouches for the device signing key. That chain is the whole authentication path.
 - Vector: `vectors/vectors.json` → `mls`.
 
@@ -82,7 +84,13 @@ identity = RJCS({ id: MlsIdentity, sig: b64u(Sign(deviceSigningKey, "mls-identit
 
 ### 4.1 Credential validation
 
-**Expected calls (not verified).** By the re-review's static reading of the ts-mls 1.6.4 source (nothing executed): the library calls `authService.validateCredential(credential, signaturePublicKey)` for leaves that a commit adds or changes, including the new leaf of an UpdatePath (`processMessages.js:136`); for the GroupInfo signer and for **every** leaf of the tree when it processes a Welcome (`clientState.js:263-265`, `:578`). It does **not** validate the sender of an incoming commit again, and it does not compare an UpdatePath's new leaf with the old one. The first revision said ts-mls validates "commit signers"; that was wrong for incoming commits. The sender's role and continuity checks therefore live in our `IncomingMessageCallback` (section 4.3), which reads the sender's leaf. Test 11 (section 10) must confirm all of this before the adapter is written.
+**Observed calls** (Spike A cases (a), (c) and (d), ts-mls 1.6.4, section 10 test 11). ts-mls calls `authService.validateCredential(credential, signaturePublicKey)`:
+
+- while processing a commit: for the committer's UpdatePath leaf (`processMessages.js:136`) and for the leaf of each added KeyPackage, and for no other leaf;
+- while creating an Add commit: for each added KeyPackage;
+- while processing a Welcome: for the GroupInfo signer (`clientState.js:578`), then for every leaf of the tree (`validateRatchetTree`, `clientState.js:264`), stopping at the first refusal.
+
+It does not compare an UpdatePath's new leaf with the old one, and it does not validate the sender of an incoming commit again. The `IncomingMessageCallback` receives only `{kind, proposals, senderLeafIndex}` and never sees the UpdatePath leaf (case (b)). Role checks therefore read the sender's leaf from the current tree by `senderLeafIndex`, and the continuity check runs after processing (section 4.2 step 4).
 
 Our implementation is a closure over the room's verified state. It returns `true` only if **all** of these hold:
 
@@ -91,13 +99,15 @@ Our implementation is a closure over the room's verified state. It returns `true
 3. `roomId` equals this room's.
 4. `mlsSig` equals `signaturePublicKey` byte for byte.
 5. The `sig` verifies with `deviceSig` under context `mls-identity`.
-6. In the **reference roster** (section 4.2), `memberId` has an active device `deviceId` whose stored signing key equals `deviceSig` byte for byte. After a device rekey this is the new key, so the device's UpdatePath credential validates. **Rekey window** (re-review finding R-5): for a leaf that the message does not add or change, `deviceSig` may instead equal the device's `prevSig`, the signing key that the device's latest `device.rekey.approved` replaced. An added or changed leaf must carry the roster key. So a Welcome sent while a rekeyed device has not yet committed its UpdatePath still validates, and a new leaf can never use an old key (`keys-rotation-recovery.md` section 4.1 step 8).
+6. In the **reference roster** (section 4.2), `memberId` has an active device `deviceId` whose stored signing key equals `deviceSig` byte for byte. There is no exception for a previous key: the `prevSig` rekey window of the round-4 revision is removed (section 4.4 explains why it is no longer needed).
 7. For a subgroup: `memberId` is in the scope roster.
-8. For an added or changed leaf, `deviceSig` is not in the device denylist. The rekey-window exception of rule 6 is the only case in which a denylisted key is accepted, and only for an unchanged leaf.
+8. `deviceSig` is not in the device denylist as of the reference roster position. Rule 6 already implies this; the check stays as a second guard.
 
-**Which leaves are unchanged.** The callback receives no leaf position, so the adapter decides before each call. While processing a Welcome (`joinGroup`), every leaf other than the joiner's own is unchanged. While processing a commit, a credential is unchanged if it is byte-identical to the credential of the leaf with the same `(memberId, deviceId)` in the current tree; any other credential is added or changed. This rule gives the right answer whether or not ts-mls also passes unchanged leaves to `validateCredential` during commits, which test 11 records.
+The same rules apply to every credential the library passes, during commit processing, commit creation and Welcome processing alike. The adapter no longer classifies leaves as "unchanged". Spike A case a-stale showed why that rule was unsafe: a post-approval UpdatePath that kept the old `deviceSig` was byte-identical to the current leaf, was classed as unchanged, and was accepted through the `prevSig` exception.
 
-The callback has no other inputs, so the adapter sets the reference roster on the closure **before** each `processMessage`, `joinGroup` or `createCommit` call, and clears it after. A missing reference roster makes the closure return `false` (fail closed).
+**Reference roster for a Welcome.** `welcome.fetch` returns the log entry of the Add commit that produced the Welcome. The joiner reads the commit's authenticated data without group state (Spike A case (e), observed), verifies its log up to that entry as in section 4.2 step 2, and uses the roster named there as the reference roster for `joinGroup`. A Welcome processed late is therefore judged against the roster its commit named, not against the joiner's current roster.
+
+The authentication service has no other inputs, so the adapter sets the reference roster on the closure **before** each `processMessage`, `joinGroup` or `createCommit` call, and clears it after. A missing reference roster makes the closure return `false` (fail closed).
 
 The closure is attached on every state load. ts-mls does not serialize `clientConfig`; a decoded state without it silently uses the accept-all default (spike surprise 3). The adapter's `decodeState` therefore takes the room context as a required argument and has no code path that returns a state without our config. A unit test loads a state and processes a commit that adds a forged credential; it must be rejected.
 
@@ -113,28 +123,85 @@ Before processing a commit, the member:
 
 1. decodes the outer `MLSMessage` without processing it, reads `authenticated_data`, and parses it strictly;
 2. makes sure its own verified log reaches the commit's entry `c`, that `roster.seq` is the last roster-changing entry before `c`, and that the hash of that roster equals `roster.hash`; if its log is behind, it fetches and verifies up to `c` first; if the host cannot provide it within 30 s, the commit is parked and a `withholding` alert is raised (`room-log-v2.md` section 6.5);
-3. sets that roster as the reference roster and processes the commit with an `IncomingMessageCallback` that computes the resulting leaf set (current leaves minus Removes plus Adds, by `(memberId, deviceId)` from the credentials) and returns `"reject"` unless it **equals** the set of active devices in the reference roster (scope roster for subgroups);
-4. after processing, recomputes the leaf set from the new state and checks equality again. On mismatch it discards the new state (the old sealed state is still on disk) and raises `roster_mismatch`.
+3. sets that roster as the reference roster and processes the commit with an `IncomingMessageCallback` that checks the committer's role (section 4.3, sender read from the current tree by `senderLeafIndex`), computes the resulting leaf set (current leaves minus Removes plus Adds, from the credentials) and returns `"reject"` unless it **equals** the set of active devices in the reference roster (scope roster for subgroups);
+4. after processing, checks the new state and discards it (the old sealed state is still on disk) and raises `roster_mismatch` on any failure:
+   - **roster equality again:** the leaf set recomputed from the new state equals the reference roster's active devices;
+   - **continuity:** if the commit has a path, the sender's leaf credential in the new state is byte-identical to its credential before processing (sender index from the callback). This catches a changed `memberId`, `deviceId`, `deviceSig` or `mlsSig` in an UpdatePath, which neither the callback nor the library checks. Spike A case (b) observed that, with an accept-all authentication service, ts-mls accepts a changed `deviceId` and only this comparison detects it.
+
+Because the result must equal the reference roster, **a commit carries every pending change** of its group at once: every pending removal, pending add and pending rekey (below), not only the change its author set out to make. A committer runs the checks of steps 3 and 4 on its own result before it submits, so a commit that members would reject is never sent.
+
+**Leaf identity** for equality is the triple `(memberId, deviceId, deviceSig)` from the leaf's credential, compared with `(memberId, deviceId, signing key)` of each active roster device. Including `deviceSig` makes an approved device rekey a pending change, like a pending removal: the first commit that names the post-approval roster must replace the device's leaf (section 4.4).
 
 Consequences:
 
 - A host, a holder of the host key, or a malicious member cannot add a ghost device: no admin-signed statement admits it, so no roster contains it, so every honest member rejects the commit (P-3).
 - A device removed in the roster but still in the group is a **pending removal**, not a mismatch, as long as no commit has been made since the roster change. The first commit after a removal must include the Remove, because it must name the newer roster. Members do not send application messages to a group with a pending removal older than 60 s (section 6.3). Devices that leave the roster because a revocation made their admission suspect (`room-log-v2.md` section 5.1) become pending removals the same way.
 - An Update or an empty commit references the current roster and must leave the leaf set equal to it.
+- A device whose rekey is approved but whose leaf still carries the old `deviceSig` is a **pending rekey**. Only an admin device can resolve it, because it needs an Add (section 4.3). The admin route makes this state transient in the room group (section 4.4).
+- A device that is active in the roster but has no leaf yet (just admitted, linked, or added by `member.device.replaced`) is a **pending add**. Only an admin device can resolve it, and only with one of the device's KeyPackages (section 6.4).
+- **Liveness cost.** While a pending add or pending rekey exists in a group, every commit must resolve it, so a device that is not an admin cannot commit there at all, not even a Remove or a periodic UpdatePath. If a removal is also pending, members stop sending after 60 s (section 6.3). Section 6.4 keeps this short (KeyPackages published as soon as a device is active, a last-resort KeyPackage, admins told when a pending add has none), and section 4.4 adds a repair rule. Whether to relax equality for pending adds is an open decision (section 11, Q7).
 
 ### 4.3 Who may commit what
 
 | Commit content | Allowed committer | Extra check |
 |---|---|---|
 | Add | a device whose member has role `admin` (or `maintain` for seated gateways) in the reference roster | every added leaf validates under 4.1 |
-| Remove | any member device | the removed leaf is absent from the reference roster |
-| Update / UpdatePath only | any member device | `memberId` and `deviceId` unchanged in the committer's new credential; `deviceSig` either unchanged or equal to the key the reference roster now names for that device (device rekey) |
-| Device rekey fallback (Remove old leaf + Add new leaf of the same `deviceId`) | an admin device | the reference roster names the new keys; used only when the device cannot commit its own UpdatePath (`keys-rotation-recovery.md` 4.1) |
+| Remove | any member device | the removed leaf's `(memberId, deviceId, deviceSig)` is absent from the reference roster |
+| Update / UpdatePath only | any member device | the committer's leaf credential is byte-identical before and after (continuity, section 4.2 step 4); only its HPKE key changes |
+| Device rekey (Remove of the old leaf + Add of a KeyPackage with the new credential, same `memberId` and `deviceId`) | an admin device | the reference roster is the current roster, as for every commit, and in it the device's signing key is the new one; the added leaf carries that `deviceSig`. In the room group the first such commit is the entry right after `device.rekey.approved`; in subgroups, and after a host split, it is a later ordinary commit (section 4.4) |
+| Leaf replacement (Remove of a leaf + Add of a fresh KeyPackage with the same `(memberId, deviceId, deviceSig)`) | an admin device | the replaced leaf is in the reference roster; used when a device cannot use the Welcome for its leaf, for example after a replayed KeyPackage (section 6.4) |
 | GroupContextExtensions | admin device | new `paseo_room_authority` matches the authority state at `seq` |
 | ReInit | admin device | only after `admin.key.revoked` (`keys-rotation-recovery.md` section 6.6) |
 | External commit, external proposals, PSK proposals | nobody | rejected |
 
-The `IncomingMessageCallback` of 4.2 enforces this using the sender's leaf credential, read from the current tree for the commit's sender, and the sender's role in the reference roster. It cannot rely on `validateCredential` for the sender, because ts-mls is expected not to call it for the sender of an incoming commit (section 4.1). For an UpdatePath it also checks that the new leaf keeps the sender's `memberId` and `deviceId`; the library does not (section 4.1). After a `device.rekey.approved` for the sender, a changed leaf must carry the new key; an UpdatePath that keeps the old `deviceSig` is rejected.
+The `IncomingMessageCallback` of 4.2 enforces the committer column using the sender's leaf credential, read from the current tree by `senderLeafIndex`, and the sender's role in the reference roster. It cannot rely on `validateCredential` for the sender, because ts-mls does not call it for the sender of an incoming commit (section 4.1, observed). It cannot see an UpdatePath leaf, so the UpdatePath row is enforced by the continuity check after processing (section 4.2 step 4).
+
+### 4.4 Device rekey: the admin route
+
+Decided in round 6 (2026-10-29) after Spike A. The device does not commit its own rekey. The admin daemon that signs `device.rekey.approved` also applies it in MLS, in the same submission.
+
+**Why.** Spike A observed that receivers accept and validate an UpdatePath that carries a new credential, but the public `createCommit` always copies the old credential and signature key into the UpdatePath (case a0). The device could send one only through an adapter-owned fork of `createCommit` that imports library internals. Round 6 rejected the fork. Remove plus Add uses only public APIs.
+
+**Inputs.** When the device requests the rekey (`keys-rotation-recovery.md` section 4.1 step 2), it publishes KeyPackages that carry its new `MlsIdentity` (new `deviceSig`, new `mlsSig`) with `kp.publish {for: "rekey"}`: one per group it is a leaf of, plus one spare, and a last-resort KeyPackage (section 6.4). KeyPackages are single-use (spike A.2).
+
+**Ordering.** When the hold has passed (automatic approval) or an admin approves interactively, the admin daemon:
+
+1. fetches with `kp.fetch` (section 6.4) one of the device's new-credential KeyPackages (`for: "rekey"`) for each group the device is a leaf of, and one `for: "current"` KeyPackage for every other pending add in the room group (section 4.2); it stops if one is missing (see below);
+2. signs `device.rekey.approved` with `base` at the current head `h`, and expects it to be sequenced at `s = h.seq + 1`;
+3. computes the roster that the fold produces at `s` (new keys, old keys denylisted) and its `rosterHash`;
+4. builds the room-group commit with the public `createCommit`: Remove of the device's old leaf and Add of its new KeyPackage, plus every other pending change of the room group (section 4.2), authenticated data naming roster `{seq: s, hash}`, with that roster set as the reference roster, so the committer's own validation of the added KeyPackages uses the new keys. It checks its own result against roster `s` as in section 4.2 before it submits;
+5. sends both in one `commit.submit {…, statement}` (section 6.1). The host sequences the statement at `s` and the commit at `s + 1`, with nothing in between, in one durable write, or sequences neither. If the head has moved, the predicted roster no longer matches and the host answers `stale_roster`. On `stale_base`, `stale_epoch` or `stale_roster` the daemon discards both, keeps the fetched KeyPackages (section 6.4, "Use"), and starts again from step 2. After a lost reply it treats the pair as outstanding (`room-log-v2.md` section 2): it re-reads the head, and if the statement is not there it may sign a new pair with the same KeyPackages. At most one pair can take effect, because the second approval names a `ref` the first one closed;
+6. after the room-group commit is sequenced, commits the same Remove plus Add in each team subgroup the device is in, naming the current roster (roster `s` unless a later roster change was sequenced) and carrying that subgroup's other pending changes. These are ordinary commits. A subgroup the daemon is not a leaf of, or that it does not reach before going offline, is handled by the repair rule below.
+
+Members process the commit at `s + 1` with roster `s` as reference. Its leaf set is the roster's active devices by `(memberId, deviceId, deviceSig)`, so it passes roster equality. A commit at `s + 1` that does not replace the device's leaf fails roster equality and is rejected.
+
+**Is anything pending visible to a joiner?** In the room group, no. Approval and application are adjacent log entries, so no commit, and therefore no Welcome, can come between them. If the host splits them anyway (it sequences the statement and drops the commit), the room group simply has a pending rekey: roster equality (section 4.2) rejects every commit that names roster `s` or later until an admin applies the rekey (repair, below), so no Welcome can be built over a tree that still holds the old key. The host may sequence `device.rekey.approved` only through `commit.submit` (section 6.1; `room-log-v2.md` section 2), so a member that finds any entry other than an `mls.commit` at `s + 1` raises `withholding` (`room-log-v2.md` section 6.5). Subgroups go through a short pending rekey between steps 5 and 6 under the same rule. In every case a Welcome's tree matches the roster its Add commit names.
+
+**Why the `prevSig` exception is removed.** Spike A case (c) needed it because a Welcome was built while a rekey was approved and the device's leaf still had the old key. Under this section that cannot happen, for two reasons. An approved but unapplied rekey can still exist briefly (a split by the host, or a subgroup between steps 5 and 6), but with `deviceSig` in the leaf identity no commit naming the post-approval roster passes roster equality until the leaf is replaced, so no Add, and no Welcome, can be built over it. A Welcome built before the approval is judged against the roster its own commit named (section 4.1), in which the old key is still the device's key. So every leaf of every valid Welcome carries the key of its reference roster, and rule 6 needs no exception, in `joinGroup` or anywhere else. Keeping the exception would only reopen case a-stale. The same argument covers concurrent Adds: a commit built before `s` names an older roster and gets `stale_epoch` or `stale_roster` once the pair is sequenced, and a commit built after it must carry the replacement.
+
+**What a malicious host can do with the pair.**
+
+- *Sequence the commit without the statement.* Not possible: the commit names roster `s`, and without the approval no roster-changing entry sits at `s`, so members reject it (section 4.2 step 2).
+- *Sequence the statement and drop or delay the commit.* Once any other entry appears at `s + 1`, the two signed entries prove the split and members raise `withholding`; a host that simply stops after `s` is a stall, which the host can cause at any time. The device's old keys are denylisted and its old session is closed, so it is out of the room group until an admin repairs the leaf, and non-admin commits are blocked meanwhile (section 4.2). The old leaf's keys keep decrypting until the repair, so if the rekey was prompted by a suspected exposure, that exposure lasts longer. Any delay before approval has the same effect; a confirmed compromise is a removal, not a rekey (`keys-rotation-recovery.md` section 4.1).
+- *Delay or refuse the pair.* The rekey is delayed and the device keeps its old, still valid keys. The host can deny service this way for any operation.
+- *Withhold the device's Welcome.* The device sees the commit at `s + 1` in the log but no Welcome from `welcome.fetch`; after 30 s it raises `withholding`.
+
+**Repair.** Any admin device that is a leaf of a group, and finds a pending rekey or pending add there older than 60 s, fetches the missing KeyPackages (section 6.4) and commits the missing changes as an ordinary commit naming the current roster. This covers a host split, subgroups after step 5, an approving daemon that went offline, and pending changes left by a re-fold (`keys-rotation-recovery.md` section 6.6). Repairers that race are ordered by the host's one-commit-per-epoch rule (section 6.2).
+
+**If no admin daemon is online.** Nothing happens. Automatic approval is already signed by an admin daemon after the hold (`identity-model.md` section 6.3), and the same daemon builds the commit. A rekey whose hold has passed stays requested, and the device keeps its old keys, which remain valid, until an admin daemon comes online. The device is never in a state where the roster has its new keys and the room group still has its old leaf. If the admin daemon is online but a KeyPackage is missing (step 1), it does not sign the approval. It asks the device to publish KeyPackages and tells the admin: "Waiting for *<device>* to publish its new keys."
+
+**Member's experience.** On the rekeyed device:
+
+- During the hold, as now: "Your device *<label>* is changing its keys at *<time>*."
+- After the hold, while no admin daemon is online: "Waiting for an admin device to finish the key change. Your current keys keep working."
+- When the pair is sequenced: the host closes the old session with `superseded`; the device reconnects with its new DH key. It does not process the commit at `s + 1` with its old state (that commit removes its old leaf). It fetches the Welcome, joins at the new leaf after verifying the tree against roster `s`, then writes the new sealed state and deletes the old one. Chat pauses for that reconnect only. Messages that others send meanwhile are in the new epoch and readable after the join. Messages it had queued under the old epoch are re-encrypted and sent again. Local history is kept.
+- Other members see the existing key-change notice for the device. They see no MLS-specific step.
+
+**Open (needs a user decision).** A team subgroup that contains no admin device cannot apply the rekey, because only an admin may Add (section 4.3). The same gap exists for adding a new device to such a subgroup. Worse than a delay: once a member's device is admitted or rekeyed, the subgroup has a pending add or rekey that nobody in it can resolve, so no device there can commit again, Removes included (section 4.2, liveness cost). Options, not decided:
+
+- **(a) A scope must contain an admin.** `apply` rejects `scope.membership.changed` whose `memberIds` include no admin. Simple, but every team scope is readable by an admin, and the gap returns whenever no admin device of the scope is online.
+- **(b) Roster-determined Adds by any scope device.** In a subgroup, any device of the scope may commit an Add when every added leaf passes rule 6 against the reference roster and the result equals the scope roster. Roster equality already fixes which leaves may exist; the admin-only Add rule is a second guard. Cost: a compromised member device of the scope chooses the timing and which served KeyPackage is used (at worst a replayed one, which yields a dead leaf, section 6.4), but cannot add a device no admin admitted. This could also apply to the room group and would remove most of the liveness cost of section 4.2.
+- **(c) Relax equality for pending adds** (section 11, Q7). Non-admin devices could then commit Removes and updates in such a subgroup, but the rekeyed or new device would stay out of it until an admin of the scope is online.
 
 ## 5. Authenticated data and epoch anchoring
 
@@ -158,19 +225,27 @@ authenticated_data = RJCS({
 ### 6.1 Operations (room session, `enrollment-v2.md` section 4)
 
 ```
-kp.publish   { keyPackages: [b64u...] }            ≤ 10 outstanding per device
-commit.submit{ epoch, commit: b64u, welcome?: b64u, ratchetTree?: b64u }
-   → ok { seq, epoch } | error stale_epoch { epoch } | error stale_roster { roster } | error not_permitted
-welcome.fetch{ } → { welcome: b64u, ratchetTree: b64u, entry } | none
+kp.publish   { for: "current" | "rekey", keyPackages: [b64u...], lastResort?: b64u }      section 6.4
+   → ok { stored, lastResort: bool } | error not_permitted
+kp.fetch     { targets: [ { memberId, deviceId, for: "current" | "rekey", count: 1..10 } ] }   ≤ 8 targets; section 6.4
+   → ok { results: [ { deviceId, keyPackages: [b64u...], lastResort: b64u | null } ] } | error not_permitted
+kp.low       (host → device push) { for: "current" | "rekey", remaining }                  section 6.4
+commit.submit{ epoch, commit: b64u, welcome?: b64u, ratchetTree?: b64u, statement?: SignedStatement }
+   → ok { seq, epoch } | error stale_epoch { epoch } | error stale_roster { roster } | error stale_base { head }
+   | error not_permitted
+welcome.fetch{ ack?: seq } → { welcome: b64u, ratchetTree: b64u, entry } | none
 msg.send     { epoch, message: b64u }              application message (PrivateMessage)
 msg.fetch    { fromSeq, limit ≤ 500 }
 ```
+
+- `statement` is allowed only for `device.rekey.approved`, and `device.rekey.approved` is accepted only this way (`stmt.submit` refuses it with `not_permitted`). The host validates the statement as for `stmt.submit` (`room-log-v2.md` section 2), checks the commit's authenticated data against the roster after the statement, and then sequences the statement and the commit as two adjacent entries, or neither (section 4.4).
+- `welcome.fetch` returns the oldest Welcome that names one of the caller's KeyPackages (section 6.4, "Welcome routing") and that the caller has not acknowledged. A device in several groups calls it until `none`. It acknowledges a Welcome with `ack` (the `seq` of its commit entry) after writing the joined state (section 8.2); the host then drops it.
 
 ### 6.2 Sequencing
 
 - The host accepts **one commit per epoch**: the first that names the current epoch and comes from an active roster device wins. Later ones get `stale_epoch`, and their senders rebuild on the new epoch.
 - The host cannot verify commit contents (they are PrivateMessages). It checks only the outer epoch, size (≤ 1 MiB), sender session, and that the authenticated data names the current roster (`stale_roster` otherwise, section 4.2). Members do the real validation (section 4). A commit that honest members reject leaves those members at the old epoch and raises `roster_mismatch`; the host sees members stop advancing and logs `mls.stalled` after 5 minutes.
-- Handshake messages use the **PrivateMessage** wire format, so the host does not learn proposal contents or senders. Content type and authenticated data stay visible to it (RFC 9420 section 6.3). Verify that ts-mls 1.6.4 creates PrivateMessage commits when `wireAsPublicMessage` is false (open question Q2).
+- Handshake messages use the **PrivateMessage** wire format, so the host does not learn proposal contents or senders. Content type and authenticated data stay visible to it (RFC 9420 section 6.3). Spike A case (e) observed that ts-mls 1.6.4 creates `mls_private_message` commits with `wireAsPublicMessage: false`, and that `decodeMlsMessage` without group state yields the wire format, epoch, content type and the `authenticated_data` bytes (Q2 answered yes).
 
 ### 6.3 Removal latency
 
@@ -179,6 +254,57 @@ A removal is enforced on grants and sessions at once (`grants-v2.md` section 7).
 - The host pushes `pending_remove {seq}` to every connected device. The first device to commit wins.
 - A sender that sees a pending removal older than 60 s commits it before sending its next application message.
 - If no device is online, the removed device still cannot fetch new messages from the host (its session is refused), but it could decrypt messages a colluding member forwards. MLS secrecy for it starts at the Remove commit.
+
+### 6.4 KeyPackages: publish, fetch and consumption
+
+Every Add needs one KeyPackage of the added device: admissions, device links, rekeys (section 4.4), subgroup joins, leaf replacements and ReInit. The host stores KeyPackages and hands them out. It is trusted for availability only; the fetcher authenticates every package against the roster.
+
+**Two pools per device.** `for: "current"` packages carry the device's current roster signing key as `deviceSig`. `for: "rekey"` packages carry the `newSig` of the device's pending `device.rekeyed` (`keys-rotation-recovery.md` section 4.1 step 2). When `device.rekey.approved` is sequenced, the host deletes the `current` pool (its `deviceSig` is now denylisted) and moves the `rekey` pool into it. When the rekey is vetoed or cancelled in the fold, the host deletes the `rekey` pool. When the device leaves the roster, both pools are deleted. The pools follow the fold, re-folds included (`keys-rotation-recovery.md` section 6.6 step 5).
+
+**Publishing (`kp.publish`).** Only an active device, for itself. The host rejects the whole frame with `not_permitted` unless every package:
+
+1. decodes strictly as an MLS KeyPackage of suite 1 whose capabilities list `0xF0A1`;
+2. has a credential whose `identity` passes rules 1 to 5 of section 4.1, with the caller's `memberId` and `deviceId`;
+3. has `deviceSig` equal to the caller's roster key (`current`), or to the `newSig` of the caller's pending, uncancelled `device.rekeyed` once that statement is sequenced (`rekey`);
+4. has a signature that verifies with its leaf `signature_key`, and a leaf lifetime that has started and ends at most 30 days after publication;
+5. has a KeyPackageRef (RFC 9420 section 5.2) the host has never stored for this room.
+
+Limits: at most 10 single-use packages per pool, plus at most one last-resort package per pool. A new `lastResort` replaces the stored one. Publishing counts toward the per-device request budget (`enrollment-v2.md` section 5.4).
+
+**When a device publishes.**
+
+- As soon as it is active: after `enroll.admitted` (any admitting statement: `member.admitted`, `device.add.approved`, `member.device.replaced`), on the same session, before anything else. It publishes `current` packages, one per group it will join (the room group and each team scope of its member) plus one spare, capped at 10, and a last-resort package.
+- When it requests a rekey: the same set for `rekey`.
+- When the host pushes `kp.low` (single-use packages in a pool at 2 or fewer, or its last-resort package was served), and after it joins a group with its last-resort package: it tops the pool up and replaces the last-resort package.
+
+**Fetching (`kp.fetch`).**
+
+- **Who.** A device whose member has role `admin` in the current roster, or role `maintain` for targets of `kind: "gateway"` only. These are the committers allowed to Add (section 4.3). Any other caller gets `not_permitted`, so a member who is not an admin cannot drain anyone's packages.
+- **Targets.** For `current`, an active device of the current roster; for `rekey`, a device with a pending, uncancelled rekey. Any other target makes the frame `not_permitted`.
+- **Single use.** The host deletes each single-use package at the moment it serves it. It never serves it again, to anyone, so two committers never receive the same single-use package from an honest host.
+- **Last resort.** Served only when the pool has fewer single-use packages than `count`, to make up the rest. It is served as often as needed and kept until the device replaces it. It exists because a pending add blocks commits (section 4.2): as long as a device has published once, an honest host can always give an admin a package for it. RFC 9420 section 10 allows such a reusable last-resort package (cited from memory, not rechecked offline). It is our own marking, not an MLS extension; other members cannot tell it apart.
+- **None available.** The result for that target is empty. The host pushes `kp.low` to the device if it is connected. The fetcher builds no commit and, for a rekey, signs no approval (section 4.4). It retries every 60 s while the pending change exists and shows "Waiting for *<device>* to publish its keys." A pending add with no package for 24 h is shown to admins as "*<device>* has not finished joining. Remove it?", because it blocks non-admin commits meanwhile.
+- **Rate.** Per target device and pool, the host serves at most `g + 2` single-use packages per hour across all fetchers, where `g` is 1 plus the number of team scopes of the target's member (the host knows scopes from the plaintext `scope.membership.changed` statements). Beyond that it serves only the last-resort package. Fetches also count toward the caller's request budget.
+
+**Authentication by the fetcher.** The host's checks are not trusted. Before it uses a package, the fetcher checks steps 1 and 4 of publishing, that the credential's `(memberId, deviceId)` are the target's, and that the credential passes all of section 4.1 against the reference roster the commit will name (for a rekey, the predicted roster `s` of section 4.4). A package that fails is discarded and reported to the admin as a host fault, because the host should have refused it. ts-mls validates each added package again inside `createCommit` (section 4.1, observed in case (d)).
+
+**Use.** A fetched single-use package goes into at most one group. If the commit that carries it is refused (`stale_*`), the fetcher may reuse it in its rebuilt commit for the same group, because at most one of those commits is sequenced. It discards the package once a commit carrying it is sequenced, or one hour after fetching. A last-resort package may go into several groups.
+
+**Welcome routing.** A Welcome names each new member by KeyPackageRef in its plaintext `secrets` list (RFC 9420 section 12.4.3.1). The host computed the refs at publication, so it can deliver each Welcome through `welcome.fetch` to the devices whose packages it names. Not yet checked: that the ts-mls 1.6.4 decoder exposes those refs without group state (test 12).
+
+**Attacks and limits.**
+
+| Attempt | Result |
+|---|---|
+| A member who is not an admin drains a device's packages | `not_permitted` |
+| A compromised admin device drains them | Bounded by the rate limit; Adds stay possible through the last-resort package. A compromised admin key can do worse by signing admissions; this adds nothing new |
+| The host drops, withholds or deletes packages | Denial of service only: fetchers see empty results and admins see the waiting notices. The host can refuse any operation anyway |
+| The host forges or alters a package | Fails the fetcher's checks: the credential is bound to `deviceSig` in the admin-signed roster, and the package is signed by the leaf key named in the credential |
+| The host serves a package of an old key (before a rekey), a `rekey` package as `current`, or one from another room | Fails section 4.1 rule 6, 8 or 3 against the reference roster |
+| The host replays a single-use package that was already used | The device deleted that package's private init key when it first joined, so it cannot open the Welcome. It refuses it and reports to the admin through the room session (section 9); an admin replaces the leaf (section 4.3, leaf replacement). Bounded by the 30-day lifetime |
+| The host serves the last-resort package while single-use ones remain | Several Welcomes are encrypted to one init key, which weakens forward secrecy for those joins. The device sees it (Welcomes naming its last-resort ref) and replaces the package after each use |
+
+**Last-resort key lifetime.** The device keeps the last-resort private init key until it has replaced the package and no unacknowledged Welcome names it, and for at most 7 days after replacing it. Someone who steals the key before then can open the captured Welcomes encrypted to it, which give the group secrets of the joining epochs. A device replaces its last-resort package at least every 7 days.
 
 ## 7. Gateway members for seated agents (future)
 
@@ -219,7 +345,7 @@ The sealed state records `{epoch, logHead}`. On connect, `session.hello.ok` retu
 |---|---|
 | Commit fails 4.1 or 4.2 | Do not advance. Raise `roster_mismatch` with the commit's `bodyHash`, sender `(memberId, deviceId)` if decryptable, and the reference roster. Keep receiving log entries. Show "Room security check failed. Messages are paused." |
 | Two valid commits for the same epoch | Should not happen (host sequencing). If seen, it is host equivocation: `room-log-v2.md` section 6.3. |
-| Welcome fails 2.3 or 4.1 | Refuse to join. Report to the admin through the room session. |
+| Welcome fails 2.3 or 4.1, or names a KeyPackage whose private init key the device no longer holds | Refuse to join. Report to the admin through the room session. In the last case an admin replaces the leaf (section 4.3). |
 | Log entry references an unknown epoch | Fetch commits from the host; if missing after 30 s, `withholding`. |
 | Removed device keeps sending | Host refuses its session. Members ignore messages from leaves absent from the reference roster. |
 
@@ -234,16 +360,35 @@ The sealed state records `{epoch, logHead}`. On connect, `session.hello.ok` retu
 7. **Write ordering:** kill the process between steps of 8.2; restart; no message lost or double-applied.
 8. **Subgroup isolation:** a room member outside a scope cannot process subgroup ciphertext (spike A.2 check, kept).
 9. **Stale roster:** a commit that names a roster older than the current one is rejected by the host (`stale_roster`) and by members, including one whose leaf set equals that older roster.
-10. **Device rekey:** an UpdatePath that changes `deviceSig` to the newly approved key is accepted; one that changes it to any other key, or before the approval entry, is rejected; one that changes `memberId` or `deviceId` is rejected.
+10. **Device rekey (admin route, section 4.4):** an admin's Remove plus Add, naming the roster of the adjacent `device.rekey.approved`, is accepted, and the rekeyed device joins by Welcome; the same commit from a non-admin device is rejected; a commit that names the post-approval roster without replacing the leaf is rejected by roster equality; the host refuses `device.rekey.approved` through `stmt.submit` and sequences the pair from `commit.submit` adjacently or not at all; a Welcome built after the rekey validates with no previous-key exception; with another device's add pending, the daemon's commit carries that Add too, and a pair without it fails the daemon's own check and is not submitted; a host that sequences the statement and then any other entry raises `withholding`, and an admin's repair commit is accepted. **Continuity:** an UpdatePath whose leaf changes `memberId`, `deviceId`, `deviceSig` or `mlsSig` (built in test code with a forked `createCommit`; production code never forks it) is rejected after processing with the state not advanced, including when the authentication service accepts the new credential.
 11. **`mls-rekey-updatepath-welcome`** (offline unit test under `spikes/security`, ts-mls 1.6.4, no network; must run **first**, before the adapter is written; decisions round 4, item 4). Three members A, B, C. Cases: (a) B commits an UpdatePath whose new leaf has a new credential: record whether ts-mls accepts it and whether `validateCredential` receives the new credential; with the callback returning `false`, the commit must be rejected; (b) the same with a changed `deviceId`: our callback rejects it; (c) after B's rekey is approved in the test roster but before B's UpdatePath, A adds D and D processes the Welcome: record whether it fails without the `prevSig` rule and succeeds with it; (d) record whether ts-mls passes unchanged leaves to `validateCredential` while processing a commit. Outcomes: if (a) shows that a credential change is refused or not validated, device rekeys use only the admin fallback (`keys-rotation-recovery.md` section 4.1); if (c) cannot pass with the `prevSig` rule, the first Add after a rekey approval carries the fallback for every device still on its `prevSig`. The results go into `spikes/security/RESULTS.md` and this section.
 
-    **Results (2026-10-29, executed offline on ts-mls 1.6.4, Node 24.20.0; details in `spikes/security/RESULTS.md`, section "Identity v2 Step 0, Spike A").** Observed: (a) receivers accept an UpdatePath whose leaf has a new credential and a new leaf key, `validateCredential` receives the new credential (`processMessages.js:136`), and a `false` answer rejects the commit with the receiver's state unchanged; but the public `createCommit` always copies the old credential and signature key into the UpdatePath, so the sender needs an adapter-owned fork of `createCommit`. (b) The `IncomingMessageCallback` gets only `{kind, proposals, senderLeafIndex}` and never the UpdatePath leaf; the changed `deviceId` was rejected by the authentication service (device not in roster), and with an accept-all service only a post-processing comparison of the sender's leaf caught it. (c) D's Welcome fails without the `prevSig` rule and succeeds with it. (d) During commit processing ts-mls passes only the committer's UpdatePath leaf and added KeyPackage leaves, never other unchanged leaves; a post-approval UpdatePath that keeps the old `deviceSig` is therefore classed "unchanged" by the 4.1 rule and accepted by the `prevSig` exception. Also observed: commits are PrivateMessage and their authenticated data decodes without group state (Q2: yes); the removal regression passes on 1.6.4 and fails on 1.6.2; results are identical with `@noble` 2.4.0. **Branch selected:** UpdatePath rekey (not the admin-only fallback), conditional on accepting the `createCommit` fork; the `prevSig` rule is needed. Inferred, not yet applied: the continuity check moves from the callback (4.3) to the authentication service plus a post-processing check, and the `prevSig` exception is limited to `joinGroup`.
+    **Results (2026-10-29, executed offline on ts-mls 1.6.4 and 1.6.2, Node 24.20.0; details in `spikes/security/RESULTS.md`, section "Identity v2 Step 0, Spike A").**
+
+    *Observed* in the runs:
+
+    - (a0) The public `createCommit` produces an UpdatePath with a new HPKE key but a byte-identical credential and the same signature key. The public API cannot emit a rekey UpdatePath.
+    - (a) With a forked `createCommit` (spike code only), receivers accept an UpdatePath whose leaf has a new credential and leaf key; `validateCredential` receives the new credential (`processMessages.js:136`); a `false` answer rejects the commit and leaves the receiver's state unchanged.
+    - (b) The `IncomingMessageCallback` gets only `{kind, proposals, senderLeafIndex}` and never the UpdatePath leaf. The authentication service rejected the changed `deviceId` (device not in roster). With an accept-all service ts-mls accepted it, and only a comparison of the sender's leaf before and after processing detected it.
+    - (c) D's Welcome fails without the `prevSig` rule and succeeds with it, when B's rekey is approved but B's leaf still has the old key.
+    - (d) During commit processing ts-mls passes only the committer's UpdatePath leaf and added KeyPackage leaves to `validateCredential`; during a Welcome, the GroupInfo signer and then every leaf.
+    - (a-stale) A post-approval UpdatePath that keeps the old `deviceSig` is classed "unchanged" by the round-4 rule and accepted through the `prevSig` exception.
+    - (e) Commits are PrivateMessage, and their authenticated data decodes without group state (Q2: yes).
+    - (f) The removal regression passes on 1.6.4 and fails on 1.6.2.
+    - (g) Results are identical with `@noble/*` 2.4.0.
+
+    *Source reading, not run:* `createUpdatePath` copies `credential` and `signaturePublicKey` from the existing leaf (`updatePath.js:37-40`).
+
+    *Inferred and applied in this revision* (decisions round 6), not run as a whole: device rekeys use the admin route with public APIs only (section 4.4), so test 10 replaces the UpdatePath rekey; the continuity check runs after processing (section 4.2 step 4); leaf identity includes `deviceSig`, which removes the `prevSig` exception (section 4.1 rule 6, section 4.4); the floor is ts-mls 1.6.4 (section 1). The admin route's Remove plus Add and its Welcome were not run in Spike A; test 10 covers them.
+
+12. **KeyPackages (section 6.4):** the host refuses packages with a wrong `deviceSig`, member, device, suite, lifetime or a reused ref; a single-use package is served once; the last-resort package is served only when the pool is short, and the device can join two groups with it (not yet tried on ts-mls 1.6.4); a non-admin `kp.fetch` gets `not_permitted`; the rate limit falls back to the last-resort package; the fetcher rejects a package whose credential fails section 4.1 against the reference roster; a Welcome for a replayed single-use package is refused and the leaf replacement commit is accepted; the host reads the KeyPackageRefs of a Welcome without group state and routes it.
 
 ## 11. Open questions
 
 - **Q1.** Who commits Adds in the pair deployment when the owner's daemon is offline? Proposed: nobody; admission waits for the admin anyway (SAS needs the owner).
-- **Q2.** Confirm ts-mls 1.6.4 emits commits as PrivateMessage when `wireAsPublicMessage` is false, and that authenticated data is readable before decryption with its decoders.
+- **Q2.** Answered yes by Spike A case (e), observed: commits are PrivateMessage when `wireAsPublicMessage` is false, and `decodeMlsMessage` reads the authenticated data without group state. Not tried: a tampered commit.
 - **Q3.** ts-mls 2.0 migration timing. The adapter limits the change, but 2.0's codec changes alter state encoding; a state migration or group ReInit will be needed.
 - **Q4.** Should the host verify commit signatures on PublicMessage-framed commits so it can reject garbage early? That would require PublicMessage framing and leak proposal contents to the host. Proposed: no.
 - **Q5.** An independent review of the adapter and the library's commit path before release (spike A.4 risk 1).
-- **Q6.** Does ts-mls 1.6.4 call `authService.validateCredential` for a changed credential in an UpdatePath, and does it allow the credential to change there? The re-review's static reading of the source says yes to both, with no continuity check of its own, and that Welcome processing validates every leaf (section 4.1). This is a reading, not a run. Our understanding that RFC 9420 leaves it to the authentication service to decide whether an updated credential still represents the same client is from memory and was not checked against the RFC text. Test 11 (section 10) answers it; the fallbacks are in `keys-rotation-recovery.md` section 4.1.
+- **Q7.** Should roster equality tolerate pending adds? Proposed for decision, not decided: a commit is valid when its leaf set equals the reference roster minus devices that have no leaf yet, and every leaf absent from the roster is removed. Non-admin devices could then commit Removes and updates while an add or rekey waits for a KeyPackage or an admin (section 4.2, liveness cost; section 4.4, open item). Old-key leaves would still have to be removed, so no Welcome would contain one and the `prevSig` exception would stay unnecessary. Cost: a commit can leave a device out of a group until an admin adds it, which a malicious member could not cause but could prolong by committing first.
+- **Q6.** Answered by test 11 (Spike A): ts-mls validates a changed UpdatePath credential on receipt and does not check continuity, but its public API cannot send one. Device rekeys therefore use the admin route (section 4.4). Still unchecked: whether ts-mls 2.0 exposes credential change through the public `createCommit` (upstream request, `README.md` section 6), and the RFC 9420 text on updated credentials, which was cited from memory.
