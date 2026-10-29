@@ -446,15 +446,14 @@ test("fold: the forward rule holds across types, and a fence kills a held statem
   assert.equal(fold.state.members[BOB].role, "watch");
 });
 
-test("fold: I-6 statement types are refused as not_implemented, reserved types as reserved", () => {
+test("fold: reserved types are refused; a ref must name an earlier statement (I-6 types are folded in v2-fold-authority)", () => {
   const fold = base4();
-  const s = V.statements;
-  const rotated = clone(s.adminKeyRotated.body.data);
-  expectFold(() => add(fold, build(fold, "admin.key.rotated", rotated, "adminA")), "not_implemented");
-  expectFold(() => add(fold, build(fold, "room.close.proposed", { exp: 1793498800 }, "adminA")), "not_implemented");
   expectFold(() => add(fold, build(fold, "seat.removed", { deviceId: BOB_DEV }, "adminA")), "reserved_type");
   // A ref that names nothing in the chain.
   expectFold(() => add(fold, build(fold, "device.add.vetoed", { memberId: BOB, ref: L.entries[0].hash }, "devSig")), "unknown_ref");
+  // A close proposal is now accepted (milestone I-6).
+  add(fold, build(fold, "room.close.proposed", { exp: 1793498800 }, "adminA", { hts: 1793300000000 }));
+  assert.equal(fold.head.seq, 4);
 });
 
 test("fold: the host's own statements need the host key valid at that position", () => {

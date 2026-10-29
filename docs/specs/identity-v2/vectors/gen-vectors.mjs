@@ -944,6 +944,28 @@ function apply(st, body, pub, entry, bodyHash) {
       st.versions.set(`conflict:${d.memberId}`, seq);
       return null;
     }
+    case "device.rekey.vetoed": {
+      const f = findDevice(st, pub);
+      const p = st.pending.get(d.ref);
+      if (kind !== "device" || !f || f.member.memberId !== d.memberId) return "producer_not_allowed";
+      if (!p || p.kind !== "rekey" || p.done || p.cancelled || p.memberId !== d.memberId) return "not_pending";
+      p.vetoed = true;
+      p.done = true;
+      st.conflicts.set(d.memberId, seq);
+      st.versions.set(`conflict:${d.memberId}`, seq);
+      return null;
+    }
+    case "room.policy.changed": {
+      // One ver per setting (room-log-v2.md section 4.0); minVersion only rises.
+      if (kind !== "admin") return "producer_not_allowed";
+      for (const c of d.changes) if (c.ver !== ver(st, `policy:${c.setting}`)) return "stale_version";
+      for (const c of d.changes) if (c.setting === "minVersion" && c.value < st.policy.minVersion) return "policy_downgrade";
+      for (const c of d.changes) {
+        st.policy[c.setting] = c.value;
+        st.versions.set(`policy:${c.setting}`, seq);
+      }
+      return null;
+    }
     case "device.conflict.resolved": {
       if (kind !== "admin") return "producer_not_allowed";
       if (!st.conflicts.has(d.memberId)) return "no_conflict";
@@ -1664,6 +1686,85 @@ const deviceRekeyCases = [
   };
 });
 
+// Rekey veto (room-log-v2.md section 4.3; keys-rotation-recovery.md section 4.1 step 3). The laptop, which is the
+// device being rekeyed, answers "Not me" 1 h after the request: the rekey is cancelled and Sam has a device
+// conflict, so an automatic approval 73 h after the request is rejected with vetoed.
+const rekeyVetoed = statement(keys.devSig, "device", "device.rekey.vetoed", { memberId, ref: rekeyRef }, rk4.entry.hts + HOUR - 100, baseOf(rk4));
+const rv5 = entryFor(5, rk4.hashBytes, rekeyVetoed, rk4.entry.hts + HOUR, 0);
+const rv6 = entryFor(
+  6,
+  rv5.hashBytes,
+  statement(keys.adminA, "admin", "device.rekey.approved", { memberId, deviceId, ref: rekeyRef, mode: "auto" }, rk4.entry.hts + 73 * HOUR - 100, baseOf(rv5)),
+  rk4.entry.hts + 73 * HOUR,
+  0,
+);
+{
+  const r = fold([...p3, rk4, rv5]);
+  check(r.ok && r.state.conflicts.get(memberId) === 5 && r.state.members.get(memberId).devices[0].sig === b64u(keys.devSig.pub), `rekey veto opens a conflict and keeps the old keys (${r.error})`);
+  const r2 = fold([...p3, rk4, rv5, rv6]);
+  check(!r2.ok && r2.error === "vetoed" && r2.seq === 6, `rekey approval after a veto rejected (${r2.error})`);
+}
+const rekeyVetoCase = {
+  name: "approvalAfterVeto",
+  note: "the laptop, the device being rekeyed, vetoed the rekey at seq 5; the approval names the vetoed request",
+  chain: [rk4, rv5].map((e) => ({ ...publicEntry(e), statement: e.statement })),
+  entry: publicEntry(rv6),
+  statement: rv6.statement,
+  expect: "vetoed",
+};
+
+// Sole-device rekey under policy soleDeviceChange = "admin" (identity-model.md sections 5.2.1 and 6.3; decision
+// round 5, item 3). adminA sets the policy at seq 4; the laptop, Sam's only device, requests a rekey at seq 5; an
+// admin approves interactively (mode "admin") 1 h later, with no hold. An automatic approval, even after 72 h,
+// is rejected.
+const saPolicy = statement(
+  keys.adminA,
+  "admin",
+  "room.policy.changed",
+  { changes: [{ setting: "soleDeviceChange", value: "admin", ver: -1 }] },
+  RK_T - HOUR - 100,
+  baseOf(e3),
+);
+const sa4 = entryFor(4, e3.hashBytes, saPolicy, RK_T - HOUR, 0);
+const saRekeyed = statement(keys.devSig, "device", "device.rekeyed", { change: rekeyChange, newKeySig: b64u(rekeyNewKeySig) }, RK_T - 100, baseOf(sa4));
+const sa5 = entryFor(5, sa4.hashBytes, saRekeyed, RK_T, 0);
+const saRef = bodyHashOf(saRekeyed);
+const saApprovalAt = (mode, hours) =>
+  entryFor(
+    6,
+    sa5.hashBytes,
+    statement(keys.adminA, "admin", "device.rekey.approved", { memberId, deviceId, ref: saRef, mode }, sa5.entry.hts + hours * HOUR - 100, baseOf(sa5)),
+    sa5.entry.hts + hours * HOUR,
+    0,
+  );
+const sa6 = saApprovalAt("admin", 1);
+const soleAdminChain = [sa4, sa5, sa6];
+{
+  const r = fold([...p3, ...soleAdminChain]);
+  const dev = r.ok && r.state.members.get(memberId).devices[0];
+  check(r.ok && r.state.policy.soleDeviceChange === "admin" && r.rosterSeq === 6 && dev.sig === b64u(keys.devSig2.pub), `sole-device rekey approved by an admin under soleDeviceChange "admin" (${r.error})`);
+}
+const soleAdminCases = [
+  {
+    name: "autoApprovalAfterHold",
+    prefix: [...p3, sa4, sa5],
+    entry: saApprovalAt("auto", 72),
+    expect: "auto_not_allowed",
+    note: 'under soleDeviceChange "admin" a sole-device rekey needs an interactive admin approval, whatever the hold',
+  },
+].map(({ name, prefix, entry, expect, note }) => {
+  const r = fold([...prefix, entry]);
+  check(!r.ok && r.error === expect && r.seq === 6, `sole-device admin case ${name}: expected ${expect}, got ${r.error}`);
+  return {
+    name,
+    note,
+    chain: prefix.slice(4).map((e) => ({ ...publicEntry(e), statement: e.statement })),
+    entry: publicEntry(entry),
+    statement: entry.statement,
+    expect,
+  };
+});
+
 // ------------------------------------------------------------------ MLS (mls-integration.md sections 2, 3, 5)
 const mlsIdentity = {
   v: 2,
@@ -1939,6 +2040,13 @@ const out = {
       holdMs: 72 * HOUR,
       note: "the requester is the member's only active device, so the rekey hold is 72 h (decision round 5, item 3)",
       cases: deviceRekeyCases,
+    },
+    vetoed: rekeyVetoCase,
+    soleDeviceChangeAdmin: {
+      prefix: "log.entries[0..3], then these entries at seq 4 to 6",
+      entries: soleAdminChain.map((e) => ({ ...publicEntry(e), statement: e.statement })),
+      note: 'room.policy.changed sets soleDeviceChange to "admin"; the sole device requests a rekey; an admin approves it interactively 1 h later',
+      cases: soleAdminCases,
     },
   },
   statements: {

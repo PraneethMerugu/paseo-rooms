@@ -1,5 +1,5 @@
-// Roster and authority fold, core (room-log-v2.md section 5, without the re-fold of 5.1, the
-// lineages and closure of 5.2, and the device holds; those are milestone I-6).
+// Roster and authority fold (room-log-v2.md section 5, with the re-fold of 5.1, the lineages and
+// closure of 5.2, and the device holds of 4.3; keys-rotation-recovery.md sections 2 and 3).
 //
 //   state = init(genesis)
 //   for entry in chain (seq ascending):
@@ -7,193 +7,96 @@
 //       if entry.cls == "mls": track epoch; continue
 //       stmt = body; verify bodyHash, strict parse, schema
 //       base rule, unique rule, producer and signature, forward rule, ref rule
-//       state = apply(state, stmt, entry)
+//       if stmt is admin.key.revoked: state = refold(...)          (refold.ts)
+//       else: state = apply(state, stmt, entry)
 //       if the roster members changed: rosterSeq = entry.seq
 //
 // A rejected entry is `invalid_entry`: processing stops there and the state stays at the last
-// accepted entry (never skip, section 5). Statement types whose effect belongs to I-6 are refused
-// with `not_implemented`, so the core never silently ignores an authority change.
+// accepted entry (never skip, section 5). Inside a re-fold, statements that no longer apply are
+// void instead, and those of the revoked key from `fromSeq` on are suspect.
 // Pure: no I/O, no clock. Nothing here logs key material or bodies.
 import { b64uDecode } from "../proto/b64u";
+import { isId } from "../proto/ids";
 import { kid as kidOf } from "../proto/keys";
 import { rjcsParse, RJCS_MAX_BYTES } from "../proto/rjcs";
 import { bodyHash, EntryError, verifyChainedEntry, type LogEntry, type SignedEntry } from "./entries";
-import { verifyGenesis, type RoomGenesis } from "./genesis";
+import { verifyGenesis } from "./genesis";
+import { byOrForDevice, cancelRequests, checkApproval, openRequest, resolveConflict, vetoRequest, YOUNG_DEVICE_MS } from "./holds";
+import { confirmClose, confirmFirstRecovery, proposeClose, proposeRecovery } from "./lineage";
+import { checkAdminRevocation, finishAdminRevocation, hostKeyAt, replay, revokeHostKey, type Imposed, type Rec, type Step } from "./refold";
 import { buildRoster, membersFingerprint, rosterHash, sortDevices, type Roster } from "./roster";
-import type { DeviceEntry, Policy, PolicySetting, RosterEntry } from "./schema";
+import type { DeviceEntry, RosterEntry } from "./schema";
+import { activeAdmins, edKid, FoldError, initState, keysInUse, versionKey, type Fail, type LaneState, type RoomState } from "./state";
 import {
   parseSignedStatement,
   producerKindAllowed,
   StatementError,
   statementRef,
+  verifyNewKeySig,
   verifyStatementSig,
+  type KeyChange,
   type SignedStatement,
   type StatementBody,
   type StatementData,
   type StatementType,
 } from "./statements";
 
+export { FoldError, versionKey } from "./state";
+export type {
+  AdminKeyState,
+  AuthorityState,
+  CloseProposal,
+  FoldReason,
+  HostKeyState,
+  KeyRefValue,
+  LaneState,
+  PendingRequest,
+  RecoveryKeyState,
+  RecoveryProposal,
+  Revocation,
+  RoomState,
+  Set_,
+} from "./state";
+
 /** Hold for `lane.closed` by the host after `lane.degraded` (room-log-v2.md 4.4), in ms of `hts`. */
 export const LANE_DEGRADED_CLOSE_MS = 24 * 60 * 60 * 1000;
 
-export type FoldReason =
-  // entry layer (entries.ts)
-  | EntryError["reason"]
-  // body and statement layer
-  | "missing_body"
-  | "body_hash_mismatch"
-  | "bad_body"
-  | "type_mismatch"
-  | "unknown_type"
-  | "bad_statement"
-  // chain rules (section 5)
-  | "base_not_before_entry"
-  | "base_mismatch"
-  | "duplicate_statement"
-  | "not_permitted"
-  | "unknown_producer"
-  | "bad_signature"
-  | "base_regressed"
-  | "unknown_ref"
-  | "base_before_ref"
-  // apply
-  | "genesis_admission_required"
-  | "creator_not_at_genesis"
-  | "room_closed"
-  | "stale_version"
-  | "id_reused"
-  | "key_reused"
-  | "unknown_member"
-  | "unknown_device"
-  | "unknown_lane"
-  | "lane_closed"
-  | "not_member_device"
-  | "not_sole_device"
-  | "last_device_use_member_left"
-  | "too_many_devices"
-  | "policy_downgrade"
-  | "not_lane_owner"
-  | "names_hidden"
-  | "not_implemented"
-  | "reserved_type";
-
-export class FoldError extends Error {
-  constructor(
-    readonly seq: number,
-    readonly reason: FoldReason,
-    message: string,
-  ) {
-    super(`seq ${seq}: ${reason}: ${message}`);
-    this.name = "FoldError";
-  }
-}
-
-// ---- state ----
-
-export type KeyRefValue = { alg: "ed25519" | "x25519"; kid: string; pub: string };
-export type AdminKeyState = { kid: string; pub: string; fromSeq: number; toSeq: number | null; root: string; addedBy: string | null; since: number };
-export type HostKeyState = { kid: string; pub: string; fromSeq: number; toSeq: number | null; validFrom: number; validTo: number | null };
-export type LaneState = {
-  owner: string;
-  offer: { serverId: string; dh: KeyRefValue; relay: { host: string; port: number; tls: true } };
-  visibility: "room" | "team";
-  status: "open" | "degraded" | "closed";
-  degradedAtHts: number | null;
-  showNames: boolean;
-};
-export type Set_ = Record<string, true>;
-
-export type AuthorityState = {
-  admins: AdminKeyState[];
-  recovery: { kid: string; pub: string; fromSeq: number; since: number } | null;
-  hostKeys: HostKeyState[];
-  adminKeyDenylist: Set_;
-  /** Public keys (b64u) of every key that was valid in the room and was rotated out, removed or revoked. */
-  retiredKeys: Set_;
-  endpoint: { serverId: string; dh: KeyRefValue; relay: { host: string; port: number; tls: true } };
-  lanes: Record<string, LaneState>;
-  scopes: Record<string, string[]>;
-  policy: Policy;
-  /** Field versions (section 4.0). A missing key is version -1. */
-  versions: Record<string, number>;
-  closed: boolean;
-};
-
-export type RoomState = {
-  roomId: string;
-  genesisHash: string;
-  auth: AuthorityState;
-  members: Record<string, RosterEntry>;
-  /** Device signing and DH keys (b64u) that were removed or rotated out (identity-model.md 6.2). */
-  deviceDenylist: Set_;
-  /** Ids that were ever used: memberId, deviceId, laneId, inviteRef; linkRef maps to its member. */
-  used: { members: Set_; devices: Set_; lanes: Set_; invites: Set_; links: Record<string, string> };
-  rosterSeq: number;
-  epoch: number | null;
-};
-
-export const versionKey = {
-  policy: (setting: PolicySetting) => `policy:${setting}`,
-  role: (memberId: string) => `role:${memberId}`,
-  lanes: (memberId: string) => `lanes:${memberId}`,
-  devices: (memberId: string) => `devices:${memberId}`,
-  scope: (scopeId: string) => `scope:${scopeId}`,
-  laneNames: (laneId: string) => `laneNames:${laneId}`,
-  laneOffer: (laneId: string) => `laneOffer:${laneId}`,
-  endpoint: () => "endpoint",
-};
-
-function initState(genesis: RoomGenesis, genesisHash: string, roomId: string): RoomState {
-  const g = genesis.body;
-  return {
-    roomId,
-    genesisHash,
-    auth: {
-      // Genesis keys are their own lineage roots, with authority start 0 (section 5.1, 5.2).
-      admins: g.admins.map((a) => ({ kid: a.kid, pub: a.pub, fromSeq: 0, toSeq: null, root: a.kid, addedBy: null, since: 0 })),
-      recovery: g.recovery ? { kid: g.recovery.kid, pub: g.recovery.pub, fromSeq: 0, since: 0 } : null,
-      hostKeys: [{ kid: g.host.key.kid, pub: g.host.key.pub, fromSeq: 0, toSeq: null, validFrom: g.host.notBefore, validTo: null }],
-      adminKeyDenylist: {},
-      retiredKeys: {},
-      endpoint: structuredClone(g.endpoint),
-      lanes: {},
-      scopes: {},
-      policy: structuredClone(g.policy),
-      versions: {},
-      closed: false,
-    },
-    members: {},
-    deviceDenylist: {},
-    used: { members: {}, devices: {}, lanes: {}, invites: {}, links: {} },
-    rosterSeq: -1,
-    epoch: null,
-  };
-}
-
-/** I-6 owns the effect of these: key changes, revocation and re-fold, lineages, closure, device holds. */
-const NOT_IN_CORE = new Set<StatementType>([
-  "room.close.proposed",
-  "room.closed",
-  "admin.added",
-  "admin.removed",
-  "admin.key.rotated",
-  "admin.key.revoked",
-  "recovery.key.proposed",
-  "recovery.key.rotated",
-  "host.key.rotated",
-  "host.key.revoked",
-  "device.added",
-  "device.add.vetoed",
-  "device.add.approved",
-  "device.rekeyed",
-  "device.rekey.vetoed",
-  "device.rekey.approved",
-  "device.conflict.resolved",
-]);
 /** Marked "(reserved)" in the catalogue: no defined effect yet. */
 const RESERVED = new Set<StatementType>(["node.certified", "seat.added", "seat.removed"]);
 
-type Producer = { kind: "admin" | "recovery" | "host" | "node"; pub: Uint8Array } | { kind: "device"; pub: Uint8Array; memberId: string; deviceId: string };
+type Producer =
+  | { kind: "admin" | "recovery" | "host" | "node"; kid: string; pub: Uint8Array }
+  | { kind: "device"; kid: string; pub: Uint8Array; memberId: string; deviceId: string };
+
+/** The producer key held in `s` for this statement at `seq` (M-5), or null. */
+function resolveProducer(s: RoomState, sb: StatementBody, seq: number): Producer | null {
+  const kid = sb.producer.kid;
+  const a = s.auth;
+  switch (sb.producer.kind) {
+    case "admin": {
+      if (a.adminKeyDenylist[kid]) return null;
+      const k = a.admins.find((x) => x.kid === kid && x.fromSeq <= seq && (x.toSeq === null || seq <= x.toSeq));
+      return k ? { kind: "admin", kid, pub: b64uDecode(k.pub, 32) } : null;
+    }
+    case "recovery":
+      return a.recovery && a.recovery.kid === kid && a.recovery.fromSeq <= seq ? { kind: "recovery", kid, pub: b64uDecode(a.recovery.pub, 32) } : null;
+    case "host": {
+      const pub = hostKeyAt(s, kid, seq);
+      return pub ? { kind: "host", kid, pub } : null;
+    }
+    case "device":
+      for (const m of Object.values(s.members)) {
+        for (const d of m.devices) {
+          const pub = b64uDecode(d.sig, 32);
+          if (kidOf("ed25519", pub) === kid) return { kind: "device", kid, pub, memberId: m.memberId, deviceId: d.deviceId };
+        }
+      }
+      return null;
+    case "node":
+      // Node keys come from node.certified, which is reserved (section 4.1).
+      return null;
+  }
+}
 
 // ---- the fold ----
 
@@ -206,13 +109,19 @@ export type FoldInputEntry = { signed: unknown; body?: Uint8Array };
  */
 export class RoomLogFold {
   private st: RoomState;
+  private readonly initial: RoomState;
   private readonly hashes: string[] = [];
   private readonly bodySeq = new Map<string, number>();
   /** Forward rule (section 2): the highest base.seq per producer kid among signature-checked statements. */
   private readonly maxBase = new Map<string, number>();
+  /** Accepted statement entries, for the re-fold (section 5.1). */
+  private readonly records: Rec[] = [];
+  private readonly step: Step;
 
   private constructor(state: RoomState) {
-    this.st = state;
+    this.initial = state;
+    this.st = structuredClone(state);
+    this.step = makeStep(this.initial, this.records);
   }
 
   static fromGenesis(genesis: Uint8Array | unknown): RoomLogFold {
@@ -247,11 +156,8 @@ export class RoomLogFold {
     return rosterHash(this.roster());
   }
 
-  /** Raw host key that may sign an entry at `seq` (I-5: genesis host key; rotation and revocation are I-6). */
-  hostKeyAt = (hostKid: string, seq: number): Uint8Array | null => {
-    const k = this.st.auth.hostKeys.find((h) => h.kid === hostKid && h.fromSeq <= seq && (h.toSeq === null || seq <= h.toSeq));
-    return k ? b64uDecode(k.pub, 32) : null;
-  };
+  /** Raw host key that may sign an entry at `seq`, by position only (keys-rotation-recovery.md 3). */
+  hostKeyAt = (hostKid: string, seq: number): Uint8Array | null => hostKeyAt(this.st, hostKid, seq);
 
   append(signed: unknown, body?: Uint8Array): void {
     this.run(signed, body, true);
@@ -305,7 +211,7 @@ export class RoomLogFold {
 
     // Producer allowed for the type, with a key held in the state (M-5), and its signature.
     if (!producerKindAllowed(sb.type, sb.producer.kind)) throw new FoldError(seq, "not_permitted", `${sb.producer.kind} may not sign ${sb.type}`);
-    const producer = this.resolveProducer(sb, seq);
+    const producer = resolveProducer(this.st, sb, seq);
     if (!producer) throw new FoldError(seq, "unknown_producer", `no active ${sb.producer.kind} key with that kid`);
     if (!verifyStatementSig(stmt, producer.pub)) throw new FoldError(seq, "bad_signature", `statement signature does not verify under stmt:${sb.type}`);
 
@@ -322,46 +228,15 @@ export class RoomLogFold {
       if (sb.base.seq < refSeq) throw new FoldError(seq, "base_before_ref", `base.seq ${sb.base.seq} precedes the ref at ${refSeq}`);
     }
 
-    const before = membersFingerprint(this.st.members);
-    const next = structuredClone(this.st);
-    applyStatement(next, sb, entry, producer);
-    if (membersFingerprint(next.members) !== before) next.rosterSeq = seq;
-    next.epoch = entry.epoch;
+    const rec: Rec = { entry, stmt: sb };
+    const next = this.step(this.st, rec, []);
 
     if (!commit) return;
     this.st = next;
     this.hashes.push(signed.hash);
     this.bodySeq.set(entry.bodyHash, seq);
     this.maxBase.set(sb.producer.kid, sb.base.seq);
-  }
-
-  private resolveProducer(sb: StatementBody, seq: number): Producer | null {
-    const kid = sb.producer.kid;
-    const a = this.st.auth;
-    switch (sb.producer.kind) {
-      case "admin": {
-        if (a.adminKeyDenylist[kid]) return null;
-        const k = a.admins.find((x) => x.kid === kid && x.fromSeq <= seq && (x.toSeq === null || seq <= x.toSeq));
-        return k ? { kind: "admin", pub: b64uDecode(k.pub, 32) } : null;
-      }
-      case "recovery":
-        return a.recovery && a.recovery.kid === kid ? { kind: "recovery", pub: b64uDecode(a.recovery.pub, 32) } : null;
-      case "host": {
-        const pub = this.hostKeyAt(kid, seq);
-        return pub ? { kind: "host", pub } : null;
-      }
-      case "device":
-        for (const m of Object.values(this.st.members)) {
-          for (const d of m.devices) {
-            const pub = b64uDecode(d.sig, 32);
-            if (kidOf("ed25519", pub) === kid) return { kind: "device", pub, memberId: m.memberId, deviceId: d.deviceId };
-          }
-        }
-        return null;
-      case "node":
-        // Node keys come from node.certified, which is reserved (section 4.1).
-        return null;
-    }
+    this.records.push(rec);
   }
 }
 
@@ -379,29 +254,67 @@ export function foldLog(genesis: Uint8Array | unknown, entries: readonly FoldInp
   return { fold, error: null };
 }
 
-// ---- apply (mutates the clone it is given) ----
+// ---- one statement: apply or re-fold, then the roster position ----
 
-function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, producer: Producer): void {
-  const seq = entry.seq;
-  const fail = (reason: FoldReason, message: string): never => {
-    throw new FoldError(seq, reason, message);
+/**
+ * The step shared by the live fold and every replay: it resolves the producer in `s` (a key that a
+ * suspect statement installed is gone in a replay, so its statements become void), applies the
+ * statement to a copy of `s` and returns it, or throws FoldError.
+ */
+function makeStep(initial: RoomState, records: readonly Rec[]): Step {
+  const step: Step = (s: RoomState, rec: Rec, imposed: Imposed): RoomState => {
+    const { entry, stmt: sb } = rec;
+    const seq = entry.seq;
+    const fail: Fail = (reason, message) => {
+      throw new FoldError(seq, reason, message);
+    };
+    const producer = resolveProducer(s, sb, seq) ?? fail("unknown_producer", `no active ${sb.producer.kind} key with that kid`);
+    preApply(s, sb, seq, fail);
+    const before = membersFingerprint(s.members);
+    let next: RoomState;
+    if (sb.type === "admin.key.revoked") {
+      const d = sb.data as StatementData<"admin.key.revoked">;
+      checkAdminRevocation(s, d, producer, seq, fail);
+      const re = replay(initial, records, seq, [...imposed, { kid: d.kid, fromSeq: d.fromSeq }], step);
+      // A re-fold that changes the roster makes the revocation the roster position (R-7).
+      re.rosterSeq = s.rosterSeq;
+      next = finishAdminRevocation(s, re, d, seq, fail);
+    } else {
+      next = structuredClone(s);
+      applyStatement(next, sb, entry, producer, fail);
+    }
+    if (membersFingerprint(next.members) !== before) next.rosterSeq = seq;
+    next.epoch = entry.epoch;
+    return next;
   };
-  const type = sb.type;
+  return step;
+}
+
+/** Rules that hold for every statement type. */
+function preApply(s: RoomState, sb: StatementBody, seq: number, fail: Fail): void {
   if (s.auth.closed) fail("room_closed", "no statement is accepted after room.closed");
   // seq 0 is the creator's admission, and only there (section 5).
-  const isCreator = type === "member.admitted" && (sb.data as StatementData<"member.admitted">).confirmation.method === "creator";
+  const isCreator = sb.type === "member.admitted" && (sb.data as StatementData<"member.admitted">).confirmation.method === "creator";
   if (seq === 0 && !isCreator) fail("genesis_admission_required", "seq 0 must be the creator's member.admitted");
   if (seq !== 0 && isCreator) fail("creator_not_at_genesis", `method "creator" at seq ${seq}`);
-  if (NOT_IN_CORE.has(type)) fail("not_implemented", `${type} is folded by milestone I-6`);
-  if (RESERVED.has(type)) fail("reserved_type", `${type} is reserved`);
+  if (RESERVED.has(sb.type)) fail("reserved_type", `${sb.type} is reserved`);
+}
+
+// ---- apply (mutates the clone it is given) ----
+
+function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, producer: Producer, fail: Fail): void {
+  const seq = entry.seq;
+  const hts = entry.hts;
+  const type = sb.type;
 
   const versionOf = (key: string) => s.auth.versions[key] ?? -1;
   const checkVer = (key: string, ver: number) => {
     if (ver !== versionOf(key)) fail("stale_version", `${key}: ver ${ver}, current ${versionOf(key)}`);
   };
   const member = (memberId: string): RosterEntry => s.members[memberId] ?? fail("unknown_member", "member is not in the roster");
-  const deviceOf = (memberId: string) => {
+  const deviceOf = (memberId: string): Extract<Producer, { kind: "device" }> => {
     if (producer.kind !== "device" || producer.memberId !== memberId) fail("not_member_device", "producer is not a device of this member");
+    return producer as Extract<Producer, { kind: "device" }>;
   };
   const lane = (laneId: string): LaneState => {
     const l = s.auth.lanes[laneId] ?? fail("unknown_lane", "lane does not exist");
@@ -410,15 +323,14 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
   };
   const freshDevice = (d: DeviceEntry, seen: Set<string>) => {
     if (s.used.devices[d.deviceId]) fail("id_reused", "deviceId was used before in this room");
-    for (const key of [d.sig, d.dh]) {
-      if (s.deviceDenylist[key] || s.auth.retiredKeys[key] || seen.has(key)) fail("key_reused", "device key is denylisted, retired or already in the roster");
-      seen.add(key);
-    }
+    freshDeviceKeys(d, seen);
+    for (const key of [d.sig, d.dh]) seen.add(key);
   };
-  const rosterKeys = (): Set<string> => {
-    const keys = new Set<string>();
-    for (const m of Object.values(s.members)) for (const d of m.devices) keys.add(d.sig).add(d.dh);
-    return keys;
+  const freshDeviceKeys = (d: Pick<DeviceEntry, "sig" | "dh">, inUse: Set<string>) => {
+    if (d.sig === d.dh) fail("key_reused", "signing and DH key are the same bytes");
+    for (const key of [d.sig, d.dh]) {
+      if (s.deviceDenylist[key] || s.auth.retiredKeys[key] || inUse.has(key)) fail("key_reused", "device key is denylisted, retired or already in use");
+    }
   };
   const retireDevice = (d: DeviceEntry) => {
     for (const key of [d.sig, d.dh]) {
@@ -429,20 +341,145 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
   const retireKey = (pub: string) => {
     s.auth.retiredKeys[pub] = true;
   };
+  /** A key the room certifies now: never retired, and not used for anything else. */
   const freshKey = (pub: string) => {
-    if (s.auth.retiredKeys[pub]) fail("key_reused", "key is retired in this room");
+    if (s.auth.retiredKeys[pub] || keysInUse(s).has(pub)) fail("key_reused", "key is retired or already in use in this room");
   };
+  /** KeyChange checks (keys-rotation-recovery.md section 2). Returns the new signing key. */
+  const keyChange = (ch: KeyChange, newKeySig: string, want: { kind: KeyChange["subject"]["kind"]; id?: string; old: string | null; dh: boolean }): string => {
+    if (ch.roomId !== s.roomId) fail("bad_key_change", "KeyChange names another room");
+    if (ch.subject.kind !== want.kind) fail("bad_key_change", `subject kind must be ${want.kind}`);
+    if (want.id !== undefined && ch.subject.id !== want.id) fail("bad_key_change", "subject id does not name the subject");
+    if (want.kind === "admin" && !isId("member", ch.subject.id)) fail("bad_key_change", "an admin key's subject id is the admin's memberId");
+    if (ch.newSig === null || (ch.newDh !== null) !== want.dh) fail("bad_key_change", "new keys do not fit the subject");
+    if (ch.old !== want.old) fail("stale_version", "KeyChange.old does not name the subject's current key");
+    if (!verifyNewKeySig(ch, newKeySig)) fail("bad_new_key_sig", "newKeySig does not verify under key-change-new");
+    return ch.newSig as string;
+  };
+  const activeAdmin = (kid: string) => activeAdmins(s.auth).find((a) => a.kid === kid);
+  const at = { kid: producer.kid, seq, hts, bodyHash: entry.bodyHash };
 
   switch (type) {
+    // ---- 4.1 authority ----
+    case "admin.added": {
+      const d = sb.data as StatementData<"admin.added">;
+      const pub = keyChange(d.change, d.newKeySig, { kind: "admin", old: null, dh: false });
+      freshKey(pub);
+      const kid = edKid(pub);
+      if (s.auth.adminKeyDenylist[kid]) fail("key_reused", "admin key is denylisted");
+      // A key added by R starts its own lineage; one added by an admin key joins that key's (5.2).
+      const root = producer.kind === "recovery" ? kid : (activeAdmin(producer.kid) ?? fail("unknown_producer", "adding key is not active")).root;
+      s.auth.admins.push({
+        kid,
+        pub,
+        fromSeq: seq + 1,
+        toSeq: null,
+        suspectFromSeq: null,
+        root,
+        addedBy: producer.kind === "recovery" ? "recovery" : producer.kid,
+        since: seq + 1,
+        end: null,
+      });
+      return;
+    }
+    case "admin.removed": {
+      const d = sb.data as StatementData<"admin.removed">;
+      if (d.kid === producer.kid) fail("not_permitted", "an admin key is removed by another admin");
+      const target = activeAdmin(d.kid) ?? fail("unknown_key", "kid is not an active admin key");
+      if (activeAdmins(s.auth).length <= 1) fail("last_admin", "the last admin key cannot be removed");
+      target.toSeq = seq;
+      target.end = "removed";
+      s.auth.adminKeyDenylist[d.kid] = true;
+      retireKey(target.pub);
+      return;
+    }
+    case "admin.key.rotated": {
+      const d = sb.data as StatementData<"admin.key.rotated">;
+      const cur = activeAdmin(producer.kid) ?? fail("unknown_producer", "rotating key is not active");
+      const pub = keyChange(d.change, d.newKeySig, { kind: "admin", old: cur.kid, dh: false });
+      freshKey(pub);
+      const kid = edKid(pub);
+      if (s.auth.adminKeyDenylist[kid]) fail("key_reused", "admin key is denylisted");
+      cur.toSeq = seq;
+      cur.end = "rotated";
+      s.auth.adminKeyDenylist[cur.kid] = true;
+      retireKey(cur.pub);
+      // The new key keeps the lineage and the authority start of the key it replaces (5.1, 5.2).
+      s.auth.admins.push({ kid, pub, fromSeq: seq + 1, toSeq: null, suspectFromSeq: null, root: cur.root, addedBy: cur.addedBy, since: cur.since, end: null });
+      return;
+    }
+    case "recovery.key.proposed": {
+      const d = sb.data as StatementData<"recovery.key.proposed">;
+      if (s.auth.recovery) fail("recovery_exists", "recovery.key.proposed is valid only while the room has no recovery key");
+      freshKey(keyChange(d.change, d.newKeySig, { kind: "recovery", id: "recovery", old: null, dh: false }));
+      proposeRecovery(s, at, d.change, d.exp, fail);
+      return;
+    }
+    case "recovery.key.rotated": {
+      const d = sb.data as StatementData<"recovery.key.rotated">;
+      const cur = s.auth.recovery;
+      if (producer.kind === "recovery" && cur) {
+        if (d.proposal !== null) fail("proposal_not_allowed", "R rotates itself with proposal null");
+        const pub = keyChange(d.change, d.newKeySig, { kind: "recovery", id: "recovery", old: cur.kid, dh: false });
+        freshKey(pub);
+        retireKey(cur.pub);
+        // A rotated recovery key keeps the authority start of the key it replaced.
+        s.auth.recovery = { kid: edKid(pub), pub, fromSeq: seq + 1, since: cur.since };
+        return;
+      }
+      if (cur) fail("recovery_exists", "with a recovery key in place only that key rotates it");
+      const pub = keyChange(d.change, d.newKeySig, { kind: "recovery", id: "recovery", old: null, dh: false });
+      freshKey(pub);
+      confirmFirstRecovery(s, producer.kid, d.change, d.proposal, hts, fail);
+      // A recovery key installed at i cannot reach back before i + 1 (5.2).
+      s.auth.recovery = { kid: edKid(pub), pub, fromSeq: seq + 1, since: seq + 1 };
+      return;
+    }
+    case "host.key.rotated": {
+      const d = sb.data as StatementData<"host.key.rotated">;
+      const cur = s.auth.hostKeys.find((h) => h.toSeq === null) ?? fail("unknown_key", "no current host key");
+      const pub = keyChange(d.change, d.newKeySig, { kind: "host", id: "host", old: cur.kid, dh: false });
+      freshKey(pub);
+      // This entry is the last one the old key signs; grants from it stay valid until oldValidTo.
+      cur.toSeq = seq;
+      cur.validTo = d.oldValidTo;
+      retireKey(cur.pub);
+      s.auth.hostKeys.push({ kid: edKid(pub), pub, fromSeq: seq + 1, toSeq: null, suspectFromSeq: null, validFrom: Math.floor(hts / 1000), validTo: null, revoked: false });
+      return;
+    }
+    case "host.key.revoked": {
+      revokeHostKey(s, sb.data as StatementData<"host.key.revoked">, producer, seq, fail);
+      return;
+    }
+    case "room.close.proposed": {
+      const d = sb.data as StatementData<"room.close.proposed">;
+      proposeClose(s, at, d.exp, fail);
+      return;
+    }
+    case "room.closed": {
+      const d = sb.data as StatementData<"room.closed">;
+      if (producer.kind === "recovery") {
+        if (d.proposal !== null) fail("proposal_not_allowed", "R closes with proposal null");
+      } else {
+        if (d.proposal === null) fail("proposal_required", "an admin key closes only by confirming an independent admin's proposal");
+        confirmClose(s, producer.kid, d.proposal, { seq, hts }, fail);
+      }
+      s.auth.closed = true;
+      return;
+    }
+    // ---- 4.3 membership ----
     case "member.admitted": {
       const d = sb.data as StatementData<"member.admitted">;
       const m = d.member;
       if (s.used.members[m.memberId]) fail("id_reused", "memberId was used before in this room");
-      const seen = rosterKeys();
+      const seen = keysInUse(s);
       for (const dev of m.devices) freshDevice(dev, seen);
       s.members[m.memberId] = { memberId: m.memberId, role: m.role, lanes: [...m.lanes], devices: sortDevices(m.devices) };
       s.used.members[m.memberId] = true;
-      for (const dev of m.devices) s.used.devices[dev.deviceId] = true;
+      for (const dev of m.devices) {
+        s.used.devices[dev.deviceId] = true;
+        s.deviceSince[dev.deviceId] = hts;
+      }
       // Initial versions of the member's fields: the admission entry (section 4.0).
       s.auth.versions[versionKey.role(m.memberId)] = seq;
       s.auth.versions[versionKey.lanes(m.memberId)] = seq;
@@ -471,7 +508,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       const m = member(d.memberId);
       for (const dev of m.devices) retireDevice(dev);
       delete s.members[d.memberId];
-      // I-6: cancel the member's pending adds and rekeys.
+      cancelRequests(s, (p) => p.memberId === d.memberId);
       return;
     }
     case "member.left": {
@@ -481,6 +518,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       if (m.devices.length !== 1) fail("not_sole_device", "member.left needs the member's only active device");
       for (const dev of m.devices) retireDevice(dev);
       delete s.members[d.memberId];
+      cancelRequests(s, (p) => p.memberId === d.memberId);
       return;
     }
     case "member.device.replaced": {
@@ -488,13 +526,106 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       const m = member(d.memberId);
       checkVer(versionKey.devices(d.memberId), d.ver);
       const removed = d.removed.map((id) => m.devices.find((x) => x.deviceId === id) ?? fail("unknown_device", "removed device is not the member's"));
-      freshDevice(d.added, rosterKeys());
+      freshDevice(d.added, keysInUse(s));
       const kept = m.devices.filter((x) => !d.removed.includes(x.deviceId));
       if (kept.length + 1 > 8) fail("too_many_devices", "a member has at most 8 devices");
-      for (const dev of removed) retireDevice(dev);
+      for (const dev of removed) {
+        retireDevice(dev);
+        cancelRequests(s, byOrForDevice(dev.deviceId));
+      }
       m.devices = sortDevices([...kept, d.added]);
       s.used.devices[d.added.deviceId] = true;
+      s.deviceSince[d.added.deviceId] = hts;
       s.auth.versions[versionKey.devices(d.memberId)] = seq;
+      return;
+    }
+    case "device.added": {
+      const d = sb.data as StatementData<"device.added">;
+      const requester = deviceOf(d.memberId);
+      if (d.addedBy !== requester.deviceId) fail("not_permitted", "addedBy must be the signing device");
+      const m = member(d.memberId);
+      keyChange(d.change, d.newKeySig, { kind: "device", id: d.device.deviceId, old: null, dh: true });
+      if (d.change.newSig !== d.device.sig || d.change.newDh !== d.device.dh) fail("bad_key_change", "KeyChange keys differ from the device entry");
+      // The link the SAS was run on: created by a device of this member, used once.
+      const linkRef = d.confirmation.linkRef;
+      if (s.used.links[linkRef] !== d.memberId) fail("unknown_link", "linkRef names no device link of this member");
+      if (s.used.linksConsumed[linkRef]) fail("link_used", "the link already added a device");
+      freshDevice(d.device, keysInUse(s));
+      // The deviceId is taken from the request on, so a request that is pending again after a re-fold keeps it.
+      s.used.devices[d.device.deviceId] = true;
+      s.used.linksConsumed[linkRef] = true;
+      const since = s.deviceSince[requester.deviceId] ?? hts;
+      openRequest(s, entry.bodyHash, {
+        kind: "add",
+        memberId: d.memberId,
+        deviceId: d.device.deviceId,
+        requester: requester.deviceId,
+        device: structuredClone(d.device),
+        seq,
+        hts,
+        sole: m.devices.length === 1,
+        young: hts - since < YOUNG_DEVICE_MS,
+      });
+      return;
+    }
+    case "device.rekeyed": {
+      const d = sb.data as StatementData<"device.rekeyed">;
+      if (producer.kind !== "device") return fail("not_permitted", "a device rekeys itself");
+      const m = member(producer.memberId);
+      const dev = m.devices.find((x) => x.deviceId === producer.deviceId) ?? fail("unknown_device", "device is not in the roster");
+      const sig = keyChange(d.change, d.newKeySig, { kind: "device", id: dev.deviceId, old: edKid(dev.sig), dh: true });
+      const next = { ...dev, sig, dh: d.change.newDh as string };
+      freshDeviceKeys(next, keysInUse(s));
+      openRequest(s, entry.bodyHash, {
+        kind: "rekey",
+        memberId: m.memberId,
+        deviceId: dev.deviceId,
+        requester: dev.deviceId,
+        device: next,
+        seq,
+        hts,
+        sole: m.devices.length === 1,
+        young: false,
+      });
+      return;
+    }
+    case "device.add.vetoed":
+    case "device.rekey.vetoed": {
+      const d = sb.data as StatementData<"device.add.vetoed">;
+      deviceOf(d.memberId);
+      vetoRequest(s, type === "device.add.vetoed" ? "add" : "rekey", d.memberId, d.ref, seq, fail);
+      return;
+    }
+    case "device.conflict.resolved": {
+      const d = sb.data as StatementData<"device.conflict.resolved">;
+      resolveConflict(s, d.memberId, d.ver, seq, fail);
+      return;
+    }
+    case "device.add.approved": {
+      const d = sb.data as StatementData<"device.add.approved">;
+      const p = checkApproval(s, "add", d, hts, fail);
+      const m = member(d.memberId);
+      if (m.devices.length + 1 > 8) fail("too_many_devices", "a member has at most 8 devices");
+      freshDeviceKeys(p.device, keysInUse(s));
+      m.devices = sortDevices([...m.devices, structuredClone(p.device)]);
+      s.deviceSince[p.deviceId] = hts;
+      s.auth.versions[versionKey.devices(d.memberId)] = seq;
+      p.status = "approved";
+      return;
+    }
+    case "device.rekey.approved": {
+      const d = sb.data as StatementData<"device.rekey.approved">;
+      const p = checkApproval(s, "rekey", d, hts, fail);
+      const m = member(d.memberId);
+      const dev = m.devices.find((x) => x.deviceId === d.deviceId) ?? fail("unknown_device", "device is not in the roster");
+      freshDeviceKeys(p.device, keysInUse(s));
+      retireDevice(dev);
+      dev.sig = p.device.sig;
+      dev.dh = p.device.dh;
+      s.auth.versions[versionKey.devices(d.memberId)] = seq;
+      p.status = "approved";
+      // Requests signed by the old key are cancelled (section 4.3, R-8).
+      cancelRequests(s, (q) => q.requester === d.deviceId);
       return;
     }
     case "device.removed": {
@@ -509,7 +640,8 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       retireDevice(dev);
       m.devices = m.devices.filter((x) => x.deviceId !== d.deviceId);
       s.auth.versions[versionKey.devices(d.memberId)] = seq;
-      // I-6: cancel the device's own pending rekey and every pending request it made.
+      // Cancels the device's own pending rekey and every pending request it made (R-8).
+      cancelRequests(s, byOrForDevice(d.deviceId));
       return;
     }
     case "scope.membership.changed": {
@@ -539,6 +671,7 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       s.auth.versions[versionKey.endpoint()] = seq;
       return;
     }
+    // ---- 4.4 lanes ----
     case "lane.created": {
       const d = sb.data as StatementData<"lane.created">;
       if (s.used.lanes[d.laneId]) fail("id_reused", "laneId was used before in this room");
@@ -575,20 +708,21 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
       const l = lane(d.laneId);
       if (l.status === "open") {
         l.status = "degraded";
-        l.degradedAtHts = entry.hts;
+        l.degradedAtHts = hts;
       }
       return;
     }
     case "lane.closed": {
       const d = sb.data as StatementData<"lane.closed">;
       const l = lane(d.laneId);
-      if (producer.kind === "host" && !(l.status === "degraded" && l.degradedAtHts !== null && entry.hts - l.degradedAtHts >= LANE_DEGRADED_CLOSE_MS)) {
+      if (producer.kind === "host" && !(l.status === "degraded" && l.degradedAtHts !== null && hts - l.degradedAtHts >= LANE_DEGRADED_CLOSE_MS)) {
         fail("not_permitted", "the host closes a lane only after lane.degraded for 24 h");
       }
       l.status = "closed";
       retireKey(l.offer.dh.pub);
       return;
     }
+    // ---- 4.2 invites and links ----
     case "invite.created": {
       const d = sb.data as StatementData<"invite.created">;
       if (s.used.invites[d.inviteRef]) fail("id_reused", "invite already exists");
@@ -625,6 +759,8 @@ function applyStatement(s: RoomState, sb: StatementBody, entry: LogEntry, produc
     case "producer.fence":
       return;
     default:
+      // admin.key.revoked is handled by the step (re-fold); reserved types never reach apply.
       fail("not_implemented", `${type} has no fold rule`);
   }
 }
+

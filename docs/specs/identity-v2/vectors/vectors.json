@@ -1435,6 +1435,428 @@
           "expect": "hold_not_elapsed"
         }
       ]
+    },
+    "vetoed": {
+      "name": "approvalAfterVeto",
+      "note": "the laptop, the device being rekeyed, vetoed the rekey at seq 5; the approval names the vetoed request",
+      "chain": [
+        {
+          "entry": {
+            "v": 2,
+            "typ": "log-entry",
+            "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+            "seq": 4,
+            "prev": "FjU-d13p3hl27GncIF1_q1Cb2L3ffrxFgUV-N97yPwk",
+            "hts": 1793405100100,
+            "epoch": 0,
+            "cls": "stmt",
+            "type": "device.rekeyed",
+            "bodyHash": "VVZn00jhPv1behddR1KDgeRKKHgZxSoZ6K5O4-QXLeo",
+            "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+          },
+          "hash": "PU-Edz1-Cfc0fV8lmWnAKRzjEdpBPJ-dzb0DPYIStSg",
+          "hsig": "fIT-8ZfwXi05FPn-pV7pimIpMIyn1ioQo8hhFDuSNHJvkgdHY93tS6Y2rFh0-gbB8Es-3Nhx0WgCZ3YKEBkCBA",
+          "statement": {
+            "body": {
+              "v": 2,
+              "typ": "stmt",
+              "type": "device.rekeyed",
+              "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+              "producer": {
+                "kind": "device",
+                "kid": "xrjwUHSKBmXBuXqn0yamgNEF6Xu_QoDCC6jVT4YLk2w"
+              },
+              "base": {
+                "seq": 3,
+                "hash": "FjU-d13p3hl27GncIF1_q1Cb2L3ffrxFgUV-N97yPwk"
+              },
+              "ts": 1793405100000,
+              "data": {
+                "change": {
+                  "v": 2,
+                  "typ": "key-change",
+                  "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+                  "subject": {
+                    "kind": "device",
+                    "id": "dev_486180968f32e4ea081013c5a32a637e"
+                  },
+                  "old": "xrjwUHSKBmXBuXqn0yamgNEF6Xu_QoDCC6jVT4YLk2w",
+                  "newSig": "ALTxn1A7aZ4WTro-4EwArdAwBowCfh7Ac7dGokjpjpM",
+                  "newDh": "bGBNOOyQJwZJPaOMISs4dxNKhRZGZI1ERK5mWxRCokw"
+                },
+                "newKeySig": "vf0kqElONL1Fp9k5AdXoxCJQN2V8-Dvu7-uiCBkVM9geMekONPcFnvhoJYMFY9oLXchCF-PF8d7UbH-pJh0nAg"
+              }
+            },
+            "sig": "Gic3eqjPFHvY9OTv5fWdE0vcOGsqgjWnbrC8u2Rj7IigexrsBxJYq5Yditvxt1oBptONURv0BSxZV-GWsY7DCg"
+          }
+        },
+        {
+          "entry": {
+            "v": 2,
+            "typ": "log-entry",
+            "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+            "seq": 5,
+            "prev": "PU-Edz1-Cfc0fV8lmWnAKRzjEdpBPJ-dzb0DPYIStSg",
+            "hts": 1793408700100,
+            "epoch": 0,
+            "cls": "stmt",
+            "type": "device.rekey.vetoed",
+            "bodyHash": "YEPyndwbi-_SSaBxCOeeDPtFQftqoESglbOxfJKc-Yw",
+            "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+          },
+          "hash": "mKxwiGLYyGKx3En9comy5EecIrKbOx_IOBflRcdswpw",
+          "hsig": "sYjN5Rjr3tU7zgU4bS25LRels17Vb4zAi9CWZCs6dNfRuLG2Uez2YgD2MYCdJfEP6s1qS0WAf2pvM0sp9CORDA",
+          "statement": {
+            "body": {
+              "v": 2,
+              "typ": "stmt",
+              "type": "device.rekey.vetoed",
+              "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+              "producer": {
+                "kind": "device",
+                "kid": "xrjwUHSKBmXBuXqn0yamgNEF6Xu_QoDCC6jVT4YLk2w"
+              },
+              "base": {
+                "seq": 4,
+                "hash": "PU-Edz1-Cfc0fV8lmWnAKRzjEdpBPJ-dzb0DPYIStSg"
+              },
+              "ts": 1793408700000,
+              "data": {
+                "memberId": "mem_3f601ad1dc407d5d4aba0078cdfd73ee",
+                "ref": "VVZn00jhPv1behddR1KDgeRKKHgZxSoZ6K5O4-QXLeo"
+              }
+            },
+            "sig": "UluAaXbwADj3X7jK7GV01X1pdRue8XvRiK_zfq0w2VluA-OUR5GIl2WlOIsIs-hb9kDBcEZYpYc5Fv1afnRICw"
+          }
+        }
+      ],
+      "entry": {
+        "entry": {
+          "v": 2,
+          "typ": "log-entry",
+          "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+          "seq": 6,
+          "prev": "mKxwiGLYyGKx3En9comy5EecIrKbOx_IOBflRcdswpw",
+          "hts": 1793667900100,
+          "epoch": 0,
+          "cls": "stmt",
+          "type": "device.rekey.approved",
+          "bodyHash": "jn_D8FGfibnimjvqb_Q0sjePPS0FkjD-m0LaLzBQCJU",
+          "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+        },
+        "hash": "doD2bAn9SkF-sNo9LC7vYIcqeJGKNZFb2Zf6khnlzzQ",
+        "hsig": "N_4pHluCbQCu0iuKAOxs9VJfG5WUqRXw3qR8jOyoA0Y1eclZF5KFtsf8-KpfkMR7CuwpmBFYhwg5a55Pwwf2DQ"
+      },
+      "statement": {
+        "body": {
+          "v": 2,
+          "typ": "stmt",
+          "type": "device.rekey.approved",
+          "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+          "producer": {
+            "kind": "admin",
+            "kid": "Y1HZddwrVn1IBIEAwhMb11ky5y_MMbACM8Q_7ajtZQQ"
+          },
+          "base": {
+            "seq": 5,
+            "hash": "mKxwiGLYyGKx3En9comy5EecIrKbOx_IOBflRcdswpw"
+          },
+          "ts": 1793667900000,
+          "data": {
+            "memberId": "mem_3f601ad1dc407d5d4aba0078cdfd73ee",
+            "deviceId": "dev_486180968f32e4ea081013c5a32a637e",
+            "ref": "VVZn00jhPv1behddR1KDgeRKKHgZxSoZ6K5O4-QXLeo",
+            "mode": "auto"
+          }
+        },
+        "sig": "5hdDdooZVhaADvrdTo2Hoow51sx63m_fK5eb_kO2wLc7zektmASO49_H84t6o4MOq4jZdApsec2YajjR-ETCCQ"
+      },
+      "expect": "vetoed"
+    },
+    "soleDeviceChangeAdmin": {
+      "prefix": "log.entries[0..3], then these entries at seq 4 to 6",
+      "entries": [
+        {
+          "entry": {
+            "v": 2,
+            "typ": "log-entry",
+            "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+            "seq": 4,
+            "prev": "FjU-d13p3hl27GncIF1_q1Cb2L3ffrxFgUV-N97yPwk",
+            "hts": 1793401500100,
+            "epoch": 0,
+            "cls": "stmt",
+            "type": "room.policy.changed",
+            "bodyHash": "2ouk7s8_FRsp8jJNhuZb3C7QzS_71KlS1OPQKoZS4fE",
+            "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+          },
+          "hash": "mAWFpabkkLXi_BnZMx8hu5Y8hHOHsJqXsr9jkpZUyHw",
+          "hsig": "6pHTlMWa8IgBAD6ghHu5piililAz87-cgiUDO6UZ_0J_mVxXXC7sxdb7NUH9di9ZDAAyPOHIwq7Drz-EtKDeDw",
+          "statement": {
+            "body": {
+              "v": 2,
+              "typ": "stmt",
+              "type": "room.policy.changed",
+              "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+              "producer": {
+                "kind": "admin",
+                "kid": "Y1HZddwrVn1IBIEAwhMb11ky5y_MMbACM8Q_7ajtZQQ"
+              },
+              "base": {
+                "seq": 3,
+                "hash": "FjU-d13p3hl27GncIF1_q1Cb2L3ffrxFgUV-N97yPwk"
+              },
+              "ts": 1793401500000,
+              "data": {
+                "changes": [
+                  {
+                    "setting": "soleDeviceChange",
+                    "value": "admin",
+                    "ver": -1
+                  }
+                ]
+              }
+            },
+            "sig": "Z2QB0kSwSR2qQTD0RqftuZApKnH8kbElk5VBYgQMZEARYoyX1VS_pBJxJi407Aa51YJbzCi9ng_H33N-nL5HCw"
+          }
+        },
+        {
+          "entry": {
+            "v": 2,
+            "typ": "log-entry",
+            "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+            "seq": 5,
+            "prev": "mAWFpabkkLXi_BnZMx8hu5Y8hHOHsJqXsr9jkpZUyHw",
+            "hts": 1793405100100,
+            "epoch": 0,
+            "cls": "stmt",
+            "type": "device.rekeyed",
+            "bodyHash": "i5v3Sq4orrgneL9BBpNz3hyLhjL5p5uRxXRF_QiW3Jg",
+            "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+          },
+          "hash": "6IUA1ugLBCLHMTwwMvCNoG-Sjrrnon3G0hZhUqcSWK4",
+          "hsig": "uip3FXp1AYBMegWdv99HeHaXDzZwJbXQFMeQIlUZuGGR4XcDiqjUqSRrPLcZgnVIiSeOnvJCha9HugzLVnQsBA",
+          "statement": {
+            "body": {
+              "v": 2,
+              "typ": "stmt",
+              "type": "device.rekeyed",
+              "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+              "producer": {
+                "kind": "device",
+                "kid": "xrjwUHSKBmXBuXqn0yamgNEF6Xu_QoDCC6jVT4YLk2w"
+              },
+              "base": {
+                "seq": 4,
+                "hash": "mAWFpabkkLXi_BnZMx8hu5Y8hHOHsJqXsr9jkpZUyHw"
+              },
+              "ts": 1793405100000,
+              "data": {
+                "change": {
+                  "v": 2,
+                  "typ": "key-change",
+                  "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+                  "subject": {
+                    "kind": "device",
+                    "id": "dev_486180968f32e4ea081013c5a32a637e"
+                  },
+                  "old": "xrjwUHSKBmXBuXqn0yamgNEF6Xu_QoDCC6jVT4YLk2w",
+                  "newSig": "ALTxn1A7aZ4WTro-4EwArdAwBowCfh7Ac7dGokjpjpM",
+                  "newDh": "bGBNOOyQJwZJPaOMISs4dxNKhRZGZI1ERK5mWxRCokw"
+                },
+                "newKeySig": "vf0kqElONL1Fp9k5AdXoxCJQN2V8-Dvu7-uiCBkVM9geMekONPcFnvhoJYMFY9oLXchCF-PF8d7UbH-pJh0nAg"
+              }
+            },
+            "sig": "5Hhdc2gb3AwbLWUJ2lYrM3b5BkR80qt14XIVPGbVgv6IJe53JKVqIjxKwjowcUxRwIXep8HraDYStx4CoA0WDw"
+          }
+        },
+        {
+          "entry": {
+            "v": 2,
+            "typ": "log-entry",
+            "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+            "seq": 6,
+            "prev": "6IUA1ugLBCLHMTwwMvCNoG-Sjrrnon3G0hZhUqcSWK4",
+            "hts": 1793408700100,
+            "epoch": 0,
+            "cls": "stmt",
+            "type": "device.rekey.approved",
+            "bodyHash": "NQb1-DK6H9u7idHIucj1nnrQwg0VriRZKblPI-9SjhE",
+            "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+          },
+          "hash": "JNUP7b2YSMTu2uXlIXUsCmsJLZnzRfrjhTmPT5HR0Xs",
+          "hsig": "aM4Pigz43sfey5ayL48zoaDhL0_rswFWlOvUl33ChF1muCqp6UYI2j73eRVdYBMLhsFZyXq-Uexw1Cu4mmQFBA",
+          "statement": {
+            "body": {
+              "v": 2,
+              "typ": "stmt",
+              "type": "device.rekey.approved",
+              "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+              "producer": {
+                "kind": "admin",
+                "kid": "Y1HZddwrVn1IBIEAwhMb11ky5y_MMbACM8Q_7ajtZQQ"
+              },
+              "base": {
+                "seq": 5,
+                "hash": "6IUA1ugLBCLHMTwwMvCNoG-Sjrrnon3G0hZhUqcSWK4"
+              },
+              "ts": 1793408700000,
+              "data": {
+                "memberId": "mem_3f601ad1dc407d5d4aba0078cdfd73ee",
+                "deviceId": "dev_486180968f32e4ea081013c5a32a637e",
+                "ref": "i5v3Sq4orrgneL9BBpNz3hyLhjL5p5uRxXRF_QiW3Jg",
+                "mode": "admin"
+              }
+            },
+            "sig": "qoNMN6Zxs6-vp3e0J8TG-v4rUZfuNMnuCcwZWNZl6KKPOyc8w-nK51hkvBNzDV1XODxHjywmflEzzCBDK-3QAw"
+          }
+        }
+      ],
+      "note": "room.policy.changed sets soleDeviceChange to \"admin\"; the sole device requests a rekey; an admin approves it interactively 1 h later",
+      "cases": [
+        {
+          "name": "autoApprovalAfterHold",
+          "note": "under soleDeviceChange \"admin\" a sole-device rekey needs an interactive admin approval, whatever the hold",
+          "chain": [
+            {
+              "entry": {
+                "v": 2,
+                "typ": "log-entry",
+                "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+                "seq": 4,
+                "prev": "FjU-d13p3hl27GncIF1_q1Cb2L3ffrxFgUV-N97yPwk",
+                "hts": 1793401500100,
+                "epoch": 0,
+                "cls": "stmt",
+                "type": "room.policy.changed",
+                "bodyHash": "2ouk7s8_FRsp8jJNhuZb3C7QzS_71KlS1OPQKoZS4fE",
+                "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+              },
+              "hash": "mAWFpabkkLXi_BnZMx8hu5Y8hHOHsJqXsr9jkpZUyHw",
+              "hsig": "6pHTlMWa8IgBAD6ghHu5piililAz87-cgiUDO6UZ_0J_mVxXXC7sxdb7NUH9di9ZDAAyPOHIwq7Drz-EtKDeDw",
+              "statement": {
+                "body": {
+                  "v": 2,
+                  "typ": "stmt",
+                  "type": "room.policy.changed",
+                  "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+                  "producer": {
+                    "kind": "admin",
+                    "kid": "Y1HZddwrVn1IBIEAwhMb11ky5y_MMbACM8Q_7ajtZQQ"
+                  },
+                  "base": {
+                    "seq": 3,
+                    "hash": "FjU-d13p3hl27GncIF1_q1Cb2L3ffrxFgUV-N97yPwk"
+                  },
+                  "ts": 1793401500000,
+                  "data": {
+                    "changes": [
+                      {
+                        "setting": "soleDeviceChange",
+                        "value": "admin",
+                        "ver": -1
+                      }
+                    ]
+                  }
+                },
+                "sig": "Z2QB0kSwSR2qQTD0RqftuZApKnH8kbElk5VBYgQMZEARYoyX1VS_pBJxJi407Aa51YJbzCi9ng_H33N-nL5HCw"
+              }
+            },
+            {
+              "entry": {
+                "v": 2,
+                "typ": "log-entry",
+                "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+                "seq": 5,
+                "prev": "mAWFpabkkLXi_BnZMx8hu5Y8hHOHsJqXsr9jkpZUyHw",
+                "hts": 1793405100100,
+                "epoch": 0,
+                "cls": "stmt",
+                "type": "device.rekeyed",
+                "bodyHash": "i5v3Sq4orrgneL9BBpNz3hyLhjL5p5uRxXRF_QiW3Jg",
+                "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+              },
+              "hash": "6IUA1ugLBCLHMTwwMvCNoG-Sjrrnon3G0hZhUqcSWK4",
+              "hsig": "uip3FXp1AYBMegWdv99HeHaXDzZwJbXQFMeQIlUZuGGR4XcDiqjUqSRrPLcZgnVIiSeOnvJCha9HugzLVnQsBA",
+              "statement": {
+                "body": {
+                  "v": 2,
+                  "typ": "stmt",
+                  "type": "device.rekeyed",
+                  "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+                  "producer": {
+                    "kind": "device",
+                    "kid": "xrjwUHSKBmXBuXqn0yamgNEF6Xu_QoDCC6jVT4YLk2w"
+                  },
+                  "base": {
+                    "seq": 4,
+                    "hash": "mAWFpabkkLXi_BnZMx8hu5Y8hHOHsJqXsr9jkpZUyHw"
+                  },
+                  "ts": 1793405100000,
+                  "data": {
+                    "change": {
+                      "v": 2,
+                      "typ": "key-change",
+                      "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+                      "subject": {
+                        "kind": "device",
+                        "id": "dev_486180968f32e4ea081013c5a32a637e"
+                      },
+                      "old": "xrjwUHSKBmXBuXqn0yamgNEF6Xu_QoDCC6jVT4YLk2w",
+                      "newSig": "ALTxn1A7aZ4WTro-4EwArdAwBowCfh7Ac7dGokjpjpM",
+                      "newDh": "bGBNOOyQJwZJPaOMISs4dxNKhRZGZI1ERK5mWxRCokw"
+                    },
+                    "newKeySig": "vf0kqElONL1Fp9k5AdXoxCJQN2V8-Dvu7-uiCBkVM9geMekONPcFnvhoJYMFY9oLXchCF-PF8d7UbH-pJh0nAg"
+                  }
+                },
+                "sig": "5Hhdc2gb3AwbLWUJ2lYrM3b5BkR80qt14XIVPGbVgv6IJe53JKVqIjxKwjowcUxRwIXep8HraDYStx4CoA0WDw"
+              }
+            }
+          ],
+          "entry": {
+            "entry": {
+              "v": 2,
+              "typ": "log-entry",
+              "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+              "seq": 6,
+              "prev": "6IUA1ugLBCLHMTwwMvCNoG-Sjrrnon3G0hZhUqcSWK4",
+              "hts": 1793664300100,
+              "epoch": 0,
+              "cls": "stmt",
+              "type": "device.rekey.approved",
+              "bodyHash": "qwbsJcQHJbg1KfWZEkVZ0U9p70P83biecfX4JwveC8U",
+              "hostKid": "qGvcyHVKtbq2Jhoy9yKVcCkQV7_8ALz5TFgs38Sd1Qo"
+            },
+            "hash": "5n97YyaFO7qh5Wb0UAToihVDRr5UyPuHUIJrU320fUQ",
+            "hsig": "ZOBim4x15YN68V0eOdX5tgB_Uu9INRg5cSg6Ft4k5bFwV_8exy96GTVz1uYMqcY1dG1WHbhSq1TjkNuH4DfxCg"
+          },
+          "statement": {
+            "body": {
+              "v": 2,
+              "typ": "stmt",
+              "type": "device.rekey.approved",
+              "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+              "producer": {
+                "kind": "admin",
+                "kid": "Y1HZddwrVn1IBIEAwhMb11ky5y_MMbACM8Q_7ajtZQQ"
+              },
+              "base": {
+                "seq": 5,
+                "hash": "6IUA1ugLBCLHMTwwMvCNoG-Sjrrnon3G0hZhUqcSWK4"
+              },
+              "ts": 1793664300000,
+              "data": {
+                "memberId": "mem_3f601ad1dc407d5d4aba0078cdfd73ee",
+                "deviceId": "dev_486180968f32e4ea081013c5a32a637e",
+                "ref": "i5v3Sq4orrgneL9BBpNz3hyLhjL5p5uRxXRF_QiW3Jg",
+                "mode": "auto"
+              }
+            },
+            "sig": "3itnr6Tu32s4MeQwbwE7mhSvEsAC7aP0C9RRAyb1Gm1AUr-Z31StkiqhuUN-VITGQ_YoMWUHSdbkzfukQFDHBQ"
+          },
+          "expect": "auto_not_allowed"
+        }
+      ]
     }
   },
   "statements": {

@@ -4,7 +4,7 @@
 // does, is decided by the fold (fold.ts), not here.
 import { z } from "zod";
 import { b64uDecode } from "../proto/b64u";
-import { stmtContext } from "../proto/contexts";
+import { CTX_KEY_CHANGE_NEW, stmtContext } from "../proto/contexts";
 import { verify } from "../proto/keys";
 import { rjcs } from "../proto/rjcs";
 import {
@@ -261,6 +261,15 @@ export function producerKindAllowed(type: StatementType, kind: ProducerKind): bo
 /** Sign check under `stmt:<type>` over RJCS(body), with a key the verifier already holds (M-5). */
 export function verifyStatementSig(stmt: SignedStatement, producerPub: Uint8Array): boolean {
   return verify(producerPub, stmtContext(stmt.body.type), rjcs(stmt.body), b64uDecode(stmt.sig, 64));
+}
+
+/**
+ * `newKeySig` over RJCS(change) under `key-change-new`, by the new signing key the change names
+ * (keys-rotation-recovery.md section 2). False when the change names no signing key.
+ */
+export function verifyNewKeySig(change: KeyChange, newKeySig: string): boolean {
+  if (change.newSig === null) return false;
+  return verify(b64uDecode(change.newSig, 32), CTX_KEY_CHANGE_NEW, rjcs(change), b64uDecode(newKeySig, 64));
 }
 
 /** The `ref` or `proposal` a statement names, if any (room-log-v2.md section 5, ref rule). */
