@@ -2,7 +2,10 @@
 // hello.sessionPermissions (honoured per permission on 0.13.2; security spike).
 // The local credential is read from $PASEO_HOME and never logged.
 import { readFileSync } from "node:fs";
+import { connect } from "node:net";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { parseHostTarget } from "@getpaseo/protocol/host-target";
 import WebSocket from "ws";
 import { FIELD_POLICY } from "../room-profile/generated";
 import { REDACTORS } from "../room-profile/sanitize";
@@ -25,15 +28,57 @@ export function readLocalCredential(home: string): string | undefined {
   }
 }
 
-export function daemonWsUrl(home: string): string {
-  const listen = readListen(home);
-  if (listen.startsWith("/")) return `ws+unix://${listen}:/ws`;
-  if (listen.startsWith("unix:")) return `ws+unix://${listen.slice(5)}:/ws`;
-  return `ws://${listen}/ws`;
+/** Where to open the upstream socket: a ws URL, plus a socket path for named pipes and unix sockets. */
+export interface DaemonTarget {
+  url: string;
+  socketPath?: string;
+}
+
+const WILDCARD_HOSTS: Record<string, string> = { "0.0.0.0": "127.0.0.1", "[::]": "[::1]" };
+
+/**
+ * Maps the daemon's listen address (paseo.pid `listen`, written by Paseo's formatListenTarget) to a
+ * connect target (cross-platform audit X-3). Parsed with @getpaseo/protocol's parseHostTarget, the
+ * grammar Paseo's own client uses. Forms: `host:port` (wildcard binds 0.0.0.0 and [::] map to
+ * loopback), `/abs/sock`, `~/sock`, `unix:///sock`, the older `unix:/sock`, `\\.\pipe\name` and
+ * `pipe://name`. Pipes and unix sockets connect to ws://localhost/ws over a socket opened on that
+ * path. Relay, ssh and ws(s) URLs are not listen addresses and are refused.
+ * Windows pipes and macOS are untested; the logic is unit-tested on Linux.
+ */
+export function daemonTargetFromListen(listen: string, home: () => string = homedir): DaemonTarget {
+  let input = listen.trim();
+  if (input.startsWith("unix:") && !input.startsWith("unix://")) input = `unix://${input.slice("unix:".length)}`;
+  let target;
+  try {
+    target = parseHostTarget(input);
+  } catch {
+    throw new Error("daemon listen address in paseo.pid is not a supported form");
+  }
+  if (target.kind !== "socket" || target.offer || target.password !== undefined)
+    throw new Error("daemon listen address in paseo.pid is not a local address");
+  if (target.socketPath !== undefined) {
+    let socketPath = target.socketPath;
+    if (socketPath.startsWith("~/") || socketPath.startsWith("~\\")) socketPath = join(home(), socketPath.slice(2));
+    else if (socketPath.startsWith("~")) throw new Error("daemon listen address in paseo.pid uses an unsupported ~user path");
+    return { url: "ws://localhost/ws", socketPath };
+  }
+  const url = new URL(target.url);
+  if (url.protocol !== "ws:") throw new Error("daemon listen address in paseo.pid is not a local address");
+  const loopback = WILDCARD_HOSTS[url.hostname];
+  if (loopback) url.hostname = loopback;
+  return { url: url.toString() };
+}
+
+export function daemonTarget(home: string): DaemonTarget {
+  return daemonTargetFromListen(readListen(home));
 }
 
 export function openDaemonSocket(home: string, maxPayload = 32 * 1024 * 1024): WebSocket {
-  return new WebSocket(daemonWsUrl(home), { maxPayload, perMessageDeflate: false });
+  const target = daemonTarget(home);
+  const socketPath = target.socketPath;
+  // ws 8.22 ignores a `socketPath` option (initAsClient resets it), so pipes and unix sockets are
+  // opened through createConnection instead.
+  return new WebSocket(target.url, { maxPayload, perMessageDeflate: false, ...(socketPath !== undefined ? { createConnection: () => connect({ path: socketPath }) } : {}) });
 }
 
 /** Upstream client type. Not used for authorization by the 0.13.2 daemon; constant so it is never viewer-chosen. */

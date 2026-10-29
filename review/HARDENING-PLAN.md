@@ -169,3 +169,12 @@ Implementation plan (`docs/IMPLEMENTATION-PLAN-identity-v2.md`, milestones renam
 8. **Network:** live-relay test runs are approved once, when work reaches I-7 to I-10. Until then, tests stay offline.
 9. **License:** Apache-2.0.
 10. **Upstream requests:** held until Spikes A and B are done. Nothing is sent without the user's go-ahead.
+
+## Decisions, round 6 (user approved, 2026-10-29)
+
+After Spike A (`spikes/security/RESULTS.md`):
+
+1. **Device rekeys in MLS use the admin route.** The admin daemon applies an approved rekey by removing the old leaf and adding the new KeyPackage, using only public ts-mls APIs. No fork of `createCommit`.
+2. **Spec fixes from Spike A:** the device-continuity check runs after processing, not in the library callback; the `prevSig` exception applies only when joining (`joinGroup`); ts-mls ≥ 1.6.4.
+3. **Upstream:** ask ts-mls for credential change through the public `createCommit` (held with the other upstream requests until the user approves sending).
+4. **Next:** start implementation with I-1 and I-16 in parallel.

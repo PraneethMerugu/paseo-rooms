@@ -20,7 +20,7 @@
 // paseo CLI, ~/.paseo and the daemon port with any shell tool (HARDENING-PLAN C-iso1). M1 lanes are
 // watch-only, and filter.ts keeps every prompting message type denied for owner-uid lanes.
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { isForkVerifiedProvider } from "../../shared/policy";
 import { log } from "../log";
@@ -66,9 +66,65 @@ export function ensureInertMcp(dataDir: string): InertMcpServer {
   return { type: "stdio", command: process.execPath, args: [path], env: { ELECTRON_RUN_AS_NODE: "1" } };
 }
 
-export function isInertMcp(server: unknown, inert: InertMcpServer): boolean {
-  const s = server as Partial<InertMcpServer> | undefined;
-  return !!s && s.type === "stdio" && s.command === inert.command && Array.isArray(s.args) && s.args[0] === inert.args[0];
+/**
+ * Basenames of Paseo binaries that may run the inert server with ELECTRON_RUN_AS_NODE (X-5), besides
+ * the basename of the current process.execPath. Linux deb: /opt/Paseo/Paseo.bin (tested). Windows
+ * Paseo.exe and macOS Paseo.app/Contents/MacOS/Paseo are untested assumptions.
+ */
+export const PASEO_BINARY_BASENAMES: readonly string[] = ["Paseo", "Paseo.bin", "Paseo.exe"];
+
+export interface InertMcpCheckOptions {
+  /** Defaults to process.platform. win32 and darwin compare paths case-insensitively. */
+  platform?: NodeJS.Platform;
+  /** Defaults to fs.existsSync. Decides whether a stored binary other than the current one is stale. */
+  exists?: (path: string) => boolean;
+}
+
+export type InertMcpVerdict = { ok: true } | { ok: false; stale: boolean; reason: string };
+
+export const STALE_INERT_MCP_MESSAGE =
+  '"paseo" MCP entry points at a Paseo binary that no longer exists (stale lane after a Paseo update or move); close the lane and re-open the room agent after updating Paseo';
+
+const caseInsensitivePaths = (platform: NodeJS.Platform) => platform === "win32" || platform === "darwin";
+
+/**
+ * Checks a stored "paseo" MCP entry against the inert shadow (C-iso2, X-5). Fail closed: accepted only
+ * when every condition holds:
+ *   - type "stdio";
+ *   - args is exactly [<our inert-mcp.cjs>];
+ *   - env is exactly { ELECTRON_RUN_AS_NODE: "1" } (no NODE_OPTIONS or other keys);
+ *   - command is an absolute path whose basename is a Paseo binary (PASEO_BINARY_BASENAMES or the
+ *     current execPath's basename) and that is either the current execPath or still exists.
+ * A Paseo binary path that no longer exists is reported as stale, with a clear message.
+ */
+export function checkInertMcp(server: unknown, inert: InertMcpServer, opts: InertMcpCheckOptions = {}): InertMcpVerdict {
+  const platform = opts.platform ?? process.platform;
+  const exists = opts.exists ?? existsSync;
+  const fold = caseInsensitivePaths(platform) ? (p: string) => p.toLowerCase() : (p: string) => p;
+  const pathApi = platform === "win32" ? win32 : posix;
+  const fail = (reason: string): InertMcpVerdict => ({ ok: false, stale: false, reason });
+  const s = server as Partial<InertMcpServer> | null | undefined;
+  if (!s || typeof s !== "object" || s.type !== "stdio") return fail("not a stdio server");
+  if (!Array.isArray(s.args) || s.args.length !== 1 || typeof s.args[0] !== "string" || fold(s.args[0]) !== fold(inert.args[0]))
+    return fail("args are not exactly the plugin's inert-mcp.cjs");
+  const env = s.env as unknown;
+  if (!env || typeof env !== "object" || Array.isArray(env)) return fail("ELECTRON_RUN_AS_NODE is not set");
+  const envKeys = Object.keys(env);
+  if (envKeys.length !== 1 || envKeys[0] !== "ELECTRON_RUN_AS_NODE" || (env as Record<string, unknown>).ELECTRON_RUN_AS_NODE !== "1")
+    return fail("env is not exactly ELECTRON_RUN_AS_NODE=1");
+  const command = s.command;
+  if (typeof command !== "string" || !command || command.includes("\0") || !pathApi.isAbsolute(command))
+    return fail("command is not an absolute path");
+  const base = fold(pathApi.basename(pathApi.normalize(command)));
+  const allowed = new Set([...PASEO_BINARY_BASENAMES, pathApi.basename(inert.command)].map(fold));
+  if (!allowed.has(base)) return fail("command is not a Paseo binary");
+  if (fold(pathApi.normalize(command)) === fold(pathApi.normalize(inert.command))) return { ok: true };
+  if (!exists(command)) return { ok: false, stale: true, reason: STALE_INERT_MCP_MESSAGE };
+  return { ok: true };
+}
+
+export function isInertMcp(server: unknown, inert: InertMcpServer, opts?: InertMcpCheckOptions): boolean {
+  return checkInertMcp(server, inert, opts).ok;
 }
 
 /** Rewrites a room agent's config: shadow Paseo's MCP, drop preapprovals. Pure; exported for tests. */

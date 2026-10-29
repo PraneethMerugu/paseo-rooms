@@ -96,7 +96,8 @@ export function redactPath(p: unknown): Out {
   if (p === null) return null;
   if (typeof p !== "string") return OMIT;
   const base = p.split(/[\\/]+/).filter(Boolean).pop() ?? "";
-  return base ? `/room/${base}` : "/room";
+  // A Windows drive root ("C:\\", "C:") maps to "/room", not "/room/C:" (X-14; untested on Windows).
+  return base && !/^[A-Za-z]:$/.test(base) ? `/room/${base}` : "/room";
 }
 
 /**

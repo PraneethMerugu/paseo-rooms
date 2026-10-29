@@ -18,7 +18,7 @@
 // on resume; no agent.create hook runs then).
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, win32 } from "node:path";
-import { isInertMcp, type InertMcpServer } from "./agent-guard";
+import { checkInertMcp, type InertMcpCheckOptions, type InertMcpServer } from "./agent-guard";
 
 export interface TripwireResult {
   ok: boolean;
@@ -56,14 +56,15 @@ export function findStoredAgentRecord(paseoHome: string, agentId: string, cwd?: 
 }
 
 /** Pure check of a stored record's config. Exported for tests. */
-export function checkRoomAgentConfig(record: unknown, inert: InertMcpServer): string[] {
+export function checkRoomAgentConfig(record: unknown, inert: InertMcpServer, opts?: InertMcpCheckOptions): string[] {
   const problems: string[] = [];
   const config = (record as { config?: Record<string, unknown> } | null)?.config;
   if (!config || typeof config !== "object") return ["stored record has no config"];
   const mcp = config.mcpServers as Record<string, unknown> | null | undefined;
   if (!mcp || typeof mcp !== "object") problems.push("no MCP servers: the inert paseo shadow is missing, so Paseo injects its control MCP");
   else {
-    if (!isInertMcp(mcp.paseo, inert)) problems.push('"paseo" MCP entry is not the inert shadow');
+    const verdict = checkInertMcp(mcp.paseo, inert, opts);
+    if (!verdict.ok) problems.push(verdict.stale ? verdict.reason : `"paseo" MCP entry is not the inert shadow (${verdict.reason})`);
     const extra = Object.keys(mcp).filter((k) => k !== "paseo");
     if (extra.length) problems.push(`unexpected MCP servers: ${extra.map((k) => k.slice(0, 40)).join(", ")}`);
     for (const [name, server] of Object.entries(mcp)) {
@@ -77,7 +78,7 @@ export function checkRoomAgentConfig(record: unknown, inert: InertMcpServer): st
 }
 
 /** Reads the stored record and checks it. A missing record is a failure (fail closed). */
-export function verifyRoomAgent(paseoHome: string, agentId: string, cwd: string | null, inert: InertMcpServer): TripwireResult {
+export function verifyRoomAgent(paseoHome: string, agentId: string, cwd: string | null, inert: InertMcpServer, opts?: InertMcpCheckOptions): TripwireResult {
   const file = findStoredAgentRecord(paseoHome, agentId, cwd);
   if (!file) return { ok: false, problems: ["stored agent record not found"], file: null };
   let record: unknown;
@@ -87,7 +88,7 @@ export function verifyRoomAgent(paseoHome: string, agentId: string, cwd: string 
     return { ok: false, problems: [`stored agent record unreadable: ${(e as Error).message.slice(0, 120)}`], file };
   }
   if ((record as { id?: unknown })?.id !== agentId) return { ok: false, problems: ["stored record id mismatch"], file };
-  const problems = checkRoomAgentConfig(record, inert);
+  const problems = checkRoomAgentConfig(record, inert, opts);
   return { ok: problems.length === 0, problems, file };
 }
 

@@ -57,6 +57,8 @@ Run these items before Milestone 1. Each one can change the design or the order 
 
 The results go into `spikes/security/RESULTS.md`. During implementation they also go into `mls-integration.md` section 10, as the spec asks.
 
+**Result (2026-10-29, run offline in `spikes/security/`, see the last section of its `RESULTS.md`; recorded in `mls-integration.md` section 10, test 11).** Observed: receivers accept and validate an UpdatePath with a new credential (a), but the public `createCommit` cannot produce one (a0); the callback never sees the UpdatePath leaf, so (b)'s pass condition cannot be met as written, and only a post-processing comparison catches a changed `deviceId` under an accept-all service; (c) fails without `prevSig` and passes with it; (d) only path and added leaves reach `validateCredential` during commits; a stale post-approval UpdatePath passes the round-4 `prevSig` rule (a-stale); (e) yes to both; (f) as before, fails on 1.6.2; (g) identical on noble 2.4.0. **Outcome selected by decision round 6:** none of the rows above as written. Device rekeys use the admin route (Remove plus Add by the approving admin daemon, sequenced next to the approval, public APIs only; `mls-integration.md` section 4.4). The continuity check runs after processing, the `prevSig` exception is removed, and the floor is ts-mls 1.6.4. Inferred, not tried: the plugin needs an npm `overrides` entry for ts-mls's exact `@noble/ciphers` peer.
+
 Size: **S**.
 
 ### 1.2 Spike B: native keyring packaging through Paseo's plugin installer (identity Q3, X-13)
@@ -117,8 +119,8 @@ Step 0 ──► I-1 encoding ──► I-4 Noise IK ─────────
            I-2 file layer ─► I-3 KeyStore ──► I-7 room host core ─► I-8 room endpoint ─► I-9 enrollment ─► I-10 grants v2
            I-1 ──► I-5 fold core ──► I-6 fold authority ──► I-7        │                 │
                                                                    │                 └► I-11 device linking
-                                                                   └► I-13 MLS adapter (needs Spike A)
-           I-12 rotation and recovery (after I-9, I-11)
+                                                                   └► I-13 MLS adapter (Spike A done)
+           I-12 rotation and recovery (after I-9, I-11; device rekey after I-13)
            I-14 Rooms UI v2 (after I-9; grows with I-10 to I-12)
            I-15 cut-over and migration (after I-10, I-14)
            I-16 X-3 and X-5 (independent; any time, suggested right after Step 0)
@@ -303,7 +305,7 @@ Every milestone ends with `npm run typecheck` clean and `npm test` green. "Linux
 - `holds.ts`: 24 h and 72 h holds measured in `hts`, vetoes, conflicts, cancellation when the requester is removed, no auto-add from devices younger than 24 h, the `soleDeviceChange` and `deviceAddApproval` policies.
 - `KeyChange` and `key-change-new` verification; the retired-key set; the device and admin denylists.
 
-**Depends on Spike A:** the `device.rekey.approved` and `prevSig` bookkeeping stays as specified only if Spike A (c) passes.
+**Spike A outcome:** the fold of `device.rekey.approved` is unchanged, and no `prevSig` bookkeeping is needed (decision round 6; `mls-integration.md` section 4.4).
 
 **Tests:** `log.refold` (including `rejectRevocationBeforeStart`), `log.closure` (one accepted, three rejected), `deviceLink.chain` and `deviceLink.chain.cases`, the recovery-key `null` format examples (format only), and an admin key that adds a ghost which a recovery-key revocation removes. Also `deviceRekey` (sole-device rekey: 24 h rejected, 72 h accepted). Two vectors still missing from the generator must be added here: `device.rekey.vetoed`, and a sole-device rekey under `soleDeviceChange = "admin"` (needs `room.policy.changed` in the generator's fold).
 
@@ -420,8 +422,11 @@ Every milestone ends with `npm run typecheck` clean and `npm test` green. "Linux
 
 **Specs:** `keys-rotation-recovery.md` 4, 6.
 
+**Depends on:** I-13 for the MLS half of the device rekey.
+
 **Add:** operations and UI flows for:
-- device rekey (UpdatePath or fallback, per Spike A);
+- device rekey by the admin route (decision round 6; `keys-rotation-recovery.md` 4.1, `mls-integration.md` 4.4): the device publishes new-credential KeyPackages with its request; after the hold, or on interactive approval, the admin daemon signs `device.rekey.approved`, builds the Remove plus Add commit naming the post-approval roster, and submits both with `commit.submit {…, statement}`; then it repeats the commit in each subgroup the device is in. With no admin daemon online nothing is signed and the device shows "Waiting for an admin device". The rekeyed device skips the commit with its old state, rejoins by Welcome and deletes the old state. The host refuses `device.rekey.approved` through `stmt.submit`;
+- periodic leaf refresh: an UpdatePath from the public `createCommit` every 7 days or 1 000 messages, credential unchanged (`keys-rotation-recovery.md` 4.2);
 - admin key rotation, add and revoke;
 - the recovery key: install, rotate, and propose with two lineages;
 - host key rotation with `oldValidTo`;
@@ -430,22 +435,24 @@ Every milestone ends with `npm run typecheck` clean and `npm test` green. "Linux
 - closure with `closeDelay`;
 - the recovery procedures of section 6 as guided flows.
 
-**Tests:** each rotation keeps the fold valid and the grants valid within their windows; a revoked host key's grants are refused; a closure before the delay is refused by the confirming daemon; recovery from a stolen admin key with R. **Size: M.**
+**Tests:** each rotation keeps the fold valid and the grants valid within their windows; a rekey with the admin daemon offline stays requested and the old keys keep working; a rekey whose new-credential KeyPackage is missing is not approved; a revoked host key's grants are refused; a closure before the delay is refused by the confirming daemon; recovery from a stolen admin key with R. **Size: M.**
 
-### I-13. MLS adapter and delivery service (needs Spike A)
+### I-13. MLS adapter and delivery service (Spike A done)
 
 **Specs:** `mls-integration.md` all.
 
 **Add:**
-- `server/mls/adapter.ts`: the only importer of ts-mls, pinned at exactly 1.6.4.
-- `auth-service.ts`: a closure over the reference roster; fails closed when no roster is set; the rekey window rule as Spike A settled.
-- `roster-rule.ts`: roster equality before and after processing; who may commit what.
+- `server/mls/adapter.ts`: the only importer of ts-mls, pinned at exactly 1.6.4 (floor 1.6.4; the removal check fails on 1.6.2). Public API only: no fork of `createCommit`, no imports through the `./*.js` subpath exports.
+- `auth-service.ts`: a closure over the reference roster; fails closed when no roster is set; rule 6 requires the roster key with no `prevSig` exception (Spike A, decision round 6). For a Welcome, the reference roster is the one the Add commit names.
+- `roster-rule.ts`: roster equality before and after processing, with leaf identity `(memberId, deviceId, deviceSig)`; role checks in the `IncomingMessageCallback` by `senderLeafIndex`; the continuity check after processing (sender's leaf credential byte-identical before and after a path commit); who may commit what.
+- The admin route for device rekeys (`mls-integration.md` 4.4): Remove plus Add commit builder, `commit.submit` with `statement`, adjacent sequencing on the host, and the rekeyed device's rejoin by Welcome.
+- npm `overrides` for ts-mls's exact `@noble/ciphers` peer, so it shares the plugin's noble 2.4.0 (Spike A case (g); the override itself is untried).
 - The authority extension `0xF0A1`.
 - Sealed state written before the ack; rollback check against `lastAck`; key retention 2, 64 and 1000.
-- Host delivery service: `kp.publish`, `commit.submit` (one commit per epoch, `stale_roster`), `welcome.fetch`, `msg.send`, `msg.fetch`, `pending_remove`, and `mls.stalled` after 5 minutes.
+- Host delivery service: `kp.publish`, `commit.submit` (one commit per epoch, `stale_roster`, optional `device.rekey.approved` sequenced adjacently or not at all), `welcome.fetch`, `msg.send`, `msg.fetch`, `pending_remove`, and `mls.stalled` after 5 minutes.
 - A dev-only alias `ts-mls-162` for the positive control.
 
-**Tests:** MLS section 10, tests 1 to 10, with test 11 already done in Step 0. E2E: two members exchange an application message; the removed one cannot read the next one; the host files hold no plaintext.
+**Tests:** MLS section 10, tests 1 to 10, with test 11 already done in Step 0. Test 10 is the admin-route rekey and the continuity check; its Remove plus Add path was not run in Spike A. E2E: two members exchange an application message; the removed one cannot read the next one; the host files hold no plaintext.
 
 **Note:** chat UI is not in this plan (it is Milestone 2 of the product). See decision D-4 on whether this milestone ships with identity v2 or opens I-2.
 

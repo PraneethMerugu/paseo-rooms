@@ -58,7 +58,7 @@ function parseCsvLine(line: string): string[] {
 }
 
 export function readClassification(path = CSV_PATH): ClassificationRow[] {
-  const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim());
+  const lines = readFileSync(path, "utf8").split(/\r?\n/).filter((l) => l.trim());
   const header = parseCsvLine(lines[0]);
   const expected = ["type", "direction", "daemon_permission", "future_role", "m1_watch", "binding_or_reason"];
   if (header.join(",") !== expected.join(",")) throw new Error(`classification header must be ${expected.join(",")}`);
@@ -112,7 +112,7 @@ export interface FieldRow {
 const FIELD_ACTIONS: readonly FieldAction[] = ["keep", "drop", "redact", "nested", "gateway", "force"];
 
 export function readFieldPolicy(path = FIELDS_CSV_PATH): FieldRow[] {
-  const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim());
+  const lines = readFileSync(path, "utf8").split(/\r?\n/).filter((l) => l.trim());
   const header = parseCsvLine(lines[0]);
   if (header.join(",") !== "object,field,action,reason") throw new Error("fields.csv header must be object,field,action,reason");
   return lines.slice(1).map((line, i) => {

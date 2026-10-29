@@ -35,7 +35,7 @@ test("the conformance gate fails when a type is missing", () => {
 });
 
 test("generated module matches the checked-in classification", () => {
-  assert.equal(readFileSync(GENERATED_PATH, "utf8"), renderGenerated(rows, types.version), "run `npm run gen:profile`");
+  assert.equal(readFileSync(GENERATED_PATH, "utf8").replace(/\r\n/g, "\n"), renderGenerated(rows, types.version), "run `npm run gen:profile`");
   assert.equal(Object.keys(INBOUND_WATCH).length, types.inbound.length);
   assert.equal(Object.keys(OUTBOUND_WATCH).length, types.outbound.length);
 });
