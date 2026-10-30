@@ -2,7 +2,11 @@
 // Registered only when the switch is set; they never ship. Enrollment (I-9): the owner creates invites
 // and admits join requests after the SAS comparison; the member previews, joins, compares and
 // confirms. Admin calls are the confirmation of what they sign (the UI flow is I-14). An invite code
-// is a bearer secret: it is returned once to the caller and never logged.
+// is a bearer secret: it is returned once to the caller and never logged. Device links (I-11): a
+// member device creates a `prl2.` link code (also a bearer secret, returned once), compares the SAS
+// with the new device and confirms; the new device joins with `rooms.v2.join.*`. Members veto, admins
+// approve held adds and resolve conflicts. `rooms.v2.test.clock.advance` is TEST-ONLY and registered
+// only on e2e test homes.
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
@@ -12,6 +16,40 @@ const RoomIdIn = z.object({ roomId: z.string().regex(/^room_[0-9a-f]{32}$/) });
 const Head = z.object({ seq: z.number().int(), hash: z.string() });
 
 const PendingIdIn = RoomIdIn.extend({ pendingId: z.string().regex(/^pen_[0-9a-f]{32}$/) });
+const RefIn = RoomIdIn.extend({ ref: z.string().regex(/^[A-Za-z0-9_-]{43}$/) });
+
+/** A held device add or rekey (room-log-v2 4.3): ids and times only. `effectiveAfter` null: an admin must approve. */
+export const DeviceRequestV2View = z.object({
+  ref: z.string(),
+  kind: z.enum(["add", "rekey"]),
+  memberId: z.string(),
+  deviceId: z.string(),
+  requester: z.string(),
+  seq: z.number().int(),
+  hts: z.number().int(),
+  sole: z.boolean(),
+  young: z.boolean(),
+  status: z.enum(["pending", "vetoed", "cancelled", "approved"]),
+  effectiveAfter: z.number().int().nullable(),
+});
+
+/** The linking device's view of one link (identity-model.md 6.4): attempts counted on this device. */
+export const LinkV2View = z.object({
+  linkId: z.string(),
+  exp: z.number().int(),
+  attempts: z.number().int(),
+  burned: z.enum(["sas_mismatch", "attempts"]).nullable(),
+  pending: z
+    .object({
+      pendingId: z.string(),
+      deviceId: z.string(),
+      label: z.string(),
+      state: z.enum(["open", "revealed", "confirmed", "aborted", "closed"]),
+      sas: z.string().nullable(),
+      earlierAttempts: z.number().int(),
+    })
+    .nullable(),
+});
 
 export const InviteV2View = z.object({
   inviteId: z.string(),
@@ -28,15 +66,17 @@ export const InviteV2View = z.object({
 /** A join request as the owner's card shows it (enrollment-v2.md 6.3). `sas` once the member revealed. */
 export const JoinRequestV2View = z.object({
   pendingId: z.string(),
+  kind: z.enum(["invite", "link"]),
   note: z.string(),
   label: z.string(),
-  state: z.enum(["created", "sas_shown", "member_ok", "admin_ok", "admitted", "closed"]),
+  state: z.enum(["created", "sas_shown", "member_ok", "admin_ok", "held", "admitted", "closed"]),
   sas: z.string().nullable(),
   abandonedBefore: z.number().int(),
   contested: z.boolean(),
   expiresAt: z.number().int(),
   closedReason: z.string().nullable(),
   memberId: z.string().nullable(),
+  deviceId: z.string().nullable(),
 });
 
 export const LaneV2View = z.object({
@@ -70,6 +110,10 @@ export const OwnedRoomV2View = z.object({
   persistError: z.string().nullable(),
   /** grants-v2 6.4: devices with two suspected thefts within 7 days. */
   compromisedDevices: z.array(z.string()),
+  /** Held device adds and rekeys of every member. */
+  deviceRequests: z.array(DeviceRequestV2View),
+  /** Members with an open device conflict (after a veto). */
+  conflicts: z.array(z.string()),
 });
 
 /** The member's side of a join (enrollment-v2.md 6.4, 7.3). */
@@ -95,6 +139,11 @@ export const JoinedRoomV2View = z.object({
   endedReason: z.string().nullable(),
   alerts: z.array(z.object({ type: z.string(), seq: z.number().int() })),
   registration: z.string().nullable(),
+  /** Device links created on this device. */
+  links: z.array(LinkV2View),
+  /** This member's held device requests: the "Was this you?" prompt (Not me = rooms.v2.device.veto). */
+  deviceRequests: z.array(DeviceRequestV2View),
+  conflict: z.boolean(),
   lanes: z.array(
     z.object({
       laneId: z.string(),
@@ -123,6 +172,8 @@ export const roomsV2Status = defineRpc({
     owned: z.array(OwnedRoomV2View),
     joining: z.array(JoiningV2View),
     joined: z.array(JoinedRoomV2View),
+    /** Only on an e2e test home with the test clock switch. */
+    testClockOffsetMs: z.number().int().optional(),
   }),
 });
 
@@ -249,4 +300,48 @@ export const roomsV2RoomDisconnect = defineRpc({
   name: "rooms.v2.room.disconnect",
   input: RoomIdIn,
   output: Ok,
+});
+
+// ------------------------------------------------------------------------------ device links (I-11)
+
+/** On a member device: "Link another device". Returns the `prl2.` code once (bearer secret, 10 minutes). */
+export const roomsV2LinkCreate = defineRpc({
+  name: "rooms.v2.link.create",
+  input: RoomIdIn.extend({ roomName: z.string().min(1).max(80).optional() }),
+  output: z.object({ code: z.string(), linkId: z.string(), exp: z.number().int() }),
+});
+
+/** On the linking device: "Codes match" (match true) or "Codes do not match" (burns the link). */
+export const roomsV2LinkConfirm = defineRpc({
+  name: "rooms.v2.link.confirm",
+  input: PendingIdIn.extend({ match: z.boolean() }),
+  output: Ok,
+});
+
+/** "Not me" on any active device of the member: vetoes a held add (opens a device conflict). */
+export const roomsV2DeviceVeto = defineRpc({
+  name: "rooms.v2.device.veto",
+  input: RefIn,
+  output: z.object({ seq: z.number().int() }),
+});
+
+/** Admin: interactive approval of a held device add (required when policy or a rule keeps it for an admin). */
+export const roomsV2DeviceApprove = defineRpc({
+  name: "rooms.v2.device.approve",
+  input: RefIn,
+  output: z.object({ seq: z.number().int() }),
+});
+
+/** Admin: clears a member's device conflict. */
+export const roomsV2ConflictResolve = defineRpc({
+  name: "rooms.v2.device.conflict.resolve",
+  input: RoomIdIn.extend({ memberId: z.string().regex(/^mem_[0-9a-f]{32}$/) }),
+  output: z.object({ seq: z.number().int() }),
+});
+
+/** TEST-ONLY: registered only on e2e test homes (server/platform/test-clock.ts). */
+export const roomsV2TestClockAdvance = defineRpc({
+  name: "rooms.v2.test.clock.advance",
+  input: z.object({ ms: z.number().int().min(1).max(7 * 24 * 60 * 60 * 1000) }),
+  output: z.object({ offsetMs: z.number().int() }),
 });

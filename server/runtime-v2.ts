@@ -21,6 +21,16 @@
 // authentication failures of its registration. Short grants for tests: PASEO_ROOMS_DEV_SHORT_GRANTS=1
 // on the host (PASEO_ROOMS_DEV_GRANT_TTL_S, default 60).
 //
+// Device links (I-11): a member's active device creates a `prl2.` link code, answers the host's
+// `link.request` with its own nonce, compares the SAS on its own screen and signs `device.added`
+// (server/member/device-link.ts). The new device joins with that code like an invite and waits in
+// `held`. The admin daemon (the owner's, with the admin key) signs `device.add.approved {mode:"auto"}`
+// once the hold has passed on its own clock (24 h, 72 h for a sole device), unless policy, a young
+// requester or a device conflict requires an admin, who approves with `rooms.v2.device.approve`. Any
+// active device of the member may veto (`device.add.vetoed`, which opens a conflict); an admin
+// resolves the conflict. TEST-ONLY: `rooms.v2.test.clock.advance` moves the room host's `hts` and the
+// approval clock forward, only on a test home (server/platform/test-clock.ts).
+//
 // Relay: the genesis records `PASEO_ROOMS_RELAY_ENDPOINT` (host:port; default relay.paseo.sh:443) with
 // tls true. Owner side: `PASEO_ROOMS_RELAY_TLS=false` is honoured for loopback hosts only. Member side
 // (P-20): TLS always, a DNS-name relay, and a relay outside `trustedRelays` only after the user's
@@ -35,7 +45,13 @@ import type { PaseoApi } from "@getpaseo/client";
 import { createRoom, memberKeysPath, memberKeysPurpose } from "./admin/genesis";
 import { AdminSigner, adminKeyPath } from "./admin/signer";
 import { verifyGenesis, type RoomGenesis } from "./authority/genesis";
-import type { StatementType } from "./authority/statements";
+import type { StatementData, StatementType } from "./authority/statements";
+import { autoApprovalEndsAt } from "./authority/holds";
+import { edKid, versionKey, type RoomState } from "./authority/state";
+import { DeviceLinker } from "./member/device-link";
+import { readLinkSection, writeLinkSection } from "./member/enrollment-journal";
+import { TestClock } from "./platform/test-clock";
+import type { KeyObject } from "node:crypto";
 import type { PendingView, InviteView } from "./host/enrollment";
 import { isDevInsecureRelay, memberRelayUseTls, relayKey } from "./host/invites";
 import { endpointKeyFromHost, RoomEndpoint } from "./host/room-endpoint";
@@ -59,10 +75,10 @@ import { RoomClient } from "./member/room-client";
 import { dataDir as roomsDataDir, resolvePaseoHome } from "./paths";
 import { writePrivateFile } from "./platform/durable";
 import { defaultProtection, ProtectionError, type FileProtection } from "./platform/file-protection";
-import { b64uDecode } from "./proto/b64u";
+import { b64u, b64uDecode } from "./proto/b64u";
 import { isValidLabel } from "./proto/enroll";
 import { isId, isRoomId } from "./proto/ids";
-import { rawPublicKey, x25519PrivateKeyFromSecret } from "./proto/keys";
+import { ed25519PrivateKeyFromSeed, rawPublicKey, x25519PrivateKeyFromSecret } from "./proto/keys";
 import { rjcsParse } from "./proto/rjcs";
 import type { RelayAddress } from "./transport/relay-server";
 
@@ -96,7 +112,7 @@ export function relayAddress(relay: { host: string; port: number }, env: NodeJS.
 }
 
 
-type Owned = { host: RoomHost; signer: AdminSigner | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService };
+type Owned = { host: RoomHost; signer: AdminSigner | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService; approver: ReturnType<typeof setInterval> | null };
 type Joined = { client: RoomClient; memberId: string; deviceId: string };
 
 const SCHEDULE_FILE = "grant-schedule.json";
@@ -139,6 +155,15 @@ export class RoomsRuntimeV2 {
   private paseo: PaseoApi | null = null;
   private started: Promise<void> | null = null;
   private stopping = false;
+  /** Member: the confirming-device side of device links, by room. */
+  private readonly linkers = new Map<string, DeviceLinker>();
+  /** Admin daemon: automatic approvals that failed, retried after this time (by request bodyHash). */
+  private readonly approveRetryAt = new Map<string, number>();
+  /**
+   * Clock of the room hosts' `hts` and of automatic approvals. Date.now, except on an e2e test home
+   * with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts), where tests may move it forward.
+   */
+  readonly clock: TestClock;
 
   constructor(
     private readonly env: NodeJS.ProcessEnv = process.env,
@@ -148,6 +173,7 @@ export class RoomsRuntimeV2 {
   ) {
     this.paseoHome = resolvePaseoHome(env);
     this.dataDir = roomsDataDir(this.paseoHome);
+    this.clock = new TestClock(env, this.paseoHome);
   }
 
   /** The PaseoApi of the latest RPC context: lane registration waits for it (section 8). */
@@ -185,7 +211,7 @@ export class RoomsRuntimeV2 {
     for (const roomId of fs.existsSync(hostDir) ? fs.readdirSync(hostDir) : []) {
       if (!isRoomId(roomId) || !fs.existsSync(genesisPath(this.dataDir, roomId))) continue;
       try {
-        const host = await RoomHost.open({ dataDir: this.dataDir, kek: this.kek, roomId });
+        const host = await RoomHost.open({ dataDir: this.dataDir, kek: this.kek, roomId, now: this.clock.now });
         const signer = fs.existsSync(adminKeyPath(this.dataDir, roomId)) ? AdminSigner.load({ dataDir: this.dataDir, kek: this.kek, roomId }) : null;
         this.serve(host, signer);
       } catch (e) {
@@ -207,6 +233,7 @@ export class RoomsRuntimeV2 {
     }, 1000);
     (this.endedWatch as { unref?: () => void }).unref?.();
     this.state = "ready";
+    if (this.clock.enabled) log("test_clock_enabled", { warning: "TEST-ONLY clock override available on this test home" });
     log("v2_runtime_started", { owned: this.owned.size, joining: this.joining.size, keystore: status.backend });
   }
 
@@ -232,9 +259,36 @@ export class RoomsRuntimeV2 {
     });
     grants.afterAppend = () => endpoint.afterAppend();
     lanes = new LaneService({ dataDir: this.dataDir, kek: this.kek!, host, grants, relay: relayAddress(g, this.env), paseoHome: this.paseoHome });
-    this.owned.set(roomId, { host, signer, endpoint, grants, lanes });
+    // The admin daemon's automatic approvals of held device adds (identity-model.md 6.3).
+    const approver = signer ? setInterval(() => this.autoApprove(roomId), 2000) : null;
+    (approver as { unref?: () => void } | null)?.unref?.();
+    this.owned.set(roomId, { host, signer, endpoint, grants, lanes, approver });
     endpoint.start();
     lanes.start();
+  }
+
+  /**
+   * `device.add.approved {mode:"auto"}` for every pending add whose hold has passed on this daemon's
+   * clock and that no rule keeps for an admin (policy, sole-device policy, conflict, young requester).
+   * The fold checks the same rules against `hts`; this is the real enforcement (room-log-v2 5).
+   */
+  autoApprove(roomId: string): void {
+    const o = this.owned.get(roomId);
+    if (!o?.signer || o.host.isStopped || this.stopping) return;
+    const st = o.host.state;
+    const now = this.clock.now();
+    for (const [ref, p] of Object.entries(st.pending)) {
+      if (p.kind !== "add" || p.status !== "pending") continue;
+      const at = autoApprovalEndsAt(st, p);
+      if (at === null || now < at || (this.approveRetryAt.get(ref) ?? 0) > Date.now()) continue;
+      try {
+        const r = this.adminSubmit(roomId, "device.add.approved", { memberId: p.memberId, deviceId: p.deviceId, ref, mode: "auto" });
+        log("device_add_auto_approved", { roomId, memberId: p.memberId, deviceId: p.deviceId, seq: r.receipt.entry.seq, sole: p.sole });
+      } catch (e) {
+        this.approveRetryAt.set(ref, Date.now() + 60_000);
+        log("device_add_auto_approve_failed", { roomId, deviceId: p.deviceId, error: String((e as Error)?.message ?? e).slice(0, 160) });
+      }
+    }
   }
 
   status() {
@@ -243,6 +297,7 @@ export class RoomsRuntimeV2 {
       protocol: "v2" as const,
       state: this.state,
       error: this.error,
+      ...(this.clock.enabled ? { testClockOffsetMs: this.clock.offset } : {}),
       keystore: ks ? { state: ks.state, backend: ks.backend, fallback: ks.state === "ready" ? ks.fallback : false } : null,
       owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes }) => ({
         roomId: host.roomId,
@@ -258,6 +313,8 @@ export class RoomsRuntimeV2 {
         grantTtlS: grants.ttlS(),
         persistError: grants.persistError ?? (host.isStopped ? "room_stopped" : null),
         compromisedDevices: grants.compromisedDevices(),
+        deviceRequests: deviceRequestsView(host.state),
+        conflicts: Object.keys(host.state.conflicts).sort(),
       })),
       joining: [...this.joining.values()].map((e) => joinView(e.view())),
       joined: [...this.joined.entries()].map(([roomId, j]) => ({
@@ -270,6 +327,10 @@ export class RoomsRuntimeV2 {
         endedReason: j.client.endedReason,
         alerts: j.client.alerts.map((a) => ({ type: a.type, seq: a.seq })),
         registration: this.registrars.get(roomId)?.status ?? null,
+        links: this.linkers.get(roomId)?.view() ?? [],
+        // The member's own pending device requests: the "Was this you?" prompt with Not me (6.3).
+        deviceRequests: j.client.status === "open" || j.client.head.seq >= 0 ? deviceRequestsView(j.client.state, j.memberId) : [],
+        conflict: j.client.head.seq >= 0 ? j.client.state.conflicts[j.memberId] !== undefined : false,
         lanes: [...(this.schedulers.get(roomId)?.entries() ?? [])].map(([laneId, sc]) => {
           const regId = this.joining.get(roomId)?.journal.e.registrations[laneId] ?? null;
           const reg = regId ? this.registrations.get(regId) : undefined;
@@ -282,7 +343,7 @@ export class RoomsRuntimeV2 {
   async createRoom(): Promise<{ roomId: string; serverId: string }> {
     const kek = await this.ready();
     // Development runtime: the recovery key is skipped so no recovery code is ever produced here.
-    const room = await createRoom({ dataDir: this.dataDir, kek, relay: genesisRelay(this.env), recovery: "skip" });
+    const room = await createRoom({ dataDir: this.dataDir, kek, relay: genesisRelay(this.env), recovery: "skip", now: this.clock.now });
     this.serve(room.host, room.signer);
     return { roomId: room.roomId, serverId: room.genesis.body.endpoint.serverId };
   }
@@ -342,6 +403,120 @@ export class RoomsRuntimeV2 {
     }
     if (o.grants.persistError) throw new PersistFailedRpcError("the grant list could not be written");
     return out;
+  }
+
+  // ------------------------------------------------------------------------------ owner: device holds
+
+  /** The folded state of a room this daemon hosts (owner view and tests). */
+  ownedHostState(roomId: string): Readonly<RoomState> {
+    return this.ownedRoom(roomId).host.state;
+  }
+
+  /** An admin's interactive approval of a pending device add (no hold; identity-model.md 6.3). */
+  async approveDevice(roomId: string, ref: string): Promise<{ seq: number }> {
+    await this.ready();
+    const p = this.ownedRoom(roomId).host.state.pending[ref];
+    if (!p || p.kind !== "add") throw new Error("Unknown device request");
+    // Checked before signing: a refused admin statement stays outstanding until a fence (I-7).
+    if (p.status !== "pending") throw new Error(`The device request is ${p.status}`);
+    return { seq: this.adminSubmit(roomId, "device.add.approved", { memberId: p.memberId, deviceId: p.deviceId, ref, mode: "admin" }).receipt.entry.seq };
+  }
+
+  /** Clears a member's device conflict (after a veto); automatic approvals resume for that member. */
+  async resolveConflict(roomId: string, memberId: string): Promise<{ seq: number }> {
+    await this.ready();
+    if (!isId("member", memberId)) throw new Error("bad memberId");
+    const st = this.ownedRoom(roomId).host.state;
+    if (st.conflicts[memberId] === undefined) throw new Error("That member has no open device conflict");
+    const ver = st.auth.versions[versionKey.conflict(memberId)] ?? -1;
+    return { seq: this.adminSubmit(roomId, "device.conflict.resolved", { memberId, ver }).receipt.entry.seq };
+  }
+
+  /** TEST-ONLY (test homes with PASEO_ROOMS_TEST_CLOCK=1): moves the hts and approval clock forward. */
+  advanceTestClock(ms: number): { offsetMs: number } {
+    const offsetMs = this.clock.advance(ms);
+    log("test_clock_advanced", { byMs: ms, offsetMs });
+    for (const roomId of this.owned.keys()) this.autoApprove(roomId);
+    return { offsetMs };
+  }
+
+  // ------------------------------------------------------------------------------ member: device links
+
+  /** "Link another device": the `prl2.` code, shown once (a bearer secret for 10 minutes). */
+  async createLink(roomId: string, roomName?: string): Promise<{ code: string; linkId: string; exp: number }> {
+    await this.ready();
+    return this.linkerOf(roomId).create({ roomName });
+  }
+
+  /** On the linking device: "Codes match" (true) or "Codes do not match" for a link request. */
+  async confirmLink(roomId: string, pendingId: string, match: boolean): Promise<void> {
+    await this.ready();
+    if (!isId("pending", pendingId)) throw new Error("bad pendingId");
+    await this.linkerOf(roomId).confirm(pendingId, match);
+  }
+
+  /** "Not me": vetoes a pending add of this member's (any active device may; opens a conflict). */
+  async vetoDevice(roomId: string, ref: string): Promise<{ seq: number }> {
+    await this.ready();
+    const j = this.joined.get(roomId);
+    const p = j?.client.state.pending[ref];
+    if (!j || !p || p.memberId !== j.memberId || p.status !== "pending") throw new Error("No pending device request of yours with that reference");
+    const type = p.kind === "add" ? "device.add.vetoed" : "device.rekey.vetoed";
+    return this.linkerOf(roomId).submitOwn(type, { memberId: j.memberId, ref } as StatementData<typeof type>);
+  }
+
+  private linkerOf(roomId: string): DeviceLinker {
+    const l = this.linkers.get(roomId);
+    if (!l) throw new Error("Not connected to that room as a member device");
+    return l;
+  }
+
+  private linkerFor(kek: Kek, roomId: string, genesisHash: string, memberId: string, deviceId: string, client: RoomClient): DeviceLinker {
+    const existing = this.linkers.get(roomId);
+    if (existing) return existing;
+    const sigKid = edKid(b64u(rawPublicKey(this.sigKeyFor(kek, roomId))));
+    const linker = new DeviceLinker({
+      roomId,
+      genesisHash,
+      memberId,
+      deviceId,
+      sigKid,
+      sigKey: () => this.sigKeyFor(kek, roomId),
+      endpoint: () => client.state.auth.endpoint as never,
+      session: () => {
+        const c = this.joined.get(roomId)?.client;
+        return c && c.status === "open" ? c : null;
+      },
+      store: { read: () => readLinkSection({ dataDir: this.dataDir, kek, roomId }), write: (v) => writeLinkSection({ dataDir: this.dataDir, kek, roomId, genesisHash }, v) },
+    });
+    this.linkers.set(roomId, linker);
+    return linker;
+  }
+
+  /** This daemon's signing key for a room (its sealed journal, or the creator's key file). */
+  private sigKeyFor(kek: Kek, roomId: string): KeyObject {
+    const j = this.joining.get(roomId)?.journal;
+    if (j && (j.state === "admitted" || j.state === "registered")) {
+      const { sigSeed, dhSecret } = j.deviceKeys();
+      dhSecret.fill(0);
+      try {
+        return ed25519PrivateKeyFromSeed(sigSeed);
+      } finally {
+        sigSeed.fill(0);
+      }
+    }
+    const plain = kek.readSealed(memberKeysPath(this.dataDir, roomId), memberKeysPurpose(roomId));
+    if (!plain) throw new Error("No device keys for that room on this daemon");
+    try {
+      const seed = b64uDecode(MemberKeysFile(rjcsParse(plain)).sig.seed, 32);
+      try {
+        return ed25519PrivateKeyFromSeed(seed);
+      } finally {
+        seed.fill(0);
+      }
+    } finally {
+      plain.fill(0);
+    }
   }
 
   // ------------------------------------------------------------------------------ owner: lanes
@@ -645,6 +820,7 @@ export class RoomsRuntimeV2 {
 
   /** Session pushes: `grant.revoked` (theft, role change) asks for a new grant through the session. */
   private onSessionPush(roomId: string, frame: Frame): void {
+    if (this.linkers.get(roomId)?.onPush(frame)) return;
     if (frame.t !== "grant.revoked" || typeof frame.laneId !== "string") return;
     log("grant_revoked_push", { roomId, laneId: frame.laneId, reason: String(frame.reason ?? "").slice(0, 32) });
     void this.schedulers.get(roomId)?.get(frame.laneId)?.rotate(`revoked_${String(frame.reason ?? "unknown").slice(0, 24)}`);
@@ -677,6 +853,7 @@ export class RoomsRuntimeV2 {
     const v = verifyGenesis(keys.genesis);
     const client = new RoomClient({ genesis: keys.genesis, device: keys.device, relay: keys.relay(v.genesis), timings: this.tuning.timings, onPush: (f) => this.onSessionPush(roomId, f) });
     this.joined.set(roomId, { client, memberId: keys.memberId, deviceId: keys.deviceId });
+    this.linkerFor(kek, roomId, v.genesisHash, keys.memberId, keys.deviceId, client);
     try {
       await client.connect();
       const m = client.state.members[keys.memberId];
@@ -751,6 +928,7 @@ export class RoomsRuntimeV2 {
     for (const e of this.joining.values()) e.close();
     for (const j of this.joined.values()) j.client.close();
     for (const o of this.owned.values()) {
+      if (o.approver) clearInterval(o.approver);
       await o.lanes.stop();
       o.grants.stop();
       o.endpoint.stop();
@@ -761,12 +939,21 @@ export class RoomsRuntimeV2 {
   }
 }
 
+/** Pending device requests in a fold state (optionally one member's), newest first, ids and times only. */
+function deviceRequestsView(st: Readonly<RoomState>, memberId?: string) {
+  return Object.entries(st.pending)
+    .filter(([, p]) => !memberId || p.memberId === memberId)
+    .sort(([, a], [, b]) => b.seq - a.seq)
+    .slice(0, 64)
+    .map(([ref, p]) => ({ ref, kind: p.kind, memberId: p.memberId, deviceId: p.deviceId, requester: p.requester, seq: p.seq, hts: p.hts, sole: p.sole, young: p.young, status: p.status, effectiveAfter: autoApprovalEndsAt(st, p) }));
+}
+
 function inviteView(i: InviteView) {
   return { inviteId: i.inviteId, inviteRef: i.inviteRef, role: i.role, lanes: i.lanes, note: i.note, exp: i.exp, state: i.state, failedProofs: i.failedProofs, abandoned: i.abandoned };
 }
 
 function pendingView(p: PendingView) {
-  return { pendingId: p.pendingId, note: p.note, label: p.label, state: p.state, sas: p.sas, abandonedBefore: p.abandonedBefore, contested: p.contested, expiresAt: p.expiresAt, closedReason: p.closedReason, memberId: p.memberId };
+  return { pendingId: p.pendingId, kind: p.kind, note: p.note, label: p.label, state: p.state, sas: p.sas, abandonedBefore: p.abandonedBefore, contested: p.contested, expiresAt: p.expiresAt, closedReason: p.closedReason, memberId: p.memberId, deviceId: p.deviceId };
 }
 
 function joinView(v: JoinView) {

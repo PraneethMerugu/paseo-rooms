@@ -42,6 +42,12 @@ import {
   roomsV2RoomCreate,
   roomsV2RoomDisconnect,
   roomsV2Status,
+  roomsV2LinkCreate,
+  roomsV2LinkConfirm,
+  roomsV2DeviceVeto,
+  roomsV2DeviceApprove,
+  roomsV2ConflictResolve,
+  roomsV2TestClockAdvance,
 } from "./shared/rpc-v2";
 
 const VERSION = "0.1.0";
@@ -199,6 +205,17 @@ function contributeV2(server: PluginServerContext) {
     return { ok: true as const };
   });
   handle(roomsV2RoomConnect, (i) => rt.connect(i.roomId));
+  // Device links and holds (identity-model.md 6.3, 6.4; I-11).
+  handle(roomsV2LinkCreate, (i) => rt.createLink(i.roomId, i.roomName));
+  handle(roomsV2LinkConfirm, async (i) => {
+    await rt.confirmLink(i.roomId, i.pendingId, i.match);
+    return { ok: true as const };
+  });
+  handle(roomsV2DeviceVeto, (i) => rt.vetoDevice(i.roomId, i.ref));
+  handle(roomsV2DeviceApprove, (i) => rt.approveDevice(i.roomId, i.ref));
+  handle(roomsV2ConflictResolve, (i) => rt.resolveConflict(i.roomId, i.memberId));
+  // TEST-ONLY: exists only on an e2e test home with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts).
+  if (rt.clock.enabled) handle(roomsV2TestClockAdvance, (i) => rt.advanceTestClock(i.ms));
   handle(roomsV2RoomDisconnect, (i) => {
     rt.disconnect(i.roomId);
     return { ok: true as const };

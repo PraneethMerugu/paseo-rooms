@@ -6,9 +6,11 @@
 //      name unless the daemon runs with PASEO_ROOMS_DEV_INSECURE_RELAY=1; a relay that is not in
 //      `trustedRelays` (default relay.paseo.sh:443) needs the user's explicit "Trust this relay";
 //   5. preview: room name and endpoint fingerprint marked unverified until the codes match.
-// Nothing is stored or connected here.
+// Nothing is stored or connected here. A device link code (`prl2.`, identity-model.md 6.4) gets the
+// same checks (I-11).
 import { fingerprintOfKid } from "../proto/keys";
 import { decodeInvite, InviteCodeError, isDevInsecureRelay, relayHostAllowed, relayKey, type InvitePayload } from "../host/invites";
+import { decodeLink, LINK_PREFIX, LinkCodeError, type DeviceLinkPayload } from "../proto/device-link";
 
 export const DEFAULT_TRUSTED_RELAYS: readonly string[] = ["relay.paseo.sh:443"];
 export const EXP_GRACE_S = 5 * 60;
@@ -40,15 +42,17 @@ export type InvitePreview = {
   relay: { host: string; port: number; trusted: boolean };
   exp: number;
   unverified: true;
+  /** `device-link`: this code adds a device to the person's existing membership. */
+  kind?: "invite" | "device-link";
 };
 
 /** Steps 1 to 4 and the preview. Throws JoinRefusedError; `relay.trusted` false means step 4 needs the user. */
-export function checkInvite(code: unknown, o: { nowS: number; trustedRelays: readonly string[]; env?: NodeJS.ProcessEnv }): { payload: InvitePayload; preview: InvitePreview } {
-  let payload: InvitePayload;
+export function checkInvite(code: unknown, o: { nowS: number; trustedRelays: readonly string[]; env?: NodeJS.ProcessEnv }): { payload: InvitePayload | DeviceLinkPayload; preview: InvitePreview } {
+  let payload: InvitePayload | DeviceLinkPayload;
   try {
-    payload = decodeInvite(code);
+    payload = typeof code === "string" && code.trim().startsWith(LINK_PREFIX) ? decodeLink(code) : decodeInvite(code);
   } catch (err) {
-    throw new JoinRefusedError(err instanceof InviteCodeError ? err.code : "malformed");
+    throw new JoinRefusedError(err instanceof InviteCodeError ? err.code : err instanceof LinkCodeError && err.code !== "not_link" ? err.code : "malformed");
   }
   if (payload.exp + EXP_GRACE_S < o.nowS) throw new JoinRefusedError("expired");
   const relay = payload.endpoint.relay;
@@ -63,6 +67,7 @@ export function checkInvite(code: unknown, o: { nowS: number; trustedRelays: rea
       relay: { host: relay.host.toLowerCase(), port: relay.port, trusted },
       exp: payload.exp,
       unverified: true,
+      kind: payload.typ,
     },
   };
 }

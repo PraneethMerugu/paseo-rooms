@@ -53,6 +53,28 @@ export function resolveConflict(s: RoomState, memberId: string, ver: number, seq
 }
 
 /**
+ * Why an automatic approval of this request can never be accepted now (policy, sole-device policy,
+ * open conflict, young requester), or null. The hold itself is separate (`holdMs`).
+ */
+export function autoApprovalBlocker(s: Readonly<RoomState>, p: PendingRequest): { reason: "auto_not_allowed" | "conflict_open" | "requester_too_young"; message: string } | null {
+  const policy = s.auth.policy;
+  if (policy.deviceAddApproval === "admin") return { reason: "auto_not_allowed", message: 'policy deviceAddApproval is "admin"' };
+  if (p.sole && policy.soleDeviceChange === "admin") return { reason: "auto_not_allowed", message: 'sole-device request under policy soleDeviceChange "admin"' };
+  if (s.conflicts[p.memberId] !== undefined) return { reason: "conflict_open", message: "the member has an open device conflict" };
+  if (p.young) return { reason: "requester_too_young", message: "the requesting device was active for less than 24 h" };
+  return null;
+}
+
+/**
+ * When (hts ms) a pending request can be approved automatically: the end of its hold, or null when it
+ * needs an admin (identity-model.md 6.3; `effectiveAfter` of `enroll.held`).
+ */
+export function autoApprovalEndsAt(s: Readonly<RoomState>, p: PendingRequest): number | null {
+  if (p.status !== "pending" || autoApprovalBlocker(s, p)) return null;
+  return p.hts + holdMs(p);
+}
+
+/**
  * Every rule an approval must meet (room-log-v2.md section 5). Returns the request, still pending;
  * the caller applies the change and then marks it approved.
  */
@@ -69,11 +91,8 @@ export function checkApproval(
   if (p.status === "vetoed") fail("vetoed", "the request was vetoed");
   if (p.status !== "pending") fail("not_pending", "the request was already approved");
   if (d.mode === "auto") {
-    const policy = s.auth.policy;
-    if (policy.deviceAddApproval === "admin") fail("auto_not_allowed", 'policy deviceAddApproval is "admin"');
-    if (p.sole && policy.soleDeviceChange === "admin") fail("auto_not_allowed", 'sole-device request under policy soleDeviceChange "admin"');
-    if (s.conflicts[d.memberId] !== undefined) fail("conflict_open", "the member has an open device conflict");
-    if (p.young) fail("requester_too_young", "the requesting device was active for less than 24 h");
+    const blocked = autoApprovalBlocker(s, p);
+    if (blocked) fail(blocked.reason, blocked.message);
     if (hts - p.hts < holdMs(p)) fail("hold_not_elapsed", `less than ${holdMs(p) / HOUR_MS} h since the request`);
   }
   return p;

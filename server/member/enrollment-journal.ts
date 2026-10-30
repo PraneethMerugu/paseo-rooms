@@ -8,13 +8,18 @@
 //   pending    `enroll.pending` verified with its `h` in `sentH`: pendingId, the content bytes and
 //              the SAS digits, before `sas.reveal`
 //   confirmed  member pressed "Codes match", before `enroll.confirm`
-//   held       device links (I-11)
+//   held       device links (I-11): `enroll.held` verified; waits for `enroll.admitted` or `enroll.closed`
 //   admitted   `enroll.admitted` verified, before any call to Paseo's hosts API (C-10)
 //   registered every lane host registered
 //   failed     closed or refused: keys deleted, reason kept for the UI until dismissed
 //
 // The invite token is not kept: only its `tokenKey`, which is what the MAC needs. Nothing here logs
 // keys, nonces, the token key or the SAS.
+//
+// Device links (I-11): the journal also holds a `prl2.` payload (without its token) in `invite`; the
+// target is then `linkId`. The same file carries the confirming device's own link counters under
+// `links` (server/member/device-link.ts, R-2), so every writer here replaces only its own section
+// (read, modify, write; one process, synchronous).
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import nodePath from "node:path";
@@ -22,6 +27,8 @@ import { z } from "zod";
 import { b64uBytes, entityId, LaneList, nonNegInt, Role } from "../authority/schema";
 import type { Kek } from "../keystore/keystore";
 import { InvitePayload } from "../host/invites";
+import { DeviceLinkPayload } from "../proto/device-link";
+import type { EnrollTarget } from "../proto/enroll";
 import { b64u, b64uDecode } from "../proto/b64u";
 import { sasCommitOf, tokenKeyOf } from "../proto/enroll";
 import { ed25519PrivateKeyFromSeed, rawPublicKey, x25519PrivateKeyFromSecret } from "../proto/keys";
@@ -41,10 +48,17 @@ export type JournalState = (typeof JOURNAL_STATES)[number];
 
 const Hash32 = b64uBytes(32);
 const InviteNoToken = z.strictObject({ ...InvitePayload.shape, token: z.null() });
+const LinkNoToken = z.strictObject({ ...DeviceLinkPayload.shape, token: z.null() });
+export type JoinPayload = z.infer<typeof InviteNoToken> | z.infer<typeof LinkNoToken>;
+
+/** `{inviteId}` for an invite, `{linkId}` for a device link. */
+export function targetOf(p: { inviteId: string } | { linkId: string }): EnrollTarget {
+  return "inviteId" in p ? { inviteId: p.inviteId } : { linkId: p.linkId };
+}
 
 const Enrollment = z.strictObject({
   state: z.enum(JOURNAL_STATES),
-  invite: InviteNoToken,
+  invite: z.union([InviteNoToken, LinkNoToken]),
   tokenKey: Hash32.nullable(),
   /** Device keys: Ed25519 seed and X25519 secret. Null once failed (deleted). */
   keys: z.strictObject({ sigSeed: Hash32, dhSecret: Hash32 }).nullable(),
@@ -69,6 +83,10 @@ const Enrollment = z.strictObject({
    * written before I-10.
    */
   admission: z.strictObject({ seq: nonNegInt(), hash: Hash32 }).nullable().optional(),
+  /** Device links: `newKeySig` over B's KeyChange, sent with `sas.reveal`. */
+  newKeySig: b64uBytes(64).nullable().optional(),
+  /** Device links: the `device.added` entry from `enroll.held`, and when it may take effect (null: an admin). */
+  held: z.strictObject({ seq: nonNegInt(), hash: Hash32, bodyHash: Hash32, effectiveAfter: nonNegInt().nullable() }).nullable().optional(),
   /** RJCS text of the verified genesis, once known. */
   genesis: z.string().nullable(),
   registrations: z.record(z.string(), z.string()),
@@ -82,9 +100,46 @@ const MemberState = z.strictObject({
   typ: z.literal("member-state"),
   roomId: z.string(),
   genesisHash: Hash32,
-  enrollment: Enrollment,
+  /** Absent when the file holds only a confirming device's link counters (`links`). */
+  enrollment: Enrollment.optional(),
+  /** server/member/device-link.ts (its own strict schema). */
+  links: z.unknown().optional(),
 });
 type MemberState = z.infer<typeof MemberState>;
+
+function readMemberState(dataDir: string, kek: Kek, roomId: string): MemberState | null {
+  const plain = kek.readSealed(memberStatePath(dataDir, roomId), memberStatePurpose(roomId));
+  if (!plain) return null;
+  try {
+    const parsed = MemberState.safeParse(rjcsParse(plain, STATE_MAX_BYTES));
+    if (!parsed.success || parsed.data.roomId !== roomId) throw new Error("member state file is invalid");
+    return parsed.data;
+  } finally {
+    plain.fill(0);
+  }
+}
+
+function writeMemberState(dataDir: string, kek: Kek, next: MemberState): void {
+  fs.mkdirSync(memberRoomDir(dataDir, next.roomId), { recursive: true, mode: 0o700 });
+  const plain = Buffer.from(rjcs(next, STATE_MAX_BYTES));
+  try {
+    kek.writeSealed(memberStatePath(dataDir, next.roomId), memberStatePurpose(next.roomId), plain);
+  } finally {
+    plain.fill(0);
+  }
+}
+
+/** The `links` section of a room's member state (undefined if none). */
+export function readLinkSection(o: { dataDir: string; kek: Kek; roomId: string }): unknown {
+  return readMemberState(o.dataDir, o.kek, o.roomId)?.links;
+}
+
+/** Replaces the `links` section, durably, keeping the enrollment journal as it is on disk. */
+export function writeLinkSection(o: { dataDir: string; kek: Kek; roomId: string; genesisHash: string }, links: unknown): void {
+  const cur = readMemberState(o.dataDir, o.kek, o.roomId);
+  if (cur && cur.genesisHash !== o.genesisHash) throw new Error("member state names another genesis");
+  writeMemberState(o.dataDir, o.kek, { ...(cur ?? { v: 2, typ: "member-state", roomId: o.roomId, genesisHash: o.genesisHash }), links });
+}
 
 export class JournalError extends Error {
   constructor(
@@ -101,21 +156,15 @@ export class EnrollmentJournal {
     private readonly dataDir: string,
     private readonly kek: Kek,
     readonly roomId: string,
-    private st: MemberState,
+    private st: MemberState & { enrollment: EnrollmentRecord },
     private readonly now: () => number,
   ) {}
 
   /** Journal of a room, or null. */
   static read(o: { dataDir: string; kek: Kek; roomId: string; now?: () => number }): EnrollmentJournal | null {
-    const plain = o.kek.readSealed(memberStatePath(o.dataDir, o.roomId), memberStatePurpose(o.roomId));
-    if (!plain) return null;
-    try {
-      const parsed = MemberState.safeParse(rjcsParse(plain, STATE_MAX_BYTES));
-      if (!parsed.success || parsed.data.roomId !== o.roomId) throw new Error("member state file is invalid");
-      return new EnrollmentJournal(o.dataDir, o.kek, o.roomId, parsed.data, o.now ?? Date.now);
-    } finally {
-      plain.fill(0);
-    }
+    const st = readMemberState(o.dataDir, o.kek, o.roomId);
+    if (!st?.enrollment) return null;
+    return new EnrollmentJournal(o.dataDir, o.kek, o.roomId, { ...st, enrollment: st.enrollment }, o.now ?? Date.now);
   }
 
   /** Rooms with a member journal. */
@@ -129,7 +178,7 @@ export class EnrollmentJournal {
    * State `keys` (user pressed Join): fresh per-room device keys, Nm and sasCommit, persisted before
    * any network access. `random` is for tests (vectors).
    */
-  static begin(o: { dataDir: string; kek: Kek; invite: InvitePayload; label: string; now?: () => number; random?: (n: number) => Buffer }): EnrollmentJournal {
+  static begin(o: { dataDir: string; kek: Kek; invite: InvitePayload | DeviceLinkPayload; label: string; now?: () => number; random?: (n: number) => Buffer }): EnrollmentJournal {
     const rnd = o.random ?? randomBytes;
     const sigSeed = rnd(32);
     const dhSecret = rnd(32);
@@ -139,8 +188,8 @@ export class EnrollmentJournal {
     try {
       const enrollment: EnrollmentRecord = {
         state: "keys",
-        invite: { ...o.invite, token: null },
-        tokenKey: b64u(tokenKeyOf(b64uDecode(o.invite.token, 32))),
+        invite: { ...o.invite, token: null } as JoinPayload,
+        tokenKey: b64u(tokenKeyOf(b64uDecode(o.invite.token, 32), o.invite.typ === "device-link" ? "link" : "invite")),
         keys: { sigSeed: b64u(sigSeed), dhSecret: b64u(dhSecret) },
         deviceSig: b64u(rawPublicKey(ed25519PrivateKeyFromSeed(sigSeed))),
         deviceDh: b64u(rawPublicKey(x25519PrivateKeyFromSecret(dhSecret))),
@@ -162,7 +211,6 @@ export class EnrollmentJournal {
         updatedAt: now,
       };
       const j = new EnrollmentJournal(o.dataDir, o.kek, roomId, { v: 2, typ: "member-state", roomId, genesisHash: o.invite.genesisHash, enrollment }, o.now ?? Date.now);
-      fs.mkdirSync(memberRoomDir(o.dataDir, roomId), { recursive: true, mode: 0o700 });
       j.persist(j.st);
       return j;
     } finally {
@@ -170,6 +218,15 @@ export class EnrollmentJournal {
       dhSecret.fill(0);
       nm.fill(0);
     }
+  }
+
+  /** `{inviteId}` or `{linkId}`. */
+  get target(): EnrollTarget {
+    return targetOf(this.st.enrollment.invite);
+  }
+
+  get isLink(): boolean {
+    return this.st.enrollment.invite.typ === "device-link";
   }
 
   get e(): Readonly<EnrollmentRecord> {
@@ -211,9 +268,25 @@ export class EnrollmentJournal {
   }
 
   /** `enroll.pending` verified: before `sas.reveal`. */
-  recordPending(p: { pendingId: string; content: string; sas: string; transcript: string; terms: { role: z.infer<typeof Role>; lanes: string[] }; expiresAt: number; genesis: string }): void {
+  recordPending(p: { pendingId: string; content: string; sas: string; transcript: string; terms: { role: z.infer<typeof Role>; lanes: string[] }; expiresAt: number; genesis: string; deviceId?: string; newKeySig?: string }): void {
     this.expect("keys");
-    this.update({ state: "pending", pendingId: p.pendingId, pending: p.content, sas: p.sas, transcript: p.transcript, terms: p.terms, expiresAt: p.expiresAt, genesis: p.genesis });
+    this.update({
+      state: "pending",
+      pendingId: p.pendingId,
+      pending: p.content,
+      sas: p.sas,
+      transcript: p.transcript,
+      terms: p.terms,
+      expiresAt: p.expiresAt,
+      genesis: p.genesis,
+      ...(p.deviceId ? { deviceId: p.deviceId, newKeySig: p.newKeySig ?? null } : {}),
+    });
+  }
+
+  /** Device links: `enroll.held` verified (both confirmations in, `device.added` logged). */
+  held(h: { seq: number; hash: string; bodyHash: string; effectiveAfter: number | null }): void {
+    this.expect("pending", "confirmed", "held");
+    this.update({ state: "held", held: h });
   }
 
   /** "Codes match": before `enroll.confirm`. */
@@ -243,9 +316,13 @@ export class EnrollmentJournal {
     this.update({ state: "failed", failure: reason.slice(0, 64), keys: null, nm: null, tokenKey: null });
   }
 
-  /** Removes the journal file (after the user dismissed a failed join). */
+  /** Removes the journal (after the user dismissed a failed join); link counters stay. */
   remove(): void {
-    fs.rmSync(memberStatePath(this.dataDir, this.roomId), { force: true });
+    const cur = readMemberState(this.dataDir, this.kek, this.roomId);
+    if (cur?.links !== undefined) {
+      const { enrollment: _e, ...rest } = cur;
+      writeMemberState(this.dataDir, this.kek, rest);
+    } else fs.rmSync(memberStatePath(this.dataDir, this.roomId), { force: true });
   }
 
   private expect(...states: JournalState[]): void {
@@ -256,13 +333,11 @@ export class EnrollmentJournal {
     this.persist({ ...this.st, enrollment: { ...this.st.enrollment, ...patch, updatedAt: this.now() } });
   }
 
-  private persist(next: MemberState): void {
-    const plain = Buffer.from(rjcs(next, STATE_MAX_BYTES));
-    try {
-      this.kek.writeSealed(memberStatePath(this.dataDir, this.roomId), memberStatePurpose(this.roomId), plain);
-    } finally {
-      plain.fill(0);
-    }
+  /** Replaces the `enrollment` section only (the confirming device's `links` stay as on disk). */
+  private persist(next: MemberState & { enrollment: EnrollmentRecord }): void {
+    const cur = readMemberState(this.dataDir, this.kek, this.roomId);
+    const { links: _stale, ...base } = next;
+    writeMemberState(this.dataDir, this.kek, cur?.links !== undefined ? { ...base, links: cur.links } : base);
     this.st = next;
   }
 }

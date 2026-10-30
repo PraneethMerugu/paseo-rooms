@@ -447,7 +447,8 @@ test("v2 runtime in-process: switch, relay address rules, owner and member runti
     await until("member confirmed on the host", () => owner.status().owned[0].joinRequests[0].state === "member_ok", 5000);
     await owner.admitJoin(roomId, pendingId);
     await until("member session open", () => member.status().joined[0]?.status === "open", 5000);
-    assert.equal(member.status().joining[0].state, "registered", "no lanes: registered at once");
+    // No lanes: registered right after the session's first sync (the I-10 gate), with no lane work.
+    await until("no lanes: registered once synced", () => member.status().joining[0].state === "registered", 2000);
     await until("member synced", () => member.status().joined[0].head.seq === owner.status().owned[0].head.seq, 5000);
     assert.deepEqual(member.status().joined[0].head, owner.status().owned[0].head);
     assert.equal(owner.status().owned[0].sessions.length, 1);

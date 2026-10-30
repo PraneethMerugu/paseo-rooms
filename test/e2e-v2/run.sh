@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Identity v2 end-to-end test (implementation plan I-8, I-9, I-10): room endpoint transport, sessions,
-# SAS enrollment and lane grants v2 between two disposable Paseo 0.13.2 test daemons running the plugin
-# with PASEO_ROOMS_PROTOCOL=v2. The driver restarts both daemons once, mid-enrollment, views the lane
-# through the member, waits for an idle and a forced grant rotation (short grants: 40 s), revokes, and
-# scans both homes for invite codes (prc2.) and grants (prg2.).
+# Identity v2 end-to-end test (implementation plan I-8 to I-11): room endpoint transport, sessions,
+# SAS enrollment, lane grants v2 and device linking between disposable Paseo 0.13.2 test daemons running
+# the plugin with PASEO_ROOMS_PROTOCOL=v2. The driver restarts the owner and member daemons once,
+# mid-enrollment, views the lane through the member, waits for an idle and a forced grant rotation
+# (short grants: 40 s), links a second device of the member (third daemon) and lets the 72 h hold pass
+# on the owner's test clock, revokes, and scans every home for invite and link codes (prc2., prl2.) and
+# grants (prg2.).
 #
-#   owner  : plugin/.test-homes/v2-owner   127.0.0.1:6921  (room host, room endpoint)
-#   member : plugin/.test-homes/v2-member  127.0.0.1:6922  (member device)
-#   relay  : fake relay process            127.0.0.1:6923  (default, offline)
-#            or the live relay relay.paseo.sh:443 with --live-relay (network; needs the user's go-ahead)
+#   owner   : plugin/.test-homes/v2-owner    127.0.0.1:6921  (room host, room endpoint, admin daemon)
+#   member  : plugin/.test-homes/v2-member   127.0.0.1:6922  (member device A)
+#   member2 : plugin/.test-homes/v2-member2  127.0.0.1:6924  (the same person's second device B)
+#   relay   : fake relay process             127.0.0.1:6923  (default, offline)
+#             or the live relay relay.paseo.sh:443 with --live-relay (network; needs the user's go-ahead)
+#
+# TEST-ONLY clock: the owner daemon (host and admin daemon) runs with PASEO_ROOMS_TEST_CLOCK=1 and its
+# home carries the marker file `rooms-test-home`; the plugin honours the override only on such a home
+# under .test-homes (server/platform/test-clock.ts). No other daemon gets the switch.
 #
 # Never touches ~/.paseo or the main daemon: every CLI call passes --home and PASEO_HOME explicitly.
 # Creates ONE agent on the owner for the lane (Claude Haiku, created without a prompt: no model call),
@@ -38,9 +45,11 @@ TSX=("${NODE[@]}" "$PLUGIN_DIR/node_modules/tsx/dist/cli.mjs")
 HOMES=$PLUGIN_DIR/.test-homes
 OWNER=$HOMES/v2-owner
 MEMBER=$HOMES/v2-member
+MEMBER2=$HOMES/v2-member2
 OWNER_PORT=6921
 MEMBER_PORT=6922
 RELAY_PORT=6923
+MEMBER2_PORT=6924
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 LOGDIR=$E2E_DIR/logs/$RUN_ID          # one directory per run; earlier runs are kept
 RELAY_PID=""
@@ -48,7 +57,7 @@ SCRATCH=$HOMES/v2-scratch            # the lane agent's working directory
 
 # ------------------------------------------------------------------ safety gates (before anything runs)
 MAIN_HOME=$(realpath -m "$HOME/.paseo")
-for h in "$OWNER" "$MEMBER"; do
+for h in "$OWNER" "$MEMBER" "$MEMBER2"; do
   r=$(realpath -m "$h")
   case "$r" in
     "$MAIN_HOME"|"$MAIN_HOME"/*) echo "Refusing: $h resolves to ~/.paseo" >&2; exit 2 ;;
@@ -61,7 +70,7 @@ done
 if [ -n "${PASEO_HOME:-}" ] && [ "$(realpath -m "${PASEO_HOME/#\~/$HOME}")" = "$MAIN_HOME" ]; then
   unset PASEO_HOME   # never inherited by our commands; every call sets it explicitly
 fi
-PORTS=("$OWNER_PORT" "$MEMBER_PORT")
+PORTS=("$OWNER_PORT" "$MEMBER_PORT" "$MEMBER2_PORT")
 [ "$LIVE" = 1 ] || PORTS+=("$RELAY_PORT")
 for port in "${PORTS[@]}"; do
   if [ "$port" = 6767 ] || [ "$port" -lt 6920 ] || [ "$port" -gt 6929 ]; then
@@ -113,7 +122,7 @@ cleanup() {
   local code=$?
   trap - EXIT INT TERM
   echo "== cleanup"
-  for h in "$MEMBER" "$OWNER"; do
+  for h in "$MEMBER2" "$MEMBER" "$OWNER"; do
     [ -d "$h" ] || continue
     pa "$h" plugin logs rooms > "$LOGDIR/plugin-$(basename "$h").log" 2>&1 || true
     pa "$h" plugin remove rooms >/dev/null 2>&1 || true
@@ -124,7 +133,7 @@ cleanup() {
     kill "$RELAY_PID" 2>/dev/null || true
     wait "$RELAY_PID" 2>/dev/null || true
   fi
-  if [ -z "${KEEP_HOMES:-}" ]; then rm -rf "$OWNER" "$MEMBER" "$SCRATCH"; echo "deleted v2 test homes"; fi
+  if [ -z "${KEEP_HOMES:-}" ]; then rm -rf "$OWNER" "$MEMBER" "$MEMBER2" "$SCRATCH"; echo "deleted v2 test homes"; fi
   if pgrep -f "$HOMES/v2-" >/dev/null; then echo "WARNING: processes still reference the v2 test homes"; code=1; else echo "no test processes left"; fi
   local busy=""
   for port in $(seq 6920 6929); do port_open "$port" && busy="$busy $port"; done
@@ -134,7 +143,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-rm -rf "$OWNER" "$MEMBER" "$SCRATCH"
+rm -rf "$OWNER" "$MEMBER" "$MEMBER2" "$SCRATCH"
 mkdir -p "$HOMES" "$SCRATCH"; chmod 700 "$HOMES" "$SCRATCH"
 
 if [ "$LIVE" != 1 ]; then
@@ -146,9 +155,14 @@ fi
 
 write_config "$OWNER" "$OWNER_PORT"
 write_config "$MEMBER" "$MEMBER_PORT"
-for h in "$OWNER" "$MEMBER"; do pa "$h" daemon start --timeout 120 | tail -1; done
-for h in "$OWNER" "$MEMBER"; do pa "$h" plugin install "$PLUGIN_DIR" --json | tail -3; done
+write_config "$MEMBER2" "$MEMBER2_PORT"
+# TEST-ONLY clock marker, owner home only (exact text checked by server/platform/test-clock.ts).
+printf 'paseo-rooms e2e test home; the test clock override may be used here\n' > "$OWNER/rooms-test-home"
+chmod 600 "$OWNER/rooms-test-home"
+PASEO_ROOMS_TEST_CLOCK=1 pa "$OWNER" daemon start --timeout 120 | tail -1
+for h in "$MEMBER" "$MEMBER2"; do pa "$h" daemon start --timeout 120 | tail -1; done
+for h in "$OWNER" "$MEMBER" "$MEMBER2"; do pa "$h" plugin install "$PLUGIN_DIR" --json | tail -3; done
 
-E2E_SCRATCH=$SCRATCH E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_PASEO_BIN=$P \
+E2E_SCRATCH=$SCRATCH E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_MEMBER2_HOME=$MEMBER2 E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_PASEO_BIN=$P \
   "${TSX[@]}" "$E2E_DIR/e2e.ts" 2>&1 | tee "$LOGDIR/e2e.log"
 test "${PIPESTATUS[0]}" -eq 0

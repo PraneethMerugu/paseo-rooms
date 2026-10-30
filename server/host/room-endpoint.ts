@@ -30,6 +30,10 @@
 //   next state no longer has, and remembers them, before the log append; so access stays cut even if
 //   the append fails and the room stops.
 //
+// - Device links (I-11): `device.link.create`, `link.nonce`, `link.confirm` and `link.abort` from an
+//   active device go to the enrollment host, which pushes `link.request`, `link.reveal` and
+//   `link.closed` to the link's creator; a creator whose session opens gets what it has not answered.
+//
 // Not here (later milestones): per-device budgets of every operation (only grants are limited),
 // endpoint rotation and `moved` (I-12), MLS operations (I-13).
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -61,7 +65,7 @@ import {
   type RoomErrorCode,
   type RoomSessionTimings,
 } from "../transport/room-session";
-import { EnrollmentHost, type EnrollmentHostOptions, type EnrollSession } from "./enrollment";
+import { EnrollmentHost, LINK_OPS, type EnrollmentHostOptions, type EnrollSession } from "./enrollment";
 import { grantStatusFrame, isGrantId, isLaneIdV2, type HostGrants } from "./grants";
 import type { RoomState } from "../authority/fold";
 import { readHostKeys, type RoomHost, type SubmitResult } from "./room-host";
@@ -89,7 +93,7 @@ export interface RoomEndpointOptions {
   /** Concurrent sessions of statics that are not active devices (5.4: 8). */
   maxPreauthSessions?: number;
   /** Serve enrollment (pre-auth operations). Without it they get the generic `enroll_rejected`. */
-  enrollment?: Omit<EnrollmentHostOptions, "host" | "afterAppend" | "endpointDh" | "now">;
+  enrollment?: Omit<EnrollmentHostOptions, "host" | "afterAppend" | "endpointDh" | "now" | "push">;
   /** Lane grants of this room (I-10). Without it the grant operations answer `not_permitted`. */
   grants?: HostGrants;
   /** Called at the end of every afterAppend (lane endpoints follow the log). */
@@ -147,7 +151,14 @@ export class RoomEndpoint {
     this.history = RoomLogFold.fromGenesis(o.host.genesis);
     this.catchUp();
     this.enrollment = o.enrollment
-      ? new EnrollmentHost({ ...o.enrollment, host: o.host, now: this.now, afterAppend: () => this.afterAppend(), endpointDh: () => o.host.state.auth.endpoint.dh.pub })
+      ? new EnrollmentHost({
+          ...o.enrollment,
+          host: o.host,
+          now: this.now,
+          afterAppend: () => this.afterAppend(),
+          endpointDh: () => o.host.state.auth.endpoint.dh.pub,
+          push: (deviceId, frame) => this.pushToDevice(deviceId, frame),
+        })
       : null;
     this.unhook = o.host.onDecide((next, prev, type) => this.decide(next, prev, type));
     if (o.grants) o.grants.notify = (deviceId, frame) => this.pushToDevice(deviceId, frame);
@@ -268,6 +279,11 @@ export class RoomEndpoint {
     }
     for (const conn of this.live.values()) conn.pump();
     try {
+      this.enrollment?.onAppended();
+    } catch (e) {
+      logError("room_endpoint_enrollment_follow_failed", e, { roomId: this.roomId });
+    }
+    try {
       this.o.onAppended?.();
     } catch (e) {
       logError("room_endpoint_on_appended_failed", e, { roomId: this.roomId });
@@ -282,6 +298,17 @@ export class RoomEndpoint {
     if (old && old !== conn) {
       log("room_session_superseded", { roomId: this.roomId, old: old.tag, by: conn.tag });
       old.fail("superseded");
+    }
+    if (conn.access.kind === "active") {
+      const deviceId = conn.access.deviceId;
+      // After the reply to the frame that confirmed the session: link requests the device has not answered.
+      queueMicrotask(() => {
+        try {
+          if (conn.isOpen()) this.enrollment?.onDeviceOnline(deviceId);
+        } catch (e) {
+          logError("room_endpoint_link_repush_failed", e, { roomId: this.roomId });
+        }
+      });
     }
   }
 
@@ -506,6 +533,19 @@ export class RoomConnection implements EnrollSession {
         case "grant.status":
         case "grant.report":
           return this.onGrant(frame, access);
+        case "device.link.create":
+        case "link.nonce":
+        case "link.confirm":
+        case "link.abort": {
+          const enrollment = this.endpoint.enrollment;
+          if (!enrollment || !LINK_OPS.has(t)) return this.fail("not_permitted", frame.id);
+          this.endpoint.submitting = this;
+          try {
+            return enrollment.handleLink(this, frame, { memberId: access.memberId, deviceId: access.deviceId, sigKid: access.sigKid });
+          } finally {
+            this.endpoint.submitting = null;
+          }
+        }
         default:
           if (LATER_OPS.has(t)) return this.fail("not_permitted", frame.id);
           return this.fail("bad_frame", frame.id);

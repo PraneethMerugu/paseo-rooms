@@ -19,6 +19,13 @@
 //   transcript) and journaled before anything else; the caller then registers lanes and opens a
 //   normal session, whose log sync folds and verifies the admission entry.
 // Transport failures retry with backoff; terminal errors fail the journal (keys deleted).
+//
+// Device links (I-11; identity-model.md 6.4): the same flow with a `prl2.` code. The request names
+// `linkId` and its MAC uses the link's token key; `enroll.pending` carries the assigned `deviceId`
+// and `Nh` is the confirming device's nonce; `sas.reveal` adds `newKeySig` (the new key signs its
+// KeyChange, `old: null`). After both confirmations the host logs `device.added` and sends
+// `enroll.held`; the journal moves to `held` and the join waits (resuming as before) for
+// `enroll.admitted` carrying `device.add.approved` for that request, or `enroll.closed`.
 import { z } from "zod";
 import { bodyHash, SignedEntry as SignedEntrySchema } from "../authority/entries";
 import { verifyAuthorityChain } from "../authority/authority-chain";
@@ -28,6 +35,7 @@ import type { SignedStatement } from "../authority/statements";
 import { log } from "../log";
 import { b64u, b64uDecode, b64uDecodeVar } from "../proto/b64u";
 import { computeSas, enrollSigned, enrollTokenMac, signEnroll } from "../proto/enroll";
+import { newDeviceKeyChange, signNewKey } from "../proto/device-link";
 import { inviteRef } from "../proto/ids";
 import { ed25519PrivateKeyFromSeed, rawPublicKey, x25519PrivateKeyFromSecret } from "../proto/keys";
 import { rjcs, rjcsText, RJCS_MAX_BYTES, RJCS_MAX_FRAME_BYTES } from "../proto/rjcs";
@@ -52,6 +60,13 @@ const PendingContent = z.strictObject({
   }),
   terms: z.strictObject({ role: Role, lanes: LaneList }),
   expiresAt: nonNegInt(),
+});
+
+const Held = z.strictObject({
+  t: z.literal("enroll.held"),
+  pendingId: entityId("pending"),
+  entry: SignedEntrySchema,
+  effectiveAfter: nonNegInt().nullable(),
 });
 
 const Admitted = z.strictObject({
@@ -152,7 +167,7 @@ export class MemberEnrollment {
     // While waiting for the other side, a dropped session is reopened (with enroll.resume).
     this.watchdog ??= setInterval(() => {
       const st = this.o.journal.state;
-      if ((st === "pending" || st === "confirmed") && this.connection === "waiting" && this.client?.status !== "open" && !this.running) void this.start();
+      if ((st === "pending" || st === "confirmed" || st === "held") && this.connection === "waiting" && this.client?.status !== "open" && !this.running) void this.start();
     }, 2000);
     (this.watchdog as { unref?: () => void }).unref?.();
     this.running ??= this.step().finally(() => (this.running = null));
@@ -220,7 +235,7 @@ export class MemberEnrollment {
     try {
       await client.open();
       const h = client.handshakeHash!;
-      let resume: { state: string; admitted?: unknown } | null = null;
+      let resume: { state: string; admitted?: unknown; held?: unknown } | null = null;
       if (j.state === "keys") {
         j.addSentH(h);
         const reply = await client.request(this.requestFrame(h, keys.sigSeed));
@@ -231,7 +246,7 @@ export class MemberEnrollment {
           resume = { state: "created" };
         } else if (reply.t === "enroll.resume.ok") {
           this.acceptPending(reply.pending);
-          resume = { state: String(reply.state), admitted: reply.admitted };
+          resume = { state: String(reply.state), admitted: reply.admitted, held: reply.held };
         } else throw new RoomSessionError("bad_frame");
       } else {
         keys.sigSeed.fill(0);
@@ -241,10 +256,12 @@ export class MemberEnrollment {
           await this.sendAbort("cancelled");
           throw new Refuse("resume_mismatch");
         }
-        resume = { state: String(reply.state), admitted: reply.admitted };
+        resume = { state: String(reply.state), admitted: reply.admitted, held: reply.held };
       }
       if (resume.admitted) return this.onAdmittedFrame(resume.admitted);
-      if (resume.state === "created") await client.request({ t: "sas.reveal", Nm: b64u(j.nm()) });
+      if (resume.held) this.onHeldFrame(resume.held);
+      if (j.state === "failed") return;
+      if (resume.state === "created") await client.request({ t: "sas.reveal", Nm: b64u(j.nm()), ...(j.isLink ? { newKeySig: j.e.newKeySig! } : {}) });
       if (j.state === "confirmed" && resume.state !== "member_ok") await client.request({ t: "enroll.confirm", pendingId: j.e.pendingId! });
       this.attempt = 0;
       this.connection = "waiting";
@@ -261,13 +278,14 @@ export class MemberEnrollment {
     const e = j.e;
     const priv = ed25519PrivateKeyFromSeed(sigSeed);
     const deviceSig = b64u(rawPublicKey(priv));
-    const signed = enrollSigned({ h, genesisHash: e.invite.genesisHash, target: { inviteId: e.invite.inviteId }, deviceSig, deviceDh: e.deviceDh, label: e.label, sasCommit: e.sasCommit });
+    const target = j.target;
+    const signed = enrollSigned({ h, genesisHash: e.invite.genesisHash, target, deviceSig, deviceDh: e.deviceDh, label: e.label, sasCommit: e.sasCommit });
     const tokenKey = j.tokenKey();
     try {
       return {
         t: "enroll.request",
         v: 2,
-        inviteId: e.invite.inviteId,
+        ...target,
         deviceSig,
         deviceDh: e.deviceDh,
         label: e.label,
@@ -288,6 +306,8 @@ export class MemberEnrollment {
     if (!parsed.success) throw new RoomSessionError("bad_frame");
     const p = parsed.data;
     if (!e.sentH.includes(p.h)) throw new Refuse("unpinned_h");
+    // A device link names the new device's id (6.4 step 2); an invite never does.
+    if (j.isLink !== (p.deviceId !== undefined)) throw new RoomSessionError("bad_frame");
     let genesisText: string;
     try {
       const v = verifyGenesis(p.genesis);
@@ -310,22 +330,50 @@ export class MemberEnrollment {
       deviceSig: e.deviceSig,
       endpointDh: e.invite.endpoint.dh.pub,
       genesisHash: e.invite.genesisHash,
-      target: { inviteId: e.invite.inviteId },
+      target: j.target,
     });
-    j.recordPending({ pendingId: p.pendingId, content: rjcsText(value), sas: sas.digits, transcript: sas.transcript, terms: p.terms, expiresAt: p.expiresAt, genesis: genesisText });
+    let newKeySig: string | undefined;
+    if (p.deviceId) {
+      // The new signing key signs its own KeyChange (old: null), carried by sas.reveal (6.4 step 4).
+      const keys = j.deviceKeys();
+      keys.dhSecret.fill(0);
+      try {
+        newKeySig = signNewKey(ed25519PrivateKeyFromSeed(keys.sigSeed), newDeviceKeyChange(this.roomId, p.deviceId, e.deviceSig, e.deviceDh));
+      } finally {
+        keys.sigSeed.fill(0);
+      }
+    }
+    j.recordPending({ pendingId: p.pendingId, content: rjcsText(value), sas: sas.digits, transcript: sas.transcript, terms: p.terms, expiresAt: p.expiresAt, genesis: genesisText, ...(p.deviceId ? { deviceId: p.deviceId, newKeySig } : {}) });
     log("join_pending", { roomId: this.roomId, pendingId: p.pendingId });
     this.changed();
   }
 
   private onPush(frame: Frame): void {
     if (frame.t === "enroll.admitted") return this.onAdmittedFrame(frame);
+    if (frame.t === "enroll.held") return this.onHeldFrame(frame);
     if (frame.t === "enroll.closed") return this.fail(`closed:${String(frame.reason).slice(0, 24)}`);
+  }
+
+  /** Device links: `enroll.held` (6.4 step 7). The entry is checked again by the fold after admission. */
+  private onHeldFrame(value: unknown): void {
+    const j = this.o.journal;
+    if (!j.isLink || !["pending", "confirmed", "held"].includes(j.state)) return;
+    const h = Held.safeParse(value);
+    if (!h.success || h.data.pendingId !== j.e.pendingId || h.data.entry.entry.type !== "device.added") return this.fail("bad_admission");
+    const prev = j.e.held;
+    if (prev && (prev.hash !== h.data.entry.hash || prev.seq !== h.data.entry.entry.seq)) return this.fail("bad_admission");
+    if (!prev) {
+      j.held({ seq: h.data.entry.entry.seq, hash: h.data.entry.hash, bodyHash: h.data.entry.entry.bodyHash, effectiveAfter: h.data.effectiveAfter });
+      log("join_held", { roomId: this.roomId, seq: h.data.entry.entry.seq, effectiveAfter: h.data.effectiveAfter });
+    }
+    this.changed();
   }
 
   private onAdmittedFrame(value: unknown): void {
     const j = this.o.journal;
     if (j.state === "admitted" || j.state === "registered" || j.state === "failed") return;
     const e = j.e;
+    if (j.isLink) return this.onLinkAdmitted(value);
     try {
       const a = Admitted.parse(value);
       const stmt = a.statement as SignedStatement;
@@ -341,6 +389,7 @@ export class MemberEnrollment {
         dev?.sig === e.deviceSig &&
         dev?.dh === e.deviceDh &&
         d.confirmation?.method === "sas6" &&
+        "inviteId" in e.invite &&
         d.confirmation.inviteRef === inviteRef(e.invite.inviteId) &&
         d.confirmation.transcript === e.transcript;
       if (!ok) throw new Refuse("bad_admission");
@@ -349,6 +398,42 @@ export class MemberEnrollment {
       return this.fail(err instanceof Refuse ? err.reason : "bad_admission");
     }
     log("join_admitted", { roomId: this.roomId, memberId: j.e.memberId, deviceId: j.e.deviceId });
+    this.connection = "done";
+    this.client?.close();
+    this.client = null;
+    this.changed();
+    this.o.onAdmitted?.(this);
+  }
+
+  /**
+   * Device links: `enroll.admitted` carries `device.add.approved` naming the held `device.added` and
+   * this device. The admin's signature and the hold are checked by the full fold after admission (5.7).
+   */
+  private onLinkAdmitted(value: unknown): void {
+    const j = this.o.journal;
+    const e = j.e;
+    try {
+      const a = Admitted.parse(value);
+      const stmt = a.statement as SignedStatement;
+      const d = (stmt?.body?.data ?? {}) as { memberId?: string; deviceId?: string; ref?: string };
+      const ok =
+        a.pendingId === e.pendingId &&
+        !!e.held &&
+        a.entry.entry.type === "device.add.approved" &&
+        a.entry.entry.seq > e.held.seq &&
+        a.entry.entry.bodyHash === bodyHash(rjcs(stmt, RJCS_MAX_FRAME_BYTES)) &&
+        stmt.body.type === "device.add.approved" &&
+        stmt.body.roomId === this.roomId &&
+        a.deviceId === e.deviceId &&
+        d.deviceId === e.deviceId &&
+        d.memberId === a.memberId &&
+        d.ref === e.held.bodyHash;
+      if (!ok) throw new Refuse("bad_admission");
+      j.admitted(a.memberId, a.deviceId, { seq: a.entry.entry.seq, hash: a.entry.hash });
+    } catch (err) {
+      return this.fail(err instanceof Refuse ? err.reason : "bad_admission");
+    }
+    log("join_admitted", { roomId: this.roomId, memberId: j.e.memberId, deviceId: j.e.deviceId, link: true });
     this.connection = "done";
     this.client?.close();
     this.client = null;

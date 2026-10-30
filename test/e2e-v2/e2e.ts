@@ -1,4 +1,4 @@
-// Identity v2 e2e driver (implementation plan I-8, I-9, I-10). Talks to the two test daemons like the
+// Identity v2 e2e driver (implementation plan I-8 to I-11). Talks to the three test daemons like the
 // CLI does (DaemonClient with the local credential) and calls the v2 plugin RPCs; the lane is viewed
 // through the member daemon exactly as the app opens a routed host (createHostChannelTransport over
 // the member's connection). Creates ONE agent on the owner (Claude Haiku, created WITHOUT a prompt, so
@@ -24,9 +24,18 @@
 // no `prc2.` and no `prg2.` in any file of either home except the member daemon's hosts.json (grant
 // by design), and no grant or invite in the logs.
 //
+// Device link (I-11), between the rotation and the removal: the owner's test clock (host and admin
+// daemon; TEST-ONLY, server/platform/test-clock.ts) moves 25 h so member device A is not young -> A
+// creates a `prl2.` link -> the member's second daemon (6924) joins with it -> A and B show the same SAS
+// (A computes it from its own nonce; the owner sees none) -> both press "Codes match" -> B is held:
+// A is the member's only device, so 72 h -> after 71 h on the owner's clock B is still held -> after
+// 72 h the admin daemon approves automatically -> B is the same member with its own device id, its own
+// session and its own lane grant -> the removal of the member later ends both devices.
+//
 // TEST-ONLY: the SAS comparison that people do by voice is done here by reading the code from the
 // owner's join card (rooms.v2.status) and from the member's join view, and checking they are equal
-// before pressing "Codes match" and "Admit" programmatically. A mismatch fails the run.
+// before pressing "Codes match" and "Admit" programmatically. A mismatch fails the run. The device
+// link's SAS is read the same way from device A's link view and device B's join view.
 import { readdirSync, readFileSync, statSync, lstatSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -37,6 +46,8 @@ import { createHostChannelTransport } from "@getpaseo/client/internal/hosts";
 
 const OWNER = process.env.E2E_OWNER_HOME!;
 const MEMBER = process.env.E2E_MEMBER_HOME!;
+const MEMBER2 = process.env.E2E_MEMBER2_HOME!;
+const HOUR = 60 * 60 * 1000;
 const LIVE = process.env.E2E_LIVE === "1";
 const RELAY_LOG = process.env.E2E_RELAY_LOG ?? "";
 const PASEO_BIN = process.env.E2E_PASEO_BIN!;
@@ -116,7 +127,8 @@ function canonical(v: unknown): string {
 /** Restarts one test daemon (same home and port; the plugin restarts with it). */
 function restartDaemon(home: string): void {
   if (!/\.test-homes\/v2-[a-z]+$/.test(home)) throw new Error("refusing to restart a daemon outside .test-homes/v2-*");
-  const env = { ...process.env, PASEO_HOME: home };
+  // The TEST-ONLY clock switch goes to the owner daemon only (the plugin also requires the marker file).
+  const env = { ...process.env, PASEO_HOME: home, ...(home === OWNER ? { PASEO_ROOMS_TEST_CLOCK: "1" } : {}) };
   execFileSync(PASEO_BIN, ["daemon", "stop", "--home", home], { env, stdio: ["ignore", "ignore", "ignore"], timeout: 120_000 });
   execFileSync(PASEO_BIN, ["daemon", "start", "--timeout", "120", "--home", home], { env, stdio: ["ignore", "ignore", "ignore"], timeout: 180_000 });
 }
@@ -133,12 +145,17 @@ async function main() {
   // Plugin RPCs are served only once the plugin process is up.
   let o = await daemonClient(OWNER, "owner");
   let m = await daemonClient(MEMBER, "member");
+  const m2 = await daemonClient(MEMBER2, "member2");
 
-  // ------------------------------------------------------------ 1. v2 runtime on both daemons
+  // ------------------------------------------------------------ 1. v2 runtime on every daemon
   const so = await v2Ready(o, "owner");
   const sm = await v2Ready(m, "member");
-  check("v2 runtime ready on both daemons", so.state === "ready" && sm.state === "ready", { owner: so.state, member: sm.state, ownerError: so.error, memberError: sm.error });
-  check("keystore is the protected fallback file (no keyring)", so.keystore?.backend === "fallback-file" && sm.keystore?.backend === "fallback-file", { owner: so.keystore, member: sm.keystore });
+  const sm2 = await v2Ready(m2, "member2");
+  check("v2 runtime ready on all three daemons", so.state === "ready" && sm.state === "ready" && sm2.state === "ready", { owner: so.state, member: sm.state, member2: sm2.state, ownerError: so.error, memberError: sm.error });
+  check("keystore is the protected fallback file (no keyring)", [so, sm, sm2].every((x) => x.keystore?.backend === "fallback-file"), { owner: so.keystore, member: sm.keystore, member2: sm2.keystore });
+  check("TEST-ONLY clock available on the owner's marked test home only", so.testClockOffsetMs === 0 && sm.testClockOffsetMs === undefined && sm2.testClockOffsetMs === undefined, { owner: so.testClockOffsetMs ?? null });
+  const noClock = await attempt(() => rpc(m, "rooms.v2.test.clock.advance", { ms: 1000 }));
+  check("the test clock RPC is not registered on a daemon without the switch and marker", !noClock.ok, { error: noClock.ok ? null : noClock.error });
   const m1 = await attempt(() => rpc(o, "rooms.overview", {}));
   check("M1 RPCs are not registered under the v2 switch", !m1.ok, { error: m1.ok ? null : m1.error });
   const dev = await attempt(() => rpc(o, "rooms.v2.dev.member.admit", {}));
@@ -307,6 +324,62 @@ async function main() {
   check("view closed: idle rotation at 50 % (no routes)", idle.ok, idle.ok ? { lastDecision: idle.value.lastDecision } : { error: idle.error, last: await memberLane() });
   await until("lane online after rotation", async () => (await laneHost())?.status === "online", 30_000).catch(() => null);
 
+  // ------------------------------------------------------------ 8b. device link: the same person's second device (I-11)
+  const ownerRoom = async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
+  const aJoined = async () => (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+  // Device A was admitted minutes ago: a device younger than 24 h cannot request an automatic add.
+  const adv = await rpc(o, "rooms.v2.test.clock.advance", { ms: 25 * HOUR });
+  log("test_clock_advanced", { daemon: "owner", hours: adv.offsetMs / HOUR });
+  const link = await rpc(m, "rooms.v2.link.create", { roomId, roomName: "E2E room" });
+  const linkCode: string = link.code;
+  const linkToken = JSON.parse(Buffer.from(linkCode.slice(5), "base64url").toString("utf8")).token as string;
+  check("device A created a prl2 link code (10 minutes)", linkCode.startsWith("prl2.") && linkCode.length > 400 && link.exp - Math.floor(Date.now() / 1000) <= 600, { length: linkCode.length });
+  const lp = await rpc(m2, "rooms.v2.join.preview", { code: linkCode });
+  check("link preview on the second daemon: same room, unverified", lp.roomId === roomId && lp.unverified === true, { relay: lp.relay });
+  await rpc(m2, "rooms.v2.join.start", { code: linkCode, label: "E2E member phone", ...(LIVE ? {} : { trustRelay: true }) });
+  const bJoin = async () => (await rpc(m2, "rooms.v2.status", {})).joining.find((j: any) => j.roomId === roomId);
+  const aLink = async () => (await aJoined())?.links.find((l: any) => l.linkId === link.linkId);
+  const bSas = await until("B's SAS", async () => (await bJoin())?.sas ?? null, 30_000);
+  const aView = await until("A's SAS", async () => {
+    const l = await aLink();
+    return l?.pending?.sas ? l : null;
+  }, 30_000);
+  // TEST-ONLY comparison of the person's two screens.
+  check("devices A and B show the same SAS (A computed it from its own nonce)", /^\d{3} \d{3}$/.test(bSas) && bSas === aView.pending.sas, { equal: bSas === aView.pending.sas, attempts: aView.attempts, earlier: aView.pending.earlierAttempts });
+  const linkCard = (await ownerRoom())?.joinRequests.find((p: any) => p.kind === "link");
+  check("the host shows no SAS for a device link (the owner is not the confirmer)", linkCard && linkCard.sas === null, { state: linkCard?.state });
+  if (bSas !== aView.pending.sas) throw new Error("link SAS mismatch: refusing to confirm");
+  await rpc(m2, "rooms.v2.join.confirm", { roomId, match: true });
+  await rpc(m, "rooms.v2.link.confirm", { roomId, pendingId: aView.pending.pendingId, match: true });
+  const held = await attempt(() => until("B held", async () => ((await bJoin())?.state === "held" ? bJoin() : null), 30_000));
+  const req = await until("owner sees the held add", async () => (await ownerRoom())?.deviceRequests.find((r: any) => r.kind === "add" && r.status === "pending"), 10_000);
+  check("both confirmed: device.added logged and B held", held.ok, held.ok ? { seq: req.seq } : { error: held.error });
+  check("A is the member's only device and not young: the hold is 72 h", req.sole === true && req.young === false && req.effectiveAfter === req.hts + 72 * HOUR && req.memberId === mv.memberId, { sole: req.sole, young: req.young, holdH: (req.effectiveAfter - req.hts) / HOUR });
+  check("device A shows the request to its person (Was this you?)", (await aJoined())?.deviceRequests.some((r: any) => r.ref === req.ref && r.status === "pending"), {});
+  await rpc(o, "rooms.v2.test.clock.advance", { ms: 71 * HOUR });
+  await sleep(2500); // longer than the admin daemon's approval interval
+  const at71 = (await ownerRoom())?.deviceRequests.find((r: any) => r.ref === req.ref);
+  check("after 71 h on the admin daemon's clock: still held", at71?.status === "pending" && (await bJoin())?.state === "held", { status: at71?.status });
+  const t3 = Date.now();
+  await rpc(o, "rooms.v2.test.clock.advance", { ms: HOUR + 5000 });
+  const approved = await attempt(() => until("approved", async () => (await ownerRoom())?.deviceRequests.find((r: any) => r.ref === req.ref && r.status === "approved"), 15_000));
+  check("after 72 h the admin daemon approves automatically (device.add.approved, mode auto)", approved.ok, approved.ok ? { ms: Date.now() - t3 } : { error: approved.error });
+  const bOpen = await attempt(() => until("B session open", async () => {
+    const j = (await rpc(m2, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+    return j?.status === "open" ? j : null;
+  }, 30_000));
+  check("B admitted as the same member with its own device id", bOpen.ok && bOpen.value.memberId === mv.memberId && bOpen.value.deviceId === req.deviceId && req.deviceId !== mv.deviceId, bOpen.ok ? { member: bOpen.value.memberId === mv.memberId } : { error: bOpen.error });
+  const bSynced = await attempt(() => until("B synced", async () => {
+    const j = (await rpc(m2, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+    const ow = await ownerRoom();
+    return j && ow && j.head.seq === ow.head.seq ? { j, ow } : null;
+  }, 15_000));
+  check("B's own fold accepts the log, including the 72 h approval (no alerts)", bSynced.ok && bSynced.value.j.alerts.length === 0, bSynced.ok ? { head: bSynced.value.j.head.seq } : { error: bSynced.error });
+  const sessionsNow = (await ownerRoom())?.sessions ?? [];
+  check("owner sees live sessions of both devices of the member", sessionsNow.some((x: any) => x.deviceId === mv.deviceId) && sessionsNow.some((x: any) => x.deviceId === req.deviceId), { sessions: sessionsNow.length });
+  const bGrant = await attempt(() => until("B's own lane grant", async () => (await ownerRoom())?.grants.find((g: any) => g.deviceId === req.deviceId && g.laneId === laneId), 60_000));
+  check("B gets its own lane grant (per device)", bGrant.ok, bGrant.ok ? {} : { error: bGrant.error });
+
   // Positive control for the secret scan: while registered, the member daemon's hosts.json (written by
   // Paseo, 0600) holds the current grant, and no other file of either home does.
   const grantFiles: string[] = [];
@@ -338,6 +411,11 @@ async function main() {
     return j?.status === "ended" ? j : null;
   }, 20_000, 100));
   check("removal ends the live session with access_ended removed", ended.ok && ended.value.endedReason === "removed", ended.ok ? { endedReason: ended.value.endedReason, removedSeq: removed.seq, ms: Date.now() - t2 } : { error: ended.error });
+  const endedB = await attempt(() => until("member2 ended", async () => {
+    const j = (await rpc(m2, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+    return j?.status === "ended" ? j : null;
+  }, 20_000, 100));
+  check("the member's removal also ends device B's session", endedB.ok && endedB.value.endedReason === "removed", endedB.ok ? {} : { error: endedB.error });
   const hostGone = await attempt(() => until("lane host removed", async () => !(await laneHost()), 20_000, 250));
   check("the member removes its lane host after access ended", hostGone.ok, hostGone.ok ? {} : { error: hostGone.error });
   const after = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
@@ -352,7 +430,7 @@ async function main() {
   const prefixHits: string[] = [];
   const grantsInHostsJson: string[] = [];
   const modes: Record<string, string> = {};
-  for (const [label, home] of [["owner", OWNER], ["member", MEMBER]] as const) {
+  for (const [label, home] of [["owner", OWNER], ["member", MEMBER], ["member2", MEMBER2]] as const) {
     const root = join(home, "plugin-data", "rooms");
     modes[`${label}:plugin-data/rooms`] = (statSync(root).mode & 0o777).toString(8);
     for (const f of files(root)) {
@@ -368,19 +446,20 @@ async function main() {
       if (/node_modules|\/plugins\//.test(f)) continue;
       const text = readFileSync(f).toString("latin1");
       const rel = f.slice(home.length + 1);
-      if (text.includes(token) || text.includes(code.slice(5, 80))) tokenFound.push(`${label}:${rel}`);
+      if (text.includes(token) || text.includes(code.slice(5, 80)) || text.includes(linkToken) || text.includes(linkCode.slice(5, 80))) tokenFound.push(`${label}:${rel}`);
       // Secret scan by prefix: invite codes (prc2.) nowhere; grants (prg2.) only in the member
       // daemon's own hosts.json, where Paseo keeps the connection password by design.
       if (/prc2\.[A-Za-z0-9_-]{20}/.test(text)) prefixHits.push(`${label}:${rel}:prc2`);
+      if (/prl2\.[A-Za-z0-9_-]{20}/.test(text)) prefixHits.push(`${label}:${rel}:prl2`);
       if (/prg2\.[A-Za-z0-9_-]{20}/.test(text)) {
-        if (label === "member" && /(^|\/)hosts\.json$/.test(rel)) grantsInHostsJson.push(rel);
+        if (label !== "owner" && /(^|\/)hosts\.json$/.test(rel)) grantsInHostsJson.push(rel);
         else prefixHits.push(`${label}:${rel}:prg2`);
       }
     }
   }
   check("no plaintext secret fields in either data tree; key and state files sealed", plaintextSecrets.length === 0, { found: plaintextSecrets });
-  check("the invite code and token appear in no file of either home (data, logs)", tokenFound.length === 0, { found: tokenFound });
-  check("secret scan: no prc2. and no prg2. outside the member's hosts.json (logs, plugin data, owner)", prefixHits.length === 0, { found: prefixHits, hostsJsonWithGrant: grantsInHostsJson.length });
+  check("the invite and link codes and tokens appear in no file of any home (data, logs)", tokenFound.length === 0, { found: tokenFound });
+  check("secret scan: no prc2., no prl2. and no prg2. outside the members' hosts.json (logs, plugin data, owner)", prefixHits.length === 0, { found: prefixHits, hostsJsonWithGrant: grantsInHostsJson.length });
   check("data dirs 0700 and sealed files 0600", Object.entries(modes).every(([k, v]) => (k.endsWith("rooms") ? v === "700" : v === "600")), { modes });
   if (!LIVE && RELAY_LOG && existsSync(RELAY_LOG)) {
     const lines = readFileSync(RELAY_LOG, "utf8");
@@ -389,6 +468,7 @@ async function main() {
 
   await o.close();
   await m.close();
+  await m2.close();
   await archiveAgent();
   log("SUMMARY", { failures, seconds: Math.round((Date.now() - T0) / 1000) });
   process.exit(failures ? 1 : 0);
