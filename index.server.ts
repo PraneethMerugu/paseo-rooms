@@ -50,6 +50,19 @@ import {
   roomsV2TestClockAdvance,
   roomsV2MlsSend,
   roomsV2MlsMessages,
+  roomsV2DeviceRekey,
+  roomsV2DeviceRemove,
+  roomsV2HostKeyRotate,
+  roomsV2HostKeyRevoke,
+  roomsV2AdminKeyRotate,
+  roomsV2AdminKeyRevoke,
+  roomsV2EndpointRotate,
+  roomsV2LaneRotate,
+  roomsV2CloseProposed,
+  roomsV2CloseConfirm,
+  roomsV2RecoveryCreate,
+  roomsV2RecoveryConfirm,
+  roomsV2RecoveryAct,
 } from "./shared/rpc-v2";
 
 const VERSION = "0.1.0";
@@ -189,7 +202,7 @@ function contributeV2(server: PluginServerContext) {
     await rt.rejectJoin(i.roomId, i.pendingId, i.reason);
     return { ok: true as const };
   });
-  handle(roomsV2MemberRemove, (i) => rt.removeMember(i.roomId, i.memberId));
+  handle(roomsV2MemberRemove, (i) => rt.removeMember(i.roomId, i.memberId, i.compromise === true));
   handle(roomsV2MemberRole, (i) => rt.changeRole(i.roomId, i.memberId, i.role));
   // Owner: lanes (grants-v2; I-10).
   handle(roomsV2LaneCreate, (i) => rt.createLane(i));
@@ -218,6 +231,20 @@ function contributeV2(server: PluginServerContext) {
   handle(roomsV2ConflictResolve, (i) => rt.resolveConflict(i.roomId, i.memberId));
   handle(roomsV2MlsSend, (i) => rt.mlsSend(i.roomId, i.text));
   handle(roomsV2MlsMessages, (i) => rt.mlsMessages(i.roomId));
+  // Rotation and recovery (I-12). The RPC call is the confirmation in the development runtime.
+  handle(roomsV2DeviceRekey, (i) => rt.requestRekey(i.roomId));
+  handle(roomsV2DeviceRemove, (i) => rt.removeDevice(i.roomId, i.memberId, i.deviceId, i.compromise));
+  handle(roomsV2HostKeyRotate, (i) => rt.rotateHostKey(i.roomId));
+  handle(roomsV2HostKeyRevoke, (i) => rt.revokeHostKey(i.roomId, i.kid, i.fromSeq));
+  handle(roomsV2AdminKeyRotate, (i) => rt.rotateAdminKey(i.roomId));
+  handle(roomsV2AdminKeyRevoke, (i) => rt.revokeAdminKey(i.roomId, i.kid, i.fromSeq));
+  handle(roomsV2EndpointRotate, (i) => rt.rotateEndpoint(i.roomId));
+  handle(roomsV2LaneRotate, (i) => rt.rotateLane(i.roomId, i.laneId));
+  handle(roomsV2CloseProposed, (i) => rt.proposeClose(i.roomId));
+  handle(roomsV2CloseConfirm, (i) => rt.confirmClose(i.roomId, i.proposal));
+  handle(roomsV2RecoveryCreate, (i) => rt.createRecoveryKey(i.roomId));
+  handle(roomsV2RecoveryConfirm, (i) => rt.confirmRecoveryKey(i.roomId, i.proposal));
+  handle(roomsV2RecoveryAct, (i) => rt.recoveryAction(i.roomId, i.code, i.action));
   // TEST-ONLY: exists only on an e2e test home with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts).
   if (rt.clock.enabled) handle(roomsV2TestClockAdvance, (i) => rt.advanceTestClock(i.ms));
   handle(roomsV2RoomDisconnect, (i) => {

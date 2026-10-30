@@ -20,25 +20,30 @@
 // - I-13: `appendMls` sequences MLS messages (`mls.commit`, `mls.app`), and `submitWithCommit` writes a
 //   `device.rekey.approved` and its commit as two adjacent entries in one durable write, or neither.
 //
-// Not here (later milestones): creating a new endpoint for rotation (I-12). The host refuses a
-// host.key.rotated naming a key it does not hold, and an endpoint.rotated naming an endpoint it does
-// not serve (keys 4.5, 4.6; decision round 9, item 2).
+// - I-12 rotations: `stageHostKey` creates the next host key in `keys.sealed` (and as a signer) and
+//   returns its KeyChange with `newKeySig`; the admin's `host.key.rotated` then makes it current by
+//   position. `stageEndpoint` creates the next room endpoint (`endpointNext`); after `endpoint.rotated`
+//   `promoteEndpoint` makes it current and keeps the old one in `endpointOld` for the 30 days of its
+//   restricted mode (keys 4.6 step 4). The host refuses a host.key.rotated naming a key it does not
+//   hold, and an endpoint.rotated naming an endpoint it does not serve (keys 4.5, 4.6; round 9, item 2).
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import nodePath from "node:path";
+import { x25519 } from "@noble/curves/ed25519.js";
 import { z } from "zod";
 import { bodyHash, entryHash, type LogEntry, type SignedEntry } from "../authority/entries";
 import { FoldError, RoomLogFold, type FoldReason, type RoomState } from "../authority/fold";
 import { verifyGenesis, type RoomGenesis } from "../authority/genesis";
 import { b64uBytes, firstIssue, Kid, RoomId } from "../authority/schema";
-import { parseSignedStatement, StatementError, STATEMENT_TYPES, type ProducerKind, type SignedStatement, type StatementBody, type StatementType } from "../authority/statements";
+import { parseSignedStatement, StatementError, STATEMENT_TYPES, type KeyChange, type ProducerKind, type SignedStatement, type StatementBody, type StatementType } from "../authority/statements";
 import type { Kek } from "../keystore/keystore";
 import { log } from "../log";
 import { appendLine, PersistFailedError, writePrivateFile } from "../platform/durable";
 import { defaultProtection, type FileProtection } from "../platform/file-protection";
 import { LogLockLostError, LogWriterLock, type LogLockOptions } from "../platform/log-lock";
 import { b64u, b64uDecode } from "../proto/b64u";
-import { CTX_LANE_GRANT, CTX_LOG_ENTRY, stmtContext } from "../proto/contexts";
-import { isServerId } from "../proto/ids";
+import { CTX_KEY_CHANGE_NEW, CTX_LANE_GRANT, CTX_LOG_ENTRY, stmtContext } from "../proto/contexts";
+import { isServerId, newServerId } from "../proto/ids";
 import { ed25519PrivateKeyFromSeed, kid as kidOf, rawPublicKey } from "../proto/keys";
 import { rjcs, rjcsParse, rjcsText, RJCS_MAX_BYTES } from "../proto/rjcs";
 import { sign } from "../proto/tbs";
@@ -73,7 +78,14 @@ const HostKeys = z.strictObject({
    * `endpoint.rotated`. Written by the I-12 rotation; absent until then.
    */
   endpointNext: RoomEndpointKey.optional(),
+  /**
+   * Endpoints replaced by `endpoint.rotated`, kept for their restricted mode (`moved`) until `until`
+   * (unix ms; keys 4.6 step 4: 30 days). Written by `promoteEndpoint` (I-12).
+   */
+  endpointOld: z.array(RoomEndpointKey.extend({ until: z.number().int().min(0) })).max(8).optional(),
   lanes: z.record(z.string(), z.strictObject({ kid: Kid, secret: Seed })),
+  /** A lane's next offer key, staged before `lane.offer.rotated` (keys 4.7; I-12). */
+  lanesNext: z.record(z.string(), z.strictObject({ kid: Kid, secret: Seed, serverId: z.string().refine((s) => isServerId("laneEndpoint", s)) })).optional(),
 });
 export type HostKeys = z.infer<typeof HostKeys>;
 
@@ -104,6 +116,9 @@ export function servedEndpoints(keys: HostKeys | null): { serverId: string; kid:
   if (!keys) return [];
   return [keys.endpoint, ...(keys.endpointNext ? [keys.endpointNext] : [])].map((e) => ({ serverId: e.serverId, kid: e.kid }));
 }
+
+/** Restricted mode of a replaced room endpoint (keys 4.6 step 4). */
+export const ENDPOINT_MOVED_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** genesis.json: the RJCS text of the signed genesis. Plaintext and public; pinned by hash in keys.sealed. */
 export function writeGenesisFile(dataDir: string, genesis: RoomGenesis, roomId: string): void {
@@ -315,6 +330,8 @@ export class RoomHost {
       const store = new RoomLogStore(dir, lock, opts.now ?? Date.now, protection);
       const loaded = store.load();
       const host = new RoomHost(opts, v.genesis, v.genesisHash, signers, lock, store, loaded);
+      // A rotation sequenced just before a crash: the staged endpoint becomes current (keys 4.6).
+      host.promoteEndpoint();
       log("room_host_open", { roomId: opts.roomId, head: host.head.seq, torn: loaded.torn.length });
       return host;
     } catch (err) {
@@ -477,6 +494,84 @@ export class RoomHost {
     if (!cur || cur.uncertified || cur.revoked) throw new RoomHostError("host_key_missing", "The current host key may not issue grants");
     const signer = this.currentSigner();
     return { kid: signer.kid, sig: signer.sign(CTX_LANE_GRANT, payload) };
+  }
+
+  /**
+   * Keys 4.5 step 1: the next host key. Written to `keys.sealed` and added to the signers before the
+   * admin signs `host.key.rotated`, so the host holds it when the rotation is sequenced. A staged key
+   * that is not yet certified is reused. Returns the KeyChange (old: the current host key) and the new
+   * key's `newKeySig`; nothing secret leaves.
+   */
+  stageHostKey(): { change: KeyChange; newKeySig: string } {
+    this.assertRunning();
+    const keys = readHostKeys(this.opts.dataDir, this.opts.kek, this.roomId);
+    if (!keys) throw new RoomHostError("room_not_found", "No host keys for this room");
+    const a = this.fold.state.auth;
+    const cur = a.hostKeys.find((h) => h.toSeq === null);
+    if (!cur) throw new RoomHostError("host_key_missing", "no current host key");
+    const known = new Set(a.hostKeys.map((h) => h.kid));
+    let staged = keys.hostKeys.find((k) => !known.has(k.kid));
+    if (!staged) {
+      if (keys.hostKeys.length >= 64) throw new RoomHostError("host_keys_invalid", "too many host keys held");
+      const seed = randomBytes(32);
+      staged = { kid: kidOf("ed25519", rawPublicKey(ed25519PrivateKeyFromSeed(seed))), seed: b64u(seed) };
+      seed.fill(0);
+      writeHostKeys(this.opts.dataDir, this.opts.kek, { ...keys, hostKeys: [...keys.hostKeys, staged] });
+    }
+    const priv = ed25519PrivateKeyFromSeed(b64uDecode(staged.seed, 32));
+    if (!this.signers.has(staged.kid)) this.signers.set(staged.kid, { kid: staged.kid, sign: (ctx, payload) => sign(priv, ctx, payload) });
+    const change: KeyChange = { v: 2, typ: "key-change", roomId: this.roomId, subject: { kind: "host", id: "host" }, old: cur.kid, newSig: b64u(rawPublicKey(priv)), newDh: null };
+    log("host_key_staged", { roomId: this.roomId, kid: staged.kid });
+    return { change, newKeySig: b64u(sign(priv, CTX_KEY_CHANGE_NEW, rjcs(change))) };
+  }
+
+  /**
+   * Keys 4.6 step 1: the next room endpoint (new serverId and X25519 key) in `endpointNext`, which the
+   * host serves once `endpoint.rotated` names it. Reuses a staged one. Returns public values only.
+   */
+  stageEndpoint(): { serverId: string; dh: { alg: "x25519"; kid: string; pub: string } } {
+    this.assertRunning();
+    const keys = readHostKeys(this.opts.dataDir, this.opts.kek, this.roomId);
+    if (!keys) throw new RoomHostError("room_not_found", "No host keys for this room");
+    let next = keys.endpointNext;
+    if (!next) {
+      const secret = new Uint8Array(randomBytes(32));
+      next = { serverId: newServerId("roomEndpoint"), kid: kidOf("x25519", x25519.getPublicKey(secret)), secret: b64u(secret) };
+      secret.fill(0);
+      writeHostKeys(this.opts.dataDir, this.opts.kek, { ...keys, endpointNext: next });
+    }
+    const pub = x25519.getPublicKey(b64uDecode(next.secret, 32));
+    return { serverId: next.serverId, dh: { alg: "x25519", kid: next.kid, pub: b64u(pub) } };
+  }
+
+  /**
+   * Keys 4.6 after `endpoint.rotated`: when the folded endpoint is `endpointNext`, it becomes
+   * `endpoint` and the old one moves to `endpointOld` until now + 30 days. Expired old endpoints are
+   * dropped. Idempotent; also run at open, so a crash between the append and this write loses nothing.
+   */
+  promoteEndpoint(): boolean {
+    const keys = readHostKeys(this.opts.dataDir, this.opts.kek, this.roomId);
+    if (!keys) return false;
+    const auth = this.fold.state.auth.endpoint;
+    const now = this.now();
+    const old = (keys.endpointOld ?? []).filter((e) => e.until > now);
+    if (!keys.endpointNext || keys.endpointNext.serverId !== auth.serverId || keys.endpointNext.kid !== auth.dh.kid) {
+      if (old.length !== (keys.endpointOld ?? []).length) writeHostKeys(this.opts.dataDir, this.opts.kek, { ...keys, endpointOld: old });
+      return false;
+    }
+    const { endpointNext: next, ...rest } = keys;
+    writeHostKeys(this.opts.dataDir, this.opts.kek, { ...rest, endpoint: next, endpointOld: [...old, { ...keys.endpoint, until: now + ENDPOINT_MOVED_KEEP_MS }].slice(-8) });
+    log("room_endpoint_promoted", { roomId: this.roomId, serverId: next.serverId });
+    return true;
+  }
+
+  /** The signed entry and body of the last `endpoint.rotated` (the `moved` answer of keys 4.6 step 4). */
+  lastEndpointRotation(): { entry: SignedEntry; body: string } | null {
+    for (let i = this.records.length - 1; i >= 0; i--) {
+      const r = this.records[i];
+      if (r.signed.entry.type === "endpoint.rotated" && this.fold.state.marks[i] === undefined) return { entry: r.signed, body: rjcsText(rjcsParse(r.body)) };
+    }
+    return null;
   }
 
   /** Clean shutdown: stops the heartbeat and deletes the lock. */

@@ -115,6 +115,19 @@ export const OwnedRoomV2View = z.object({
   deviceRequests: z.array(DeviceRequestV2View),
   /** Members with an open device conflict (after a veto). */
   conflicts: z.array(z.string()),
+  /** I-12: key ids and rotation state (no key material). */
+  keys: z.object({
+    hostKid: z.string().nullable(),
+    hostKeys: z.array(z.object({ kid: z.string(), fromSeq: z.number().int(), toSeq: z.number().int().nullable(), validTo: z.number().int().nullable(), revoked: z.boolean(), uncertified: z.boolean() })),
+    adminKid: z.string().nullable(),
+    admins: z.array(z.object({ kid: z.string(), root: z.string() })),
+    recoveryKid: z.string().nullable(),
+    movedEndpoints: z.array(z.string()),
+    closed: z.boolean(),
+    closeProposals: z.array(z.object({ ref: z.string(), kid: z.string(), hts: z.number().int(), exp: z.number().int() })),
+  }),
+  /** Room-log 4.6 alerts: a host key, the endpoint or a lane offer left uncertified by a re-fold. */
+  uncertified: z.array(z.object({ subject: z.string(), id: z.string() })),
 });
 
 /** The member's side of a join (enrollment-v2.md 6.4, 7.3). */
@@ -142,6 +155,10 @@ export const JoinedRoomV2View = z.object({
   registration: z.string().nullable(),
   /** Device links created on this device. */
   links: z.array(LinkV2View),
+  /** I-12: this device's open rekey (keys-rotation-recovery 4.1), or null. */
+  rekey: z.object({ ref: z.string().nullable(), requestedAt: z.number().int(), published: z.boolean() }).nullable(),
+  /** The room endpoint in this device's verified state (changes with `endpoint.rotated`). */
+  endpointServerId: z.string().nullable(),
   /** This member's held device requests: the "Was this you?" prompt (Not me = rooms.v2.device.veto). */
   deviceRequests: z.array(DeviceRequestV2View),
   conflict: z.boolean(),
@@ -238,8 +255,9 @@ export const roomsV2JoinReject = defineRpc({
 
 export const roomsV2MemberRemove = defineRpc({
   name: "rooms.v2.member.remove",
-  input: RoomIdIn.extend({ memberId: z.string() }),
-  output: z.object({ seq: z.number().int() }),
+  /** `compromise`: "Do you suspect this person of misusing access?" (keys 4.7: rotates their lanes). */
+  input: RoomIdIn.extend({ memberId: z.string(), compromise: z.boolean().optional() }),
+  output: z.object({ seq: z.number().int(), rotatedLanes: z.array(z.string()) }),
 });
 
 /** Lowers or changes a member's role: their grants at the old role stop working at once (S-9). */
@@ -380,4 +398,67 @@ export const roomsV2TestClockAdvance = defineRpc({
   name: "rooms.v2.test.clock.advance",
   input: z.object({ ms: z.number().int().min(1).max(7 * 24 * 60 * 60 * 1000) }),
   output: z.object({ offsetMs: z.number().int() }),
+});
+
+// ------------------------------------------------------------------------------ rotation and recovery (I-12)
+
+const Kid = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const Seq = z.object({ seq: z.number().int() });
+
+/** Member device: requests its own rekey (keys-rotation-recovery 4.1). Held 24 h (72 h for a sole device). */
+export const roomsV2DeviceRekey = defineRpc({
+  name: "rooms.v2.device.rekey",
+  input: RoomIdIn,
+  output: z.object({ ref: z.string(), seq: z.number().int() }),
+});
+
+/** Admin: removes one device; `compromise` rotates the member's lanes (keys 4.7, 6.3). */
+export const roomsV2DeviceRemove = defineRpc({
+  name: "rooms.v2.device.remove",
+  input: RoomIdIn.extend({ memberId: z.string().regex(/^mem_[0-9a-f]{32}$/), deviceId: z.string().regex(/^dev_[0-9a-f]{32}$/), compromise: z.boolean() }),
+  output: z.object({ seq: z.number().int(), rotatedLanes: z.array(z.string()) }),
+});
+
+/** Admin: rotates the host key (keys 4.5); grants from the old key stay valid for 24 h. */
+export const roomsV2HostKeyRotate = defineRpc({ name: "rooms.v2.host.key.rotate", input: RoomIdIn, output: Seq.extend({ kid: z.string() }) });
+
+/** Admin: revokes a host key already rotated out, from `fromSeq` (keys 4.5 step 6, 6.4). */
+export const roomsV2HostKeyRevoke = defineRpc({ name: "rooms.v2.host.key.revoke", input: RoomIdIn.extend({ kid: Kid, fromSeq: z.number().int().min(0) }), output: Seq });
+
+/** Admin: rotates this daemon's admin key (keys 4.3). */
+export const roomsV2AdminKeyRotate = defineRpc({ name: "rooms.v2.admin.key.rotate", input: RoomIdIn, output: Seq.extend({ kid: z.string() }) });
+
+/** Admin: revokes another admin key from `fromSeq` (keys 6.6). */
+export const roomsV2AdminKeyRevoke = defineRpc({ name: "rooms.v2.admin.key.revoke", input: RoomIdIn.extend({ kid: Kid, fromSeq: z.number().int().min(0) }), output: Seq });
+
+/** Admin: rotates the room endpoint (keys 4.6); the old one answers `moved` for 30 days. */
+export const roomsV2EndpointRotate = defineRpc({ name: "rooms.v2.endpoint.rotate", input: RoomIdIn, output: Seq.extend({ serverId: z.string() }) });
+
+/** Admin: rotates a lane offer (keys 4.7). */
+export const roomsV2LaneRotate = defineRpc({ name: "rooms.v2.lane.rotate", input: RoomIdIn.extend({ laneId: z.string().regex(/^lane_[0-9a-f]{32}$/) }), output: Seq.extend({ serverId: z.string() }) });
+
+/** Admin: proposes closing the room (keys 6.8). */
+export const roomsV2CloseProposed = defineRpc({ name: "rooms.v2.room.close.propose", input: RoomIdIn, output: Seq.extend({ proposal: z.string(), earliest: z.number().int() }) });
+
+/** Admin of another lineage: confirms a closure; refused before `closeDelay` on this daemon's clock. */
+export const roomsV2CloseConfirm = defineRpc({ name: "rooms.v2.room.close.confirm", input: RefIn.omit({ ref: true }).extend({ proposal: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }), output: Seq });
+
+/** Admin: a first recovery key (keys 4.4). The code is a secret, returned once and never stored. */
+export const roomsV2RecoveryCreate = defineRpc({ name: "rooms.v2.recovery.create", input: RoomIdIn, output: Seq.extend({ kid: z.string(), code: z.string(), proposal: z.string().nullable() }) });
+
+/** Admin of another lineage: confirms a recovery key proposal (keys 4.4). */
+export const roomsV2RecoveryConfirm = defineRpc({ name: "rooms.v2.recovery.confirm", input: RoomIdIn.extend({ proposal: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }), output: Seq });
+
+/** A recovery procedure signed by the recovery key (keys 6.6, 6.8, 4.4); the code is used once and not stored. */
+export const roomsV2RecoveryAct = defineRpc({
+  name: "rooms.v2.recovery.act",
+  input: RoomIdIn.extend({
+    code: z.string().min(1).max(200),
+    action: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("revoke_admin"), kid: Kid, fromSeq: z.number().int().min(0) }),
+      z.object({ kind: z.literal("close") }),
+      z.object({ kind: z.literal("rotate") }),
+    ]),
+  }),
+  output: Seq.extend({ freshAdminKid: z.string().optional(), code: z.string().optional() }),
 });

@@ -33,6 +33,10 @@
 //   through a callback, predicts roster `s`, builds Remove plus Add (with the other pending changes) and
 //   submits both with `commit.submit {…, statement}`. The rekeyed device skips the commit at `s + 1` with
 //   its old state and joins by Welcome.
+// - Periodic leaf refresh (keys-rotation-recovery.md 4.2; I-12): every 7 days or 1 000 sent messages
+//   the device commits an UpdatePath with the public `createCommit` (no Add, every pending removal),
+//   credential unchanged; a refresh of the HPKE key only. `resumeRekey` restores the next device key of
+//   a rekey requested before a restart (its `rekey` packages are already in the sealed record).
 // - State at rest (8): the group state is sealed (MlsStore) before `msg.ack`; `checkRollback` refuses a
 //   stored state older than the host's `lastAck` (8.4).
 // Nothing here logs key material, messages or package bytes.
@@ -87,6 +91,8 @@ export type MemberRecord = {
   kps: KpRecord[];
   sent: string[];
   stalled: string | null;
+  /** Last leaf refresh (4.2): when, and messages sent since. Absent in records written before I-12. */
+  refresh?: { at: number; sent: number };
 };
 
 export interface MlsStore {
@@ -115,8 +121,11 @@ export type MlsTimings = {
   epochConfirmMs: number;
   /** Retry of fetches and publications. */
   retryMs: number;
+  /** Periodic leaf refresh (keys 4.2): an UpdatePath after this long, or after `refreshMessages` sent. */
+  refreshMs: number;
+  refreshMessages: number;
 };
-export const MLS_TIMINGS: Readonly<MlsTimings> = { repairDelayMs: 60_000, repairJitterMs: 60_000, witnessMaxDelayMs: 30_000, epochConfirmMs: 5 * 60_000, retryMs: 60_000 };
+export const MLS_TIMINGS: Readonly<MlsTimings> = { repairDelayMs: 60_000, repairJitterMs: 60_000, witnessMaxDelayMs: 30_000, epochConfirmMs: 5 * 60_000, retryMs: 60_000, refreshMs: 7 * 24 * 3600 * 1000, refreshMessages: 1000 };
 
 export interface MlsMemberOptions {
   adapter: MlsAdapter;
@@ -172,7 +181,7 @@ export class MlsMember {
   private latest: { state: Readonly<RoomState>; head: { seq: number; hash: string } } | null = null;
   private lock: Promise<unknown> = Promise.resolve();
   private bodies = new Map<number, Uint8Array>();
-  private pendingOwn: { bodyHash: string; newState: MlsState; adds: number } | null = null;
+  private pendingOwn: { bodyHash: string; newState: MlsState; adds: number; refresh?: boolean } | null = null;
   private welcomeCache: { welcome: Uint8Array; entry: SignedEntry } | null = null;
   private expectCommitAt = -1;
   private addSeen = new Map<string, number>();
@@ -183,6 +192,7 @@ export class MlsMember {
   private witnessAt: number | null = null;
   private anchorsSeen = new Map<number, Set<string>>();
   private retryAt = 0;
+  private refreshRetryAt = 0;
   private stopped = false;
   private disabled: string | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -337,6 +347,7 @@ export class MlsMember {
       if (this.state && this.o.adapter.isActive(this.state) && !this.rec.stalled) {
         await this.commitPending(opts.removalsOnly === true);
         if (!opts.removalsOnly) await this.dueWitness();
+        if (!opts.removalsOnly) await this.dueRefresh();
       }
       this.checkJoinTimeout();
     });
@@ -360,6 +371,21 @@ export class MlsMember {
     if (!this.promptEligible.has(deviceId)) return;
     this.promptArmed.add(deviceId);
     void this.maintain().catch(() => undefined);
+  }
+
+  /** After a restart during a rekey's hold: the next device key again, without publishing (its packages are stored). */
+  resumeRekey(next: { sigPub: string; sigKey: KeyObject }): void {
+    if (next.sigPub !== this.device.sigPub) this.nextDevice = next;
+  }
+
+  /** The rekey was vetoed or cancelled: the next key is forgotten (its packages expire unused). */
+  cancelRekey(): void {
+    this.nextDevice = null;
+  }
+
+  /** True while a rekey of this device waits for its approval (its next key is known). */
+  get rekeyPending(): boolean {
+    return this.nextDevice !== null;
   }
 
   /** Prepares a rekey (keys-rotation-recovery 4.1 step 2): publishes `rekey` KeyPackages under the new key. */
@@ -521,6 +547,7 @@ export class MlsMember {
         return;
       }
       this.state = this.pendingOwn.newState;
+      if (this.pendingOwn.refresh) this.rec.refresh = { at: this.now(), sent: 0 };
       // The committer holds the new epoch too and witnesses it like every other device (5.1).
       if (this.pendingOwn.adds > 0) this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
       this.pendingOwn = null;
@@ -863,9 +890,40 @@ export class MlsMember {
     // The ratchet moved: the state is written before the message leaves (8.2).
     this.state = r.newState;
     this.rec.sent = [...this.rec.sent, bodyHash(r.message)].slice(-SENT_MAX);
+    this.rec.refresh = { at: this.rec.refresh?.at ?? this.now(), sent: (this.rec.refresh?.sent ?? 0) + 1 };
     this.save();
     const reply = await link.request({ t: "msg.send", epoch: this.o.adapter.epoch(this.state), message: b64u(r.message) });
     return { seq: Number(reply.seq) };
+  }
+
+  /**
+   * Keys 4.2: an UpdatePath commit with the public `createCommit` every `refreshMs` or `refreshMessages`
+   * sent, whichever comes first. It adds nobody and carries every pending removal (4.2), so it passes
+   * the same checks as any commit; the credential stays byte-identical (continuity check).
+   */
+  private async dueRefresh(): Promise<void> {
+    if (!this.state || !this.latest || this.pendingOwn || this.rec.stalled || !this.o.adapter.isActive(this.state) || this.now() < this.refreshRetryAt) return;
+    const r = this.rec.refresh;
+    if (!r) {
+      this.rec.refresh = { at: this.now(), sent: 0 };
+      this.save();
+      return;
+    }
+    if (this.now() - r.at < this.t.refreshMs && r.sent < this.t.refreshMessages) return;
+    const link = this.o.link();
+    if (!link) return;
+    const ref = referenceRosterOf(this.latest.state, this.o.scope ?? null);
+    const pend = pendingChanges(ref, this.currentLeaves());
+    const built = await this.buildCommit(ref, this.latest.head, [], pend.removals.map((l) => l.leafIndex));
+    this.pendingOwn = { bodyHash: bodyHash(built.commit), newState: built.newState, adds: 0, refresh: true };
+    try {
+      const reply = await link.request({ t: "commit.submit", epoch: this.o.adapter.epoch(this.state), commit: b64u(built.commit) });
+      log("mls_leaf_refreshed", { roomId: this.o.roomId, seq: reply.seq });
+    } catch (e) {
+      this.pendingOwn = null;
+      this.refreshRetryAt = this.now() + Math.max(this.t.retryMs, 1000);
+      log("mls_leaf_refresh_refused", { roomId: this.o.roomId, code: (e as { code?: string }).code ?? "error" });
+    }
   }
 
   /** `log.witness` (room-log-v2 4.5) in the new epoch after a commit with an Add (5.1). */

@@ -399,10 +399,12 @@ export class HostGrants {
    * next state no longer allows, push to the lane endpoints, persist. A lowered role also tells the
    * member's devices to reissue at the new role (S-9).
    */
-  decide(next: Readonly<RoomState>, _prev: Readonly<RoomState>, _type: StatementType): void {
+  decide(next: Readonly<RoomState>, prev: Readonly<RoomState>, _type: StatementType): void {
     const dropped: { c: CurrentGrant & { deviceId: string; laneId: string }; reason: DropReason }[] = [];
     for (const c of this.current.values()) {
-      const reason = dropReason(next, c);
+      // A rekeyed device's grants name its old key (`dev`): they leave the allowlist and the device
+      // reissues with the new key (keys-rotation-recovery.md 4.1 step 6).
+      const reason = dropReason(next, c) ?? (deviceSigOf(prev, c) !== deviceSigOf(next, c) ? "superseded" : null);
       if (reason) dropped.push({ c, reason });
     }
     if (dropped.length === 0) return;
@@ -415,7 +417,7 @@ export class HostGrants {
     }
     for (const laneId of lanes) this.enforce(laneId, "revoked");
     for (const { c, reason } of dropped) {
-      if (reason === "role_changed") this.notify(c.deviceId, { t: "grant.revoked", laneId: c.laneId, gid: c.gid, reason });
+      if (reason === "role_changed" || reason === "superseded") this.notify(c.deviceId, { t: "grant.revoked", laneId: c.laneId, gid: c.gid, reason });
     }
     this.persist("revoke");
     log("grants_revoked", { roomId: this.roomId, grants: dropped.length, reasons: [...new Set(dropped.map((d) => d.reason))] });
@@ -508,6 +510,10 @@ export class HostGrants {
       plain.fill(0);
     }
   }
+}
+
+function deviceSigOf(s: Readonly<RoomState>, c: { memberId: string; deviceId: string }): string | undefined {
+  return s.members[c.memberId]?.devices.find((d) => d.deviceId === c.deviceId)?.sig;
 }
 
 /** Why a current grant no longer holds under a state, or null. */

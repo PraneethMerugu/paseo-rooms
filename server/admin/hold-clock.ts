@@ -59,8 +59,9 @@ export class AdminHoldClock {
     const now = this.now();
     const next: Record<string, number> = {};
     let changed = false;
-    for (const [ref, p] of Object.entries(st.pending)) {
-      if (p.status !== "pending") continue;
+    // Open closure proposals are timed the same way (keys 6.8: the confirming daemon's own clock).
+    const open = [...Object.entries(st.pending).filter(([, p]) => p.status === "pending").map(([ref]) => ref), ...Object.entries(st.auth?.pendingClose ?? {}).filter(([, p]) => !p.used).map(([ref]) => ref)];
+    for (const ref of open) {
       if (Object.keys(next).length >= MAX_REQUESTS) break;
       const t = this.seen[ref];
       next[ref] = t ?? now;

@@ -18,6 +18,11 @@
 //   up to `livenessWaitMs` (12 s, longer than the source's 10 s heartbeat; the spec's 5 s assumed a
 //   destination ping): any inbound frame in that window means two live holders, so both links close
 //   and the host records `grant.suspected-theft`; silence means the old link is dead and is replaced.
+// - Offer rotation (keys-rotation-recovery.md 4.7; I-12): `rotateOffer` stages a new lane key and
+//   serverId in `lanesNext`, submits `lane.offer.rotated`, then promotes the key; `sync` stops the old
+//   lane endpoint at once and starts one for the new offer (every holder of the old offer is evicted).
+//   `lanesToRotate` lists the lanes a removal flagged as compromise (or every removal under policy
+//   `rotateLaneOnRemove = "always"`) must rotate.
 // - Project names (13.2): shown only when `policy.projectNames == "lane-owner"` and the lane's
 //   `showNames`; otherwise the neutral label. Viewer errors carry an error reference (13.1).
 import { randomBytes } from "node:crypto";
@@ -26,7 +31,7 @@ import { x25519 } from "@noble/curves/ed25519.js";
 import { z } from "zod";
 import type { RoomState } from "../authority/fold";
 import { firstIssue, LaneId, RoomId } from "../authority/schema";
-import { edKid } from "../authority/state";
+import { edKid, versionKey } from "../authority/state";
 import type { Lane } from "../../shared/schemas";
 import { LaneEndpoint, type LaneGrantAuthority, type LinkSession } from "../gateway/lane-endpoint";
 import type { Kek } from "../keystore/keystore";
@@ -71,6 +76,8 @@ export interface LaneServiceOptions {
 
 export class LaneService {
   readonly endpoints = new Map<string, LaneEndpoint>();
+  /** The offer serverId each running endpoint serves. */
+  private readonly served = new Map<string, string>();
   private bindings: LaneBinding[];
   private stopped = false;
 
@@ -115,15 +122,73 @@ export class LaneService {
     return { laneId, serverId };
   }
 
+  /**
+   * Keys 4.7: a new lane offer (serverId and X25519 key), staged in `lanesNext` before the admin's
+   * `lane.offer.rotated` is submitted, promoted after it. `submit` signs and submits the statement.
+   */
+  rotateOffer(laneId: string, submit: (data: unknown) => void): { serverId: string } {
+    const s = this.o.host.state;
+    const l = s.auth.lanes[laneId];
+    if (!l || l.status === "closed") throw new Error("Unknown or closed lane");
+    const keys = readHostKeys(this.o.dataDir, this.o.kek, this.roomId);
+    if (!keys?.lanes[laneId]) throw new Error("This daemon does not serve that lane");
+    let next = keys.lanesNext?.[laneId];
+    if (!next) {
+      const secret = new Uint8Array(randomBytes(32));
+      next = { kid: kidOf("x25519", x25519.getPublicKey(secret)), secret: b64u(secret), serverId: newServerId("laneEndpoint") };
+      secret.fill(0);
+      writeHostKeys(this.o.dataDir, this.o.kek, { ...keys, lanesNext: { ...(keys.lanesNext ?? {}), [laneId]: next } });
+    }
+    const pub = x25519.getPublicKey(b64uDecode(next.secret, 32));
+    const relay = this.o.host.state.auth.endpoint.relay;
+    const ver = s.auth.versions[versionKey.laneOffer(laneId)] ?? -1;
+    submit({ laneId, offer: { serverId: next.serverId, dh: { alg: "x25519", kid: next.kid, pub: b64u(pub) }, relay: { host: relay.host, port: relay.port, tls: true } }, ver });
+    log("v2_lane_offer_rotated", { roomId: this.roomId, laneId });
+    this.sync();
+    return { serverId: next.serverId };
+  }
+
+  /**
+   * Lanes to rotate after a removal (keys 4.7, `rotateLaneOnRemove`): those the removed member had
+   * access to, when the removal is flagged as a compromise or the policy says "always". Only lanes
+   * this daemon serves.
+   */
+  lanesToRotate(prev: Readonly<RoomState>, memberId: string, compromise: boolean): string[] {
+    if (!compromise && prev.auth.policy.rotateLaneOnRemove !== "always") return [];
+    const served = new Set(this.bindings.map((b) => b.laneId));
+    return (prev.members[memberId]?.lanes ?? []).filter((id) => served.has(id) && prev.auth.lanes[id]?.status === "open");
+  }
+
+  /** A staged lane key whose offer is now in the log becomes the lane's key (also after a crash). */
+  private promoteOffers(): void {
+    const keys = readHostKeys(this.o.dataDir, this.o.kek, this.roomId);
+    if (!keys?.lanesNext || Object.keys(keys.lanesNext).length === 0) return;
+    const s = this.o.host.state;
+    const lanes = { ...keys.lanes };
+    const next = { ...keys.lanesNext };
+    let changed = false;
+    for (const [laneId, n] of Object.entries(keys.lanesNext)) {
+      const offer = s.auth.lanes[laneId]?.offer;
+      if (offer && offer.serverId === n.serverId && offer.dh.kid === n.kid) {
+        lanes[laneId] = { kid: n.kid, secret: n.secret };
+        delete next[laneId];
+        changed = true;
+      }
+    }
+    if (changed) writeHostKeys(this.o.dataDir, this.o.kek, { ...keys, lanes, lanesNext: next });
+  }
+
   /** Called after every append: lanes opened, closed, names policy changed. */
   sync(): void {
     if (this.stopped) return;
     const s = this.o.host.state;
+    this.promoteOffers();
     for (const [laneId, ep] of [...this.endpoints]) {
       const l = s.auth.lanes[laneId];
-      if (!l || l.status === "closed" || s.auth.closed) {
+      if (!l || l.status === "closed" || s.auth.closed || this.served.get(laneId) !== l.offer.serverId) {
         this.endpoints.delete(laneId);
-        void ep.stop("lane_closed");
+        this.served.delete(laneId);
+        void ep.stop(l && l.status !== "closed" && !s.auth.closed ? "offer_rotated" : "lane_closed");
         continue;
       }
       ep.setProjectNamesVisible(namesShown(s, laneId));
@@ -134,6 +199,7 @@ export class LaneService {
       const ep = this.makeEndpoint(b, l.offer.serverId);
       if (!ep) continue;
       this.endpoints.set(b.laneId, ep);
+      this.served.set(b.laneId, l.offer.serverId);
       if (this.o.autostart !== false) void ep.start();
     }
   }

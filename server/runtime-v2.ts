@@ -31,6 +31,18 @@
 // resolves the conflict. TEST-ONLY: `rooms.v2.test.clock.advance` moves the room host's `hts` and the
 // approval clock forward, only on a test home (server/platform/test-clock.ts).
 //
+// Rotation and recovery (I-12, keys-rotation-recovery.md 4 and 6): a member device requests its own
+// rekey (`device.rekeyed`, next keys sealed in its journal first, `rekey` KeyPackages published); the
+// admin daemon approves it after the hold on its own clock (or an admin interactively) by the admin
+// route: `device.rekey.approved` and the Remove plus Add commit in one `commit.submit`, sequenced
+// adjacently or not at all; with no admin daemon online nothing is signed and the old keys keep
+// working. The device then reconnects with its new DH key and rejoins the room group by Welcome. The
+// owner rotates the admin key, the host key (staged in keys.sealed first; `oldValidTo` = now + 24 h),
+// the room endpoint (staged in `endpointNext`; the old one answers `moved` for 30 days) and lane offers
+// (also after a removal flagged as compromise, or every removal under `rotateLaneOnRemove = "always"`);
+// it proposes and confirms closures (the confirming daemon refuses before `closeDelay` on its own
+// clock); and runs the recovery-key procedures (a recovery code typed for one action, never stored).
+//
 // Relay: the genesis records `PASEO_ROOMS_RELAY_ENDPOINT` (host:port; default relay.paseo.sh:443) with
 // tls true. Owner side: `PASEO_ROOMS_RELAY_TLS=false` is honoured for loopback hosts only. Member side
 // (P-20): TLS always, a DNS-name relay, and a relay outside `trustedRelays` only after the user's
@@ -42,20 +54,29 @@
 import * as fs from "node:fs";
 import nodePath from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
+import { randomBytes } from "node:crypto";
 import { createRoom, memberKeysPath, memberKeysPurpose } from "./admin/genesis";
-import { AdminSigner, adminKeyPath } from "./admin/signer";
+import { AdminSigner, adminKeyPath, writeAdminKey } from "./admin/signer";
+import { closeConfirmationBlocker, newRecoveryKey, RecoveryKey, recoverFromStolenAdmin } from "./admin/recovery";
+import { bodyHash, type SignedEntry } from "./authority/entries";
+import { activeAdmins } from "./authority/state";
+import { lineageCount } from "./authority/lineage";
+import type { SignedStatement } from "./authority/statements";
+import { movedTarget, rekeyRequest, rekeyStatus } from "./member/rotation";
+import { rjcs } from "./proto/rjcs";
 import { verifyGenesis, type RoomGenesis } from "./authority/genesis";
 import type { StatementData, StatementType } from "./authority/statements";
 import { autoApprovalEndsAt } from "./authority/holds";
 import { AdminHoldClock } from "./admin/hold-clock";
 import { edKid, versionKey, type RoomState } from "./authority/state";
+import type { KeyChange } from "./authority/statements";
 import { DeviceLinker } from "./member/device-link";
 import { readLinkSection, writeLinkSection } from "./member/enrollment-journal";
 import { TestClock } from "./platform/test-clock";
 import type { KeyObject } from "node:crypto";
 import type { PendingView, InviteView } from "./host/enrollment";
 import { isDevInsecureRelay, memberRelayUseTls, relayKey } from "./host/invites";
-import { endpointKeyFromHost, RoomEndpoint } from "./host/room-endpoint";
+import { endpointKeyFromHost, movedEndpointKeys, RoomEndpoint } from "./host/room-endpoint";
 import { genesisPath, RoomHost } from "./host/room-host";
 import { ENV_KEYSTORE, openKeyStore, type Kek, type KeyStoreStatus } from "./keystore/keystore";
 import { log, logError } from "./log";
@@ -124,7 +145,20 @@ export function relayAddress(relay: { host: string; port: number }, env: NodeJS.
 }
 
 
-type Owned = { host: RoomHost; signer: AdminSigner | null; holds: AdminHoldClock | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService; approver: ReturnType<typeof setInterval> | null; mls: MlsDelivery | null; mlsTick: ReturnType<typeof setInterval> | null; ownFeed: (() => void) | null };
+type Owned = {
+  host: RoomHost;
+  signer: AdminSigner | null;
+  holds: AdminHoldClock | null;
+  endpoint: RoomEndpoint;
+  /** Replaced room endpoints in their restricted (`moved`) mode (keys 4.6 step 4). */
+  moved: RoomEndpoint[];
+  grants: HostGrants;
+  lanes: LaneService;
+  approver: ReturnType<typeof setInterval> | null;
+  mls: MlsDelivery | null;
+  mlsTick: ReturnType<typeof setInterval> | null;
+  ownFeed: (() => void) | null;
+};
 type Joined = { client: RoomClient; memberId: string; deviceId: string };
 
 const SCHEDULE_FILE = "grant-schedule.json";
@@ -174,6 +208,12 @@ export class RoomsRuntimeV2 {
   readonly mlsMembers = new Map<string, MlsMember>();
   /** Admin daemon: automatic approvals that failed, retried after this time (by request bodyHash). */
   private readonly approveRetryAt = new Map<string, number>();
+  /** Admin daemon: rekey approvals in flight (the admin route is asynchronous), by request bodyHash. */
+  private readonly rekeyInFlight = new Set<string>();
+  /** Member: reconnects after `superseded` or `moved`, not before this time (by room). */
+  private readonly reconnectAt = new Map<string, number>();
+  /** Member: rooms whose rekey packages are published (in this process). */
+  private readonly rekeyPublished = new Set<string>();
   /**
    * Clock of the room hosts' `hts` and of automatic approvals. Date.now, except on an e2e test home
    * with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts), where tests may move it forward.
@@ -251,6 +291,7 @@ export class RoomsRuntimeV2 {
     }
     this.endedWatch = setInterval(() => {
       for (const [roomId, j] of this.joined) if (j.client.status === "ended" && this.schedulers.has(roomId)) this.stopLanes(roomId);
+      for (const roomId of this.joined.keys()) this.followRotation(roomId);
     }, 1000);
     (this.endedWatch as { unref?: () => void }).unref?.();
     this.state = "ready";
@@ -264,7 +305,14 @@ export class RoomsRuntimeV2 {
     return this.kek;
   }
 
-  private serve(host: RoomHost, signer: AdminSigner | null): void {
+  private serve(host: RoomHost, signer0: AdminSigner | null): void {
+    // An admin key rotation logged before a crash: the staged key becomes this daemon's key (keys 4.3).
+    let signer = signer0;
+    try {
+      signer = signer0?.promote((kid) => activeAdmins(host.state.auth).some((a) => a.kid === kid)) ?? signer0;
+    } catch (e) {
+      logError("admin_key_promote_failed", e, { roomId: host.roomId });
+    }
     const g = host.state.auth.endpoint.relay;
     const roomId = host.roomId;
     const grants = new HostGrants({ dataDir: this.dataDir, kek: this.kek!, host, env: this.env });
@@ -296,10 +344,12 @@ export class RoomsRuntimeV2 {
     const mlsTick = mls ? setInterval(() => mls.tick(), 30_000) : null;
     (mlsTick as { unref?: () => void } | null)?.unref?.();
     const holds = signer ? new AdminHoldClock(this.dataDir, this.kek!, roomId, this.clock.now) : null;
-    const owned: Owned = { host, signer, holds, endpoint, grants, lanes, approver, mls, mlsTick, ownFeed: null };
+    const moved = movedEndpointKeys(this.dataDir, this.kek!, roomId, this.clock.now()).map((m) => new RoomEndpoint({ host, endpointKey: m.endpointKey, relay: relayAddress(g, this.env), restricted: m, ...(this.tuning.timings ? { timings: this.tuning.timings } : {}) }));
+    const owned: Owned = { host, signer, holds, endpoint, moved, grants, lanes, approver, mls, mlsTick, ownFeed: null };
     this.owned.set(roomId, owned);
     this.observeHolds(roomId);
     endpoint.start();
+    for (const m of moved) m.start();
     lanes.start();
     try {
       ownFeed = this.startOwnMember(owned);
@@ -406,6 +456,15 @@ export class RoomsRuntimeV2 {
       onAlert: (a) => log("mls_member_alert", { roomId, type: a.type, seq: a.seq }),
     });
     this.mlsMembers.set(roomId, member);
+    // A rekey requested before a restart: its next key again (its packages are in the sealed record).
+    const j = this.joining.get(roomId)?.journal;
+    if (j?.rekey?.ref) {
+      const { sigSeed, dhSecret } = j.rekeyKeys();
+      dhSecret.fill(0);
+      member.resumeRekey({ sigPub: j.rekey.sig, sigKey: ed25519PrivateKeyFromSeed(sigSeed) });
+      sigSeed.fill(0);
+      this.rekeyPublished.add(roomId);
+    }
     member.start();
     return member;
   }
@@ -445,10 +504,21 @@ export class RoomsRuntimeV2 {
     this.observeHolds(roomId);
     const now = this.clock.now();
     for (const [ref, p] of Object.entries(st.pending)) {
-      if (p.kind !== "add" || p.status !== "pending") continue;
+      if (p.status !== "pending") continue;
       // The hold on this daemon's own clock from when it first saw the request (identity 6.3).
       const at = o.holds.endsAt(st, ref, p);
       if (at === null || now < at || (this.approveRetryAt.get(ref) ?? 0) > Date.now()) continue;
+      if (p.kind === "rekey") {
+        // Keys 4.1 step 7: the admin route, approval and commit together (asynchronous).
+        if (this.rekeyInFlight.has(ref)) continue;
+        void this.approveRekeyNow(roomId, ref, "auto")
+          .then((r) => log("device_rekey_auto_approved", { roomId, deviceId: p.deviceId, seq: r.seq, sole: p.sole }))
+          .catch((e) => {
+            this.approveRetryAt.set(ref, Date.now() + ((e as { code?: string }).code === "no_key_package" ? 5_000 : 60_000));
+            log("device_rekey_auto_approve_failed", { roomId, deviceId: p.deviceId, code: (e as { code?: string }).code ?? "error", error: String((e as Error)?.message ?? e).slice(0, 160) });
+          });
+        continue;
+      }
       try {
         const r = this.adminSubmit(roomId, "device.add.approved", { memberId: p.memberId, deviceId: p.deviceId, ref, mode: "auto" });
         log("device_add_auto_approved", { roomId, memberId: p.memberId, deviceId: p.deviceId, seq: r.receipt.entry.seq, sole: p.sole });
@@ -478,7 +548,7 @@ export class RoomsRuntimeV2 {
       error: this.error,
       ...(this.clock.enabled ? { testClockOffsetMs: this.clock.offset } : {}),
       keystore: ks ? { state: ks.state, backend: ks.backend, fallback: ks.state === "ready" ? ks.fallback : false } : null,
-      owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes, holds }) => ({
+      owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes, holds, signer, moved }) => ({
         roomId: host.roomId,
         serverId: endpoint.serverId,
         head: host.head,
@@ -494,6 +564,18 @@ export class RoomsRuntimeV2 {
         compromisedDevices: grants.compromisedDevices(),
         deviceRequests: deviceRequestsView(host.state, undefined, holds),
         conflicts: Object.keys(host.state.conflicts).sort(),
+        // I-12: keys in use (ids only) and rotation state.
+        keys: {
+          hostKid: host.state.auth.hostKeys.find((h) => h.toSeq === null)?.kid ?? null,
+          hostKeys: host.state.auth.hostKeys.map((h) => ({ kid: h.kid, fromSeq: h.fromSeq, toSeq: h.toSeq, validTo: h.validTo, revoked: h.revoked, uncertified: h.uncertified })),
+          adminKid: signer?.kid ?? null,
+          admins: activeAdmins(host.state.auth).map((a) => ({ kid: a.kid, root: a.root })),
+          recoveryKid: host.state.auth.recovery?.kid ?? null,
+          movedEndpoints: moved.filter((m) => m.status !== "closed").map((m) => m.serverId),
+          closed: host.state.auth.closed,
+          closeProposals: Object.entries(host.state.auth.pendingClose).filter(([, p]) => !p.used).map(([ref, p]) => ({ ref, kid: p.kid, hts: p.hts, exp: p.exp })),
+        },
+        uncertified: host.uncertifiedAlerts(),
       })),
       mls: this.mlsView(),
       joining: [...this.joining.values()].map((e) => joinView(e.view())),
@@ -508,6 +590,12 @@ export class RoomsRuntimeV2 {
         alerts: j.client.alerts.map((a) => ({ type: a.type, seq: a.seq })),
         registration: this.registrars.get(roomId)?.status ?? null,
         links: this.linkers.get(roomId)?.view() ?? [],
+        // I-12: this device's own rekey, if one is open (ids and times only).
+        rekey: (() => {
+          const r = this.joining.get(roomId)?.journal.rekey;
+          return r ? { ref: r.ref, requestedAt: r.at, published: this.rekeyPublished.has(roomId) } : null;
+        })(),
+        endpointServerId: j.client.head.seq >= 0 ? j.client.state.auth.endpoint.serverId : null,
         // The member's own pending device requests: the "Was this you?" prompt with Not me (6.3).
         deviceRequests: j.client.status === "open" || j.client.head.seq >= 0 ? deviceRequestsView(j.client.state, j.memberId) : [],
         conflict: j.client.head.seq >= 0 ? j.client.state.conflicts[j.memberId] !== undefined : false,
@@ -557,10 +645,14 @@ export class RoomsRuntimeV2 {
    * Removal (grants-v2 7.1): sessions and lane links are cut in the decide step, before the log
    * append; a failed save of the grants file or of the log answers `persist_failed`.
    */
-  async removeMember(roomId: string, memberId: string): Promise<{ seq: number }> {
+  async removeMember(roomId: string, memberId: string, compromise = false): Promise<{ seq: number; rotatedLanes: string[] }> {
     await this.ready();
     if (!isId("member", memberId)) throw new Error("bad memberId");
-    return this.reducing(roomId, () => ({ seq: this.adminSubmit(roomId, "member.removed", { memberId, reason: "admin" }).receipt.entry.seq }));
+    const o = this.ownedRoom(roomId);
+    // Keys 4.7: lanes are rotated after a removal flagged as compromise (or always, by policy).
+    const toRotate = o.lanes.lanesToRotate(o.host.state, memberId, compromise);
+    const seq = this.reducing(roomId, () => this.adminSubmit(roomId, "member.removed", { memberId, reason: compromise ? "compromise" : "admin" }).receipt.entry.seq);
+    return { seq, rotatedLanes: this.rotateLanesAfterRemoval(roomId, toRotate) };
   }
 
   /** Lowers or changes a member's role (S-9: grants at the old role stop working at once). */
@@ -596,9 +688,10 @@ export class RoomsRuntimeV2 {
   async approveDevice(roomId: string, ref: string): Promise<{ seq: number }> {
     await this.ready();
     const p = this.ownedRoom(roomId).host.state.pending[ref];
-    if (!p || p.kind !== "add") throw new Error("Unknown device request");
+    if (!p) throw new Error("Unknown device request");
     // Checked before signing: a refused admin statement stays outstanding until a fence (I-7).
     if (p.status !== "pending") throw new Error(`The device request is ${p.status}`);
+    if (p.kind === "rekey") return this.approveRekeyNow(roomId, ref, "admin");
     return { seq: this.adminSubmit(roomId, "device.add.approved", { memberId: p.memberId, deviceId: p.deviceId, ref, mode: "admin" }).receipt.entry.seq };
   }
 
@@ -610,6 +703,229 @@ export class RoomsRuntimeV2 {
     if (st.conflicts[memberId] === undefined) throw new Error("That member has no open device conflict");
     const ver = st.auth.versions[versionKey.conflict(memberId)] ?? -1;
     return { seq: this.adminSubmit(roomId, "device.conflict.resolved", { memberId, ver }).receipt.entry.seq };
+  }
+
+  /**
+   * Keys 4.1 step 7, the admin route (mls-integration.md 4.4): this daemon's own device in the room
+   * group fetches the device's `rekey` KeyPackage (no package: nothing is signed), signs
+   * `device.rekey.approved` and submits it with the Remove plus Add commit; the host sequences both
+   * adjacently or neither. A pair the host refused is settled as rejected, so the signer is free again.
+   */
+  private async approveRekeyNow(roomId: string, ref: string, mode: "auto" | "admin"): Promise<{ seq: number }> {
+    const o = this.ownedRoom(roomId);
+    const member = this.mlsMembers.get(roomId);
+    if (!o.signer) throw Object.assign(new Error("No admin key for this room on this daemon"), { code: "no_admin_key" });
+    if (!member) throw Object.assign(new Error("This daemon's device is not in the room group"), { code: "no_group" });
+    const p = o.host.state.pending[ref];
+    if (!p || p.kind !== "rekey" || p.status !== "pending") throw new Error("No pending rekey with that reference");
+    const signer = o.signer;
+    let stmt: SignedStatement | null = null;
+    this.rekeyInFlight.add(ref);
+    try {
+      o.ownFeed?.();
+      const r = await member.approveRekey(ref, (base) => (stmt = signer.signWithCommit({ type: "device.rekey.approved", data: { memberId: p.memberId, deviceId: p.deviceId, ref, mode }, base })));
+      signer.reconcile(o.host);
+      log("device_rekey_approved", { roomId, deviceId: p.deviceId, mode, seq: r.statementSeq });
+      return { seq: r.statementSeq };
+    } catch (e) {
+      if (stmt) {
+        const h = bodyHash(rjcs(stmt));
+        signer.reconcile(o.host);
+        // commit.submit refused both entries: the approval was never logged (a definite rejection).
+        if (o.host.findBody(h) === undefined) signer.settle(h, { rejected: true });
+      }
+      throw e;
+    } finally {
+      this.rekeyInFlight.delete(ref);
+    }
+  }
+
+  /** Keys 4.5: stage the next host key in keys.sealed, then `host.key.rotated` with oldValidTo = now + 24 h. */
+  async rotateHostKey(roomId: string): Promise<{ seq: number; kid: string }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    const staged = o.host.stageHostKey();
+    const oldValidTo = Math.floor(this.clock.now() / 1000) + 24 * 3600;
+    const r = this.adminSubmit(roomId, "host.key.rotated", { ...staged, oldValidTo });
+    return { seq: r.receipt.entry.seq, kid: edKid(staged.change.newSig!) };
+  }
+
+  /** Keys 4.5 step 6 and 6.4: revokes a host key that is already rotated out, from `fromSeq`. */
+  async revokeHostKey(roomId: string, kid: string, fromSeq: number): Promise<{ seq: number }> {
+    await this.ready();
+    const h = this.ownedRoom(roomId).host.state.auth.hostKeys.find((k) => k.kid === kid);
+    if (!h) throw new Error("Unknown host key");
+    if (h.toSeq === null) throw new Error("The current host key cannot be revoked; rotate it first");
+    return this.reducing(roomId, () => ({ seq: this.adminSubmit(roomId, "host.key.revoked", { kid, fromSeq }).receipt.entry.seq }));
+  }
+
+  /** Keys 4.3: a new admin key, staged before `admin.key.rotated` is signed by the old one, installed after. */
+  async rotateAdminKey(roomId: string): Promise<{ seq: number; kid: string }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    if (!o.signer) throw new Error("No admin key for this room on this daemon");
+    const staged = o.signer.stageRotation();
+    const r = this.adminSubmit(roomId, "admin.key.rotated", staged);
+    const next = o.signer.promote((kid) => activeAdmins(o.host.state.auth).some((a) => a.kid === kid));
+    if (!next) throw new Error("The rotation is logged but the new admin key could not be installed; it is installed at the next start");
+    o.signer = next;
+    next.reconcile(o.host);
+    return { seq: r.receipt.entry.seq, kid: next.kid };
+  }
+
+  /** Keys 6.6: this admin revokes another admin key from `fromSeq` (its statements from there on become suspect). */
+  async revokeAdminKey(roomId: string, kid: string, fromSeq: number): Promise<{ seq: number }> {
+    await this.ready();
+    return this.reducing(roomId, () => ({ seq: this.adminSubmit(roomId, "admin.key.revoked", { kid, fromSeq }).receipt.entry.seq }));
+  }
+
+  /**
+   * Keys 4.6: the host creates and serves the next endpoint (`endpointNext`), the admin logs
+   * `endpoint.rotated`, live sessions get the entry and are closed with `moved`, and the old endpoint
+   * keeps answering `moved` to active devices for 30 days.
+   */
+  async rotateEndpoint(roomId: string): Promise<{ seq: number; serverId: string }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    const old = { serverId: o.endpoint.serverId, endpointKey: o.endpoint.endpointKey };
+    const next = o.host.stageEndpoint();
+    const relay = o.host.state.auth.endpoint.relay;
+    const r = this.adminSubmit(roomId, "endpoint.rotated", { serverId: next.serverId, dh: next.dh, relay, ver: o.host.state.auth.versions[versionKey.endpoint()] ?? -1 });
+    o.host.promoteEndpoint();
+    o.endpoint.rotateTo(endpointKeyFromHost(this.dataDir, this.kek!, o.host));
+    const until = this.clock.now() + 30 * 24 * 3600 * 1000;
+    const restricted = new RoomEndpoint({ host: o.host, endpointKey: old.endpointKey, relay: relayAddress(relay, this.env), restricted: { ...old, until }, ...(this.tuning.timings ? { timings: this.tuning.timings } : {}) });
+    o.moved.push(restricted);
+    restricted.start();
+    return { seq: r.receipt.entry.seq, serverId: next.serverId };
+  }
+
+  /** Keys 4.7: a new lane offer; the old lane endpoint stops at once. */
+  async rotateLane(roomId: string, laneId: string): Promise<{ seq: number; serverId: string }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    let seq = -1;
+    const r = o.lanes.rotateOffer(laneId, (data) => (seq = this.adminSubmit(roomId, "lane.offer.rotated", data).receipt.entry.seq));
+    return { seq, serverId: r.serverId };
+  }
+
+  /** Keys 4.7 after a removal: the lanes `rotateLaneOnRemove` names are rotated; failures are logged. */
+  private rotateLanesAfterRemoval(roomId: string, lanes: string[]): string[] {
+    const o = this.ownedRoom(roomId);
+    const done: string[] = [];
+    for (const laneId of lanes) {
+      try {
+        o.lanes.rotateOffer(laneId, (data) => void this.adminSubmit(roomId, "lane.offer.rotated", data));
+        done.push(laneId);
+      } catch (e) {
+        logError("lane_rotate_after_removal_failed", e, { roomId, laneId });
+      }
+    }
+    return done;
+  }
+
+  /** Keys 6.1, 6.3: an admin removes one device; `compromise` also rotates the lanes the member could use. */
+  async removeDevice(roomId: string, memberId: string, deviceId: string, compromise: boolean): Promise<{ seq: number; rotatedLanes: string[] }> {
+    await this.ready();
+    if (!isId("member", memberId) || !isId("device", deviceId)) throw new Error("bad memberId or deviceId");
+    const o = this.ownedRoom(roomId);
+    const toRotate = o.lanes.lanesToRotate(o.host.state, memberId, compromise);
+    const seq = this.reducing(roomId, () => this.adminSubmit(roomId, "device.removed", { memberId, deviceId, reason: compromise ? "compromise" : "admin" }).receipt.entry.seq);
+    return { seq, rotatedLanes: this.rotateLanesAfterRemoval(roomId, toRotate) };
+  }
+
+  /** Keys 6.8: `room.close.proposed` with `exp` (default: closeDelay + 3 days, at most 7 days ahead). */
+  async proposeClose(roomId: string): Promise<{ seq: number; proposal: string; earliest: number }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    const delayS = o.host.state.auth.policy.closeDelay;
+    const exp = Math.floor(this.clock.now() / 1000) + Math.min(7 * 24 * 3600 - 60, delayS + 3 * 24 * 3600);
+    const r = this.adminSubmit(roomId, "room.close.proposed", { exp });
+    return { seq: r.receipt.entry.seq, proposal: r.receipt.entry.bodyHash, earliest: r.receipt.entry.hts + delayS * 1000 };
+  }
+
+  /** Keys 6.8: an admin of another lineage confirms; refused here before closeDelay on this daemon's clock. */
+  async confirmClose(roomId: string, proposal: string): Promise<{ seq: number }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    if (!o.signer) throw new Error("No admin key for this room on this daemon");
+    this.observeHolds(roomId);
+    const blocked = closeConfirmationBlocker(o.host.state, proposal, o.signer.kid, this.clock.now(), o.holds?.firstSeen(proposal));
+    if (blocked) throw Object.assign(new Error(blocked.message), { code: blocked.reason });
+    return { seq: this.adminSubmit(roomId, "room.closed", { proposal }).receipt.entry.seq };
+  }
+
+  /**
+   * Keys 4.4: a first recovery key. One lineage: installed at once (`proposal: null`). Two or more:
+   * `recovery.key.proposed` (exp in 3 days), which an admin of another lineage confirms. The code is a
+   * secret, returned once and never stored or logged.
+   */
+  async createRecoveryKey(roomId: string): Promise<{ seq: number; kid: string; code: string; proposal: string | null }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    if (o.host.state.auth.recovery) throw new Error("This room already has a recovery key; rotate it with the recovery code");
+    const k = newRecoveryKey(roomId);
+    if (lineageCount(o.host.state.auth) <= 1) {
+      const r = this.adminSubmit(roomId, "recovery.key.rotated", { change: k.change, newKeySig: k.newKeySig, proposal: null });
+      return { seq: r.receipt.entry.seq, kid: k.kid, code: k.code, proposal: null };
+    }
+    const exp = Math.floor(this.clock.now() / 1000) + 3 * 24 * 3600;
+    const r = this.adminSubmit(roomId, "recovery.key.proposed", { change: k.change, newKeySig: k.newKeySig, exp });
+    return { seq: r.receipt.entry.seq, kid: k.kid, code: k.code, proposal: r.receipt.entry.bodyHash };
+  }
+
+  /** Keys 4.4 (two lineages): confirms another lineage's proposal with its byte-identical change. */
+  async confirmRecoveryKey(roomId: string, proposal: string): Promise<{ seq: number }> {
+    await this.ready();
+    const o = this.ownedRoom(roomId);
+    const at = o.host.findBody(proposal);
+    const rec = at === undefined ? undefined : o.host.entries(at, at)[0];
+    if (!rec || rec.signed.entry.type !== "recovery.key.proposed") throw new Error("No recovery.key.proposed with that reference");
+    const d = (rjcsParse(rec.body) as SignedStatement).body.data as StatementData<"recovery.key.proposed">;
+    return { seq: this.adminSubmit(roomId, "recovery.key.rotated", { change: d.change, newKeySig: d.newKeySig, proposal }).receipt.entry.seq };
+  }
+
+  /**
+   * The recovery procedures with R (keys 6.6 step 4, 6.8, 4.4), one action per typed code:
+   * - `revoke_admin`: R revokes `kid` from `fromSeq`; when that leaves no active admin key or retires
+   *   this daemon's key, R adds a fresh admin key, sealed here as this daemon's admin key (R8-5a).
+   * - `close`: `room.closed {proposal: null}`, final.
+   * - `rotate`: a new recovery code (returned once).
+   */
+  async recoveryAction(roomId: string, code: string, a: { kind: "revoke_admin"; kid: string; fromSeq: number } | { kind: "close" } | { kind: "rotate" }): Promise<{ seq: number; freshAdminKid?: string; code?: string }> {
+    const kek = await this.ready();
+    const o = this.ownedRoom(roomId);
+    const r = RecoveryKey.fromCode(code, o.host.state, this.clock.now);
+    const submit = (stmt: SignedStatement) => {
+      const res = o.endpoint.submit(stmt);
+      if (!res.ok) throw new Error(`${stmt.body.type} refused: ${res.code} (${res.reason})`);
+      log("v2_recovery_statement", { roomId, type: stmt.body.type, seq: res.receipt.entry.seq });
+    };
+    try {
+      if (a.kind === "close") {
+        submit(r.sign("room.closed", { proposal: null }, o.host.head));
+        return { seq: o.host.head.seq };
+      }
+      if (a.kind === "rotate") {
+        const x = r.rotate(o.host.head);
+        submit(x.statement);
+        return { seq: o.host.head.seq, code: x.code };
+      }
+      const memberId = o.signer?.memberId ?? this.ownMemberId(kek, roomId);
+      const out = await recoverFromStolenAdmin({ r, state: () => o.host.state, head: () => o.host.head, submit, stolenKid: a.kid, fromSeq: a.fromSeq, ownKid: o.signer?.kid ?? null, freshFor: memberId });
+      if (out.fresh) {
+        try {
+          writeAdminKey(this.dataDir, kek, { v: 2, typ: "admin-key", roomId, genesisHash: o.host.genesisHash, memberId, kid: out.fresh.kid, seed: b64u(out.fresh.seed) });
+        } finally {
+          out.fresh.seed.fill(0);
+        }
+        o.signer = AdminSigner.load({ dataDir: this.dataDir, kek, roomId });
+        o.signer.reconcile(o.host);
+      }
+      return { seq: o.host.head.seq, ...(out.fresh ? { freshAdminKid: out.fresh.kid } : {}) };
+    } finally {
+      r.dispose();
+    }
   }
 
   /** TEST-ONLY (test homes with PASEO_ROOMS_TEST_CLOCK=1): moves the hts and approval clock forward. */
@@ -1028,29 +1344,186 @@ export class RoomsRuntimeV2 {
     log("relay_trusted", { relay: relayKey(relay) });
   }
 
+  // ------------------------------------------------------------------------------ member: rekey (I-12)
+
+  /**
+   * Keys 4.1 steps 1 and 2 on a joined device: the next keys are sealed in the journal, then
+   * `device.rekeyed` (signed by the current key) is submitted over the session, then `rekey`
+   * KeyPackages under the new credential are published. The old keys stay in use until the approval
+   * is in the log; `followRotation` then switches.
+   */
+  async requestRekey(roomId: string): Promise<{ ref: string; seq: number }> {
+    const kek = await this.ready();
+    const j = this.joining.get(roomId)?.journal;
+    const joined = this.joined.get(roomId);
+    if (!j || !(j.state === "admitted" || j.state === "registered") || !joined) throw new Error("Only a device that joined this room can request its own rekey here");
+    const c = joined.client;
+    if (c.status !== "open") throw new Error("The room is not connected");
+    if (j.rekey?.ref && rekeyStatus(c.state, joined.memberId, joined.deviceId, j.rekey) === "pending") throw new Error("A rekey of this device is already waiting");
+    const me = c.state.members[joined.memberId]?.devices.find((d) => d.deviceId === joined.deviceId);
+    if (!me) throw new Error("This device is not in the roster");
+    j.abandonRekey();
+    const sigSeed = randomBytes(32);
+    const dhSecret = randomBytes(32);
+    try {
+      j.beginRekey({ sigSeed, dhSecret });
+    } finally {
+      sigSeed.fill(0);
+      dhSecret.fill(0);
+    }
+    const next = j.rekey!;
+    const keys = j.rekeyKeys();
+    keys.dhSecret.fill(0);
+    let req: ReturnType<typeof rekeyRequest>;
+    try {
+      req = rekeyRequest({ roomId, deviceId: joined.deviceId, currentSig: me.sig, currentKey: this.sigKeyFor(kek, roomId), next: { sigSeed: keys.sigSeed, sig: next.sig, dh: next.dh }, base: c.head, ts: Date.now() });
+    } finally {
+      keys.sigSeed.fill(0);
+    }
+    let seq: number;
+    try {
+      const reply = await c.request({ t: "stmt.submit", statement: req.statement });
+      seq = Number((reply.receipt as { entry?: { seq?: number } } | undefined)?.entry?.seq ?? -1);
+    } catch (e) {
+      j.abandonRekey();
+      throw new Error(`device.rekeyed refused: ${(e as { code?: string }).code ?? "error"}`);
+    }
+    j.rekeyRequested(req.ref);
+    log("device_rekey_requested", { roomId, deviceId: joined.deviceId, seq });
+    await this.publishRekey(roomId).catch(() => undefined);
+    return { ref: req.ref, seq };
+  }
+
+  /** Keys 4.1 step 7: `rekey` KeyPackages under the next credential (retried by `followRotation`). */
+  private async publishRekey(roomId: string): Promise<void> {
+    const j = this.joining.get(roomId)?.journal;
+    const mls = this.mlsMembers.get(roomId);
+    if (!j?.rekey?.ref || !mls || this.rekeyPublished.has(roomId)) return;
+    const { sigSeed, dhSecret } = j.rekeyKeys();
+    dhSecret.fill(0);
+    const sigKey = ed25519PrivateKeyFromSeed(sigSeed);
+    sigSeed.fill(0);
+    try {
+      await mls.prepareRekey({ sigPub: j.rekey.sig, sigKey });
+      this.rekeyPublished.add(roomId);
+    } catch (e) {
+      log("device_rekey_publish_failed", { roomId, code: (e as { code?: string }).code ?? "error" });
+      throw e;
+    }
+  }
+
+  /**
+   * Every second for each joined room: a rekey approved in the log switches the journal to the new
+   * keys and reconnects (the host closes the old session with `superseded`); a vetoed or cancelled
+   * one is dropped; a session closed with `superseded` or `moved` is reopened (2 s apart at most).
+   */
+  private followRotation(roomId: string): void {
+    if (this.stopping) return;
+    const joined = this.joined.get(roomId);
+    const j = this.joining.get(roomId)?.journal;
+    if (!joined || !j || this.owned.has(roomId)) return;
+    const c = joined.client;
+    const r = j.rekey;
+    if (r && c.head.seq >= 0) {
+      const st = rekeyStatus(c.state, joined.memberId, joined.deviceId, r);
+      if (st === "approved") {
+        this.finishRekey(roomId);
+        return;
+      }
+      if (st === "ended") {
+        j.abandonRekey();
+        this.mlsMembers.get(roomId)?.cancelRekey();
+        this.rekeyPublished.delete(roomId);
+        log("device_rekey_ended", { roomId, deviceId: joined.deviceId });
+      } else if (st === "pending" && c.status === "open" && !this.rekeyPublished.has(roomId)) void this.publishRekey(roomId).catch(() => undefined);
+    }
+    if (c.status === "closed" && (c.lastError === "superseded" || c.lastError === "moved") && (this.reconnectAt.get(roomId) ?? 0) <= Date.now()) {
+      this.reconnectAt.set(roomId, Date.now() + 2000);
+      void this.connect(roomId).catch((e) => logError("v2_reconnect_failed", e, { roomId }));
+    }
+  }
+
+  /** The approval is in the log: new keys in the journal, old ones deleted, new session, new grants. */
+  private finishRekey(roomId: string): void {
+    const j = this.joining.get(roomId)?.journal;
+    if (!j?.rekey) return;
+    j.completeRekey();
+    this.rekeyPublished.delete(roomId);
+    this.linkers.delete(roomId);
+    log("device_rekey_completed", { roomId });
+    this.reconnectAt.set(roomId, Date.now() + 2000);
+    void this.connect(roomId)
+      .then(() => {
+        // Keys 4.1 step 6: the old grants named the old key; ask for new ones.
+        for (const sc of this.schedulers.get(roomId)?.values() ?? []) void sc.rotate("rekeyed");
+      })
+      .catch((e) => logError("v2_reconnect_after_rekey_failed", e, { roomId }));
+  }
+
+  /** Entries of a joined room's verified log that need action here (endpoint and lane offer rotations). */
+  private onMemberEntry(roomId: string, signed: SignedEntry, before: Readonly<RoomState>, after: Readonly<RoomState>): void {
+    const t = signed.entry.type;
+    if (t === "endpoint.rotated") {
+      const e = after.auth.endpoint;
+      try {
+        this.joining.get(roomId)?.journal.setEndpoint({ serverId: e.serverId, dh: e.dh.pub, relay: { host: e.relay.host, port: e.relay.port } });
+      } catch (err) {
+        logError("v2_endpoint_save_failed", err, { roomId });
+      }
+      log("room_endpoint_rotated_seen", { roomId, seq: signed.entry.seq });
+    }
+    if (t === "lane.offer.rotated") {
+      for (const [laneId, l] of Object.entries(after.auth.lanes)) {
+        if (before.auth.lanes[laneId]?.offer.serverId === l.offer.serverId) continue;
+        // Keys 4.7 step 3: new grants for the new offer, and hosts.update with the new connection.
+        void this.schedulers.get(roomId)?.get(laneId)?.rotate("offer_rotated");
+      }
+    }
+  }
+
   // ------------------------------------------------------------------------------ member: sessions
 
   /** Member side: opens (or reopens) the room session with the device key from the journal. */
-  async connect(roomId: string): Promise<{ status: RoomClient["status"]; lastError: string | null }> {
+  async connect(roomId: string, opts: { nextKeys?: boolean; moved?: SignedEntry; depth?: number } = {}): Promise<{ status: RoomClient["status"]; lastError: string | null }> {
     const kek = await this.ready();
-    this.joined.get(roomId)?.client.close();
-    const keys = this.deviceFor(kek, roomId);
+    const prev = this.joined.get(roomId)?.client;
+    prev?.close();
+    const keys = this.deviceFor(kek, roomId, opts.nextKeys === true);
     const v = verifyGenesis(keys.genesis);
     const mls = this.memberMlsFor(kek, roomId, v.genesisHash, keys.memberId, keys.deviceId);
+    const j = this.owned.has(roomId) ? undefined : this.joining.get(roomId)?.journal;
+    // Keys 4.6: the last endpoint this device verified, when the room endpoint has rotated.
+    const ep = j?.endpoint;
+    const useEp = ep && ep.serverId !== v.genesis.body.endpoint.serverId ? ep : null;
     const client = new RoomClient({
       genesis: keys.genesis,
       device: keys.device,
-      relay: keys.relay(v.genesis),
+      relay: useEp ? memberRelayAddress(useEp.relay, this.env) : keys.relay(v.genesis),
+      ...(useEp ? { endpoint: { serverId: useEp.serverId, dh: { pub: useEp.dh } } } : {}),
       timings: this.tuning.timings,
       onPush: (f) => this.onSessionPush(roomId, f),
-      // Enrollment 5.7 (round 9, item 3): what the host showed before admission must be in the log.
-      anchors: this.joining.get(roomId)?.journal.preAdmissionAnchors() ?? [],
-      ...(mls && !this.owned.has(roomId) ? { onIngest: (s, b, a) => mls.ingest(s, b, a) } : {}),
+      // Enrollment 5.7 (round 9, item 3): what the host showed before admission must be in the log;
+      // so must the `endpoint.rotated` a moved endpoint showed (keys 4.6).
+      anchors: [...(j?.preAdmissionAnchors() ?? []), ...(opts.moved ? [{ source: "moved", signed: opts.moved }] : [])],
+      onIngest: (s, b, a) => {
+        if (mls && !this.owned.has(roomId)) mls.ingest(s, b, a);
+        this.onMemberEntry(roomId, s, b, a);
+      },
     });
     this.joined.set(roomId, { client, memberId: keys.memberId, deviceId: keys.deviceId });
+    if (opts.nextKeys) this.linkers.delete(roomId);
     this.linkerFor(kek, roomId, v.genesisHash, keys.memberId, keys.deviceId, client);
     try {
       const hello = await client.connect();
+      // Keys 4.1: a session with the next keys is open, so the approval is in the log.
+      if (opts.nextKeys && j?.rekey) {
+        j.completeRekey();
+        this.rekeyPublished.delete(roomId);
+        this.linkers.delete(roomId);
+        this.linkerFor(kek, roomId, v.genesisHash, keys.memberId, keys.deviceId, client);
+        log("device_rekey_completed", { roomId, via: "reconnect" });
+        for (const sc of this.schedulers.get(roomId)?.values() ?? []) void sc.rotate("rekeyed");
+      }
       if (mls && !this.owned.has(roomId)) {
         const la = hello.lastAck as { seq?: unknown; epoch?: unknown } | null;
         mls.checkRollback(la && Number.isSafeInteger(la.seq) && Number.isSafeInteger(la.epoch) ? { seq: la.seq as number, epoch: la.epoch as number } : null);
@@ -1059,7 +1532,25 @@ export class RoomsRuntimeV2 {
       const m = client.state.members[keys.memberId];
       if (!m?.devices.some((d) => d.deviceId === keys.deviceId)) log("v2_admission_not_in_log", { roomId, memberId: keys.memberId });
     } catch (e) {
-      log("v2_connect_failed", { roomId, code: (e as { code?: string }).code ?? "error" });
+      const code = (e as { code?: string }).code ?? "error";
+      log("v2_connect_failed", { roomId, code });
+      const depth = opts.depth ?? 0;
+      // Keys 4.1: the old DH key is unknown once the approval is logged; try the next keys.
+      if (code === "not_authorized" && !opts.nextKeys && j?.rekey?.ref && depth < 2) return this.connect(roomId, { ...opts, nextKeys: true, depth: depth + 1 });
+      // Keys 4.6 step 4: a replaced endpoint answered `moved`; go to the endpoint it names.
+      if (code === "moved" && j && depth < 2) {
+        const target = movedTarget(client.lastErrorFields, roomId, prev && prev.head.seq >= 0 ? prev.state : client.state);
+        if (target) {
+          j.setEndpoint(target.endpoint);
+          log("room_moved", { roomId, hsigChecked: target.hsigChecked });
+          return this.connect(roomId, { ...opts, moved: target.anchor, depth: depth + 1 });
+        }
+        log("room_moved_unusable", { roomId });
+      }
+    }
+    if (client.status === "open" && j) {
+      const e = client.state.auth.endpoint;
+      if (e.serverId !== v.genesis.body.endpoint.serverId || j.endpoint) j.setEndpoint({ serverId: e.serverId, dh: e.dh.pub, relay: { host: e.relay.host, port: e.relay.port } });
     }
     if (client.status === "ended" && this.schedulers.has(roomId)) this.stopLanes(roomId);
     return { status: client.status, lastError: client.lastError };
@@ -1075,10 +1566,10 @@ export class RoomsRuntimeV2 {
     for (const id of Object.values(regs)) void hosts?.remove?.(id).catch((e) => logError("lane_host_remove_failed", e, { roomId }));
   }
 
-  private deviceFor(kek: Kek, roomId: string): { genesis: RoomGenesis | Uint8Array; device: { publicKey: Uint8Array; secretKey: Uint8Array }; memberId: string; deviceId: string; relay(g: RoomGenesis): RelayAddress } {
+  private deviceFor(kek: Kek, roomId: string, nextKeys = false): { genesis: RoomGenesis | Uint8Array; device: { publicKey: Uint8Array; secretKey: Uint8Array }; memberId: string; deviceId: string; relay(g: RoomGenesis): RelayAddress } {
     const j = this.joining.get(roomId)?.journal;
     if (j && (j.state === "admitted" || j.state === "registered") && j.e.genesis) {
-      const { sigSeed, dhSecret } = j.deviceKeys();
+      const { sigSeed, dhSecret } = nextKeys && j.rekey ? j.rekeyKeys() : j.deviceKeys();
       sigSeed.fill(0);
       const secret = new Uint8Array(dhSecret);
       dhSecret.fill(0);
@@ -1134,6 +1625,7 @@ export class RoomsRuntimeV2 {
       await o.lanes.stop();
       o.grants.stop();
       o.endpoint.stop();
+      for (const m of o.moved) m.stop();
       o.host.close();
     }
     this.kek?.dispose();

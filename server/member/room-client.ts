@@ -105,6 +105,11 @@ export interface RoomClientOptions {
   onAlert?(alert: RoomAlert): void;
   /** Every entry the fold accepted, with the fold state before and after it (the MLS member, I-13). */
   onIngest?(signed: SignedEntry, before: Readonly<RoomState>, after: Readonly<RoomState>): void;
+  /**
+   * The room endpoint to reach when it is newer than the genesis one (keys 4.6): the last endpoint this
+   * device verified, or the one a `moved` answer named. The fetched log must then certify it.
+   */
+  endpoint?: { serverId: string; dh: { pub: string } };
   /** Signed entries received before admission, checked against the fetched log (enrollment 5.7). */
   anchors?: readonly { source: string; signed: SignedEntry }[];
   /** Test only: bind the handshake to something else than this room (wrong prologue). */
@@ -330,7 +335,7 @@ export class RoomClient {
   // ------------------------------------------------------------------------------- internals
 
   private handshake(): Promise<void> {
-    const auth = this.fold ? this.fold.state.auth.endpoint : this.o.target!.endpoint;
+    const auth = this.o.endpoint ?? (this.fold ? this.fold.state.auth.endpoint : this.o.target!.endpoint);
     this.handshakeHash = null;
     const binding: RoomEndpointBinding = this.o.bindingOverride ?? { genesisHash: b64uDecode(this.genesisHash, 32), serverId: auth.serverId };
     let hs: NoiseHandshake;

@@ -40,8 +40,14 @@
 //   `superseded`. The owner's own member device reaches the same service in process (`localRequest`),
 //   without a relay session.
 //
-// Not here (later milestones): per-device budgets of every operation (only grants are limited),
-// endpoint rotation and `moved` (I-12).
+// - Endpoint rotation (I-12, keys-rotation-recovery.md 4.6): `rotateTo` moves this endpoint to the new
+//   serverId and key once `endpoint.rotated` is in the log; live sessions, which already received the
+//   entry, are closed with `moved`. The old endpoint runs as a separate `restricted` instance for 30
+//   days: it completes handshakes only for active roster devices and answers every request with
+//   `{t:"error", code:"moved", entry, body}` (the signed entry and its statement body; the spec names
+//   only `entry`, but a member that missed the rotation cannot learn the new endpoint without the body).
+//
+// Not here (later milestones): per-device budgets of every operation (only grants are limited).
 import { x25519 } from "@noble/curves/ed25519.js";
 import { RoomLogFold } from "../authority/fold";
 import type { SignedEntry } from "../authority/entries";
@@ -108,6 +114,11 @@ export interface RoomEndpointOptions {
   /** MLS delivery service (I-13). Without it the MLS operations answer `not_permitted`. */
   mls?: MlsDelivery;
   now?: () => number;
+  /**
+   * Restricted mode of a replaced endpoint (keys 4.6 step 4): its serverId and key, and until when it
+   * answers (unix ms). Without enrollment, grants or MLS.
+   */
+  restricted?: { serverId: string; endpointKey: NoiseKeyPair; until: number };
 }
 
 const DEFAULT_MAX_CONNECTIONS = 256;
@@ -127,9 +138,22 @@ export function endpointKeyFromHost(dataDir: string, kek: Kek, host: RoomHost): 
   return { publicKey, secretKey };
 }
 
+/** Replaced endpoints still in their 30-day restricted mode (keys 4.6 step 4). */
+export function movedEndpointKeys(dataDir: string, kek: Kek, roomId: string, now: number): { serverId: string; endpointKey: NoiseKeyPair; until: number }[] {
+  const keys = readHostKeys(dataDir, kek, roomId);
+  return (keys?.endpointOld ?? [])
+    .filter((e) => e.until > now)
+    .map((e) => {
+      const secretKey = new Uint8Array(b64uDecode(e.secret, 32));
+      return { serverId: e.serverId, endpointKey: { publicKey: x25519.getPublicKey(secretKey), secretKey }, until: e.until };
+    });
+}
+
 export class RoomEndpoint {
   status: RoomEndpointStatus = "starting";
-  readonly serverId: string;
+  serverId: string;
+  /** The endpoint's X25519 static key (changes only by `rotateTo`). */
+  endpointKey: NoiseKeyPair;
   readonly timings: RoomSessionTimings;
   readonly connections = new Map<string, RoomConnection>();
   /** Key-confirmed sessions of active devices, by device DH key (b64u): one per device (3.5). */
@@ -153,13 +177,15 @@ export class RoomEndpoint {
   private readonly unhook: () => void;
 
   constructor(readonly o: RoomEndpointOptions) {
-    this.serverId = o.host.state.auth.endpoint.serverId;
+    this.serverId = o.restricted?.serverId ?? o.host.state.auth.endpoint.serverId;
+    this.endpointKey = o.restricted?.endpointKey ?? o.endpointKey;
     this.timings = resolveTimings(o.timings);
     this.now = o.now ?? Date.now;
-    if (b64u(o.endpointKey.publicKey) !== o.host.state.auth.endpoint.dh.pub) throw new Error("room endpoint key does not match the room's endpoint");
+    if (!o.restricted && b64u(o.endpointKey.publicKey) !== o.host.state.auth.endpoint.dh.pub) throw new Error("room endpoint key does not match the room's endpoint");
+    if (o.restricted && (o.enrollment || o.grants || o.mls)) throw new Error("a restricted endpoint serves no operations");
     this.history = RoomLogFold.fromGenesis(o.host.genesis);
     this.catchUp();
-    this.enrollment = o.enrollment
+    this.enrollment = o.enrollment && !o.restricted
       ? new EnrollmentHost({
           ...o.enrollment,
           host: o.host,
@@ -271,8 +297,44 @@ export class RoomEndpoint {
     log("room_endpoint_stopped", { roomId: this.roomId, why });
   }
 
+  /** Restricted mode (keys 4.6 step 4): the answer to every request, or null when not restricted. */
+  movedFields(): Record<string, unknown> | null {
+    if (!this.o.restricted) return null;
+    const m = this.o.host.lastEndpointRotation();
+    return m ? { entry: m.entry, body: m.body } : {};
+  }
+
+  get restricted(): boolean {
+    return !!this.o.restricted;
+  }
+
+  /**
+   * Keys 4.6 step 3: `endpoint.rotated` is in the log (call after the afterAppend that pushed it). This
+   * endpoint moves to the new serverId and key: live sessions are closed with `moved`, the relay
+   * registration moves to the new serverId. The old serverId is served by a restricted instance.
+   */
+  rotateTo(key: NoiseKeyPair): void {
+    if (this.o.restricted) throw new Error("a restricted endpoint does not rotate");
+    const auth = this.o.host.state.auth.endpoint;
+    if (b64u(key.publicKey) !== auth.dh.pub) throw new Error("room endpoint key does not match the room's endpoint");
+    if (auth.serverId === this.serverId) return;
+    const moved = this.o.host.lastEndpointRotation();
+    for (const c of [...this.connections.values()]) {
+      if (c.state === "open" && c.access.kind === "active" && moved) c.fail("moved", undefined, { entry: moved.entry, body: moved.body });
+      else c.close("endpoint_rotated");
+    }
+    const wasStarted = !!this.control;
+    this.control?.stop(1001, "room endpoint rotated");
+    this.control = null;
+    this.serverId = auth.serverId;
+    this.endpointKey = key;
+    log("room_endpoint_rotated", { roomId: this.roomId, serverId: this.serverId });
+    if (wasStarted && !this.stopped) this.start();
+  }
+
   /** Relay control notices: data sockets for new connections (capped), and disconnects. */
   onRelayNotice(msg: unknown): void {
+    if (this.o.restricted && this.now() > this.o.restricted.until) return this.stop("moved_expired");
     const notice = parseRelayNotice(msg);
     if (notice.disconnected !== null) this.connections.get(notice.disconnected)?.close("relay_disconnected");
     for (const id of notice.announced) {
@@ -456,7 +518,7 @@ export class RoomConnection implements EnrollSession {
     readonly connectionId: string,
   ) {
     const host = endpoint.host;
-    this.hs = createRoomIkResponder({ binding: { genesisHash: b64uDecode(host.genesisHash, 32), serverId: endpoint.serverId }, endpointStatic: endpoint.o.endpointKey });
+    this.hs = createRoomIkResponder({ binding: { genesisHash: b64uDecode(host.genesisHash, 32), serverId: endpoint.serverId }, endpointStatic: endpoint.endpointKey });
   }
 
   get tag(): string | null {
@@ -520,6 +582,8 @@ export class RoomConnection implements EnrollSession {
       return this.preauthFail("handshake_failed");
     }
     const dh = b64u(this.hs.remoteStatic()!);
+    // A restricted (moved) endpoint completes handshakes only for active roster devices (keys 4.6).
+    if (this.endpoint.restricted && this.endpoint.accessOf(dh).kind !== "active") return this.preauthFail("moved_not_member");
     if (this.endpoint.accessOf(dh).kind !== "active" && this.endpoint.preauthSessions() >= (this.endpoint.o.maxPreauthSessions ?? 8)) {
       return this.preauthFail("preauth_sessions_cap");
     }
@@ -560,6 +624,8 @@ export class RoomConnection implements EnrollSession {
     if (this.access.kind === "active") this.access = this.endpoint.accessOf(this.deviceDh!);
     const access = this.access;
     if (access.kind === "ended") return this.fail("access_ended", frame.id, { reason: access.reason });
+    const moved = this.endpoint.movedFields();
+    if (moved) return access.kind === "active" ? this.fail("moved", frame.id, moved) : this.fail("not_authorized", frame.id);
     if (PREAUTH_OPS.has(t)) {
       const enrollment = this.endpoint.enrollment;
       if (enrollment) return enrollment.handle(this, frame);

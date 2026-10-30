@@ -38,6 +38,14 @@
 // 72 h the admin daemon approves automatically -> B is the same member with its own device id, its own
 // session and its own lane grant -> the removal of the member later ends both devices.
 //
+// Rotation (I-12): before the test clock moves (grants are timed on the wall clock, hts on the test
+// clock), the owner rotates the host key; the member's fold accepts the rotation, the lane stays online
+// on the old key's grant, the next grant is issued under the new key and the routed view works. After
+// the MLS exchange, device B requests its own rekey: it is held 24 h (A is another active device), is
+// still pending after 23 h on the admin daemon's TEST-ONLY clock, and after 24 h the admin daemon
+// approves it by the admin route (approval and Remove plus Add commit adjacent); B reconnects with its
+// new keys, rejoins the room group by Welcome, gets a new lane grant, and the chat continues both ways.
+//
 // TEST-ONLY: the SAS comparison that people do by voice is done here by reading the code from the
 // owner's join card (rooms.v2.status) and from the member's join view, and checking they are equal
 // before pressing "Codes match" and "Admit" programmatically. A mismatch fails the run. The device
@@ -272,6 +280,8 @@ async function main() {
   check("no alerts on the member", (mv?.alerts ?? []).length === 0, { alerts: mv?.alerts });
 
   // ------------------------------------------------------------ 7. lane through the member (grants v2)
+  const aJoinedNow = async () => (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+  const ownerRoomNow = async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
   const memberLane = async () => (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId)?.lanes.find((l: any) => l.laneId === laneId);
   const reg = await attempt(() => until("lane registered with a grant", async () => {
     const st = await rpc(m, "rooms.v2.status", {});
@@ -334,6 +344,38 @@ async function main() {
   }, GRANT_TTL_S * 1000 + 20_000, 250));
   check("view closed: idle rotation at 50 % (no routes)", idle.ok, idle.ok ? { lastDecision: idle.value.lastDecision } : { error: idle.error, last: await memberLane() });
   await until("lane online after rotation", async () => (await laneHost())?.status === "online", 30_000).catch(() => null);
+
+  // ------------------------------------------------------------ 8a. host key rotation (I-12, keys 4.5)
+  const hk0 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId).keys;
+  const gBeforeHk = (await memberLane())!.gid;
+  const tHk = Date.now();
+  const hkRot = await attempt(() => rpc(o, "rooms.v2.host.key.rotate", { roomId }));
+  const hk1 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.keys;
+  const oldHk = hk1?.hostKeys.find((k: any) => k.kid === hk0.hostKid);
+  check(
+    "host key rotated: staged and held by the host first, the new key is current, the old one valid for grants 24 h",
+    hkRot.ok && hk1?.hostKid === hkRot.value.kid && hk1.hostKid !== hk0.hostKid && oldHk?.toSeq === hkRot.value.seq && Math.abs(oldHk.validTo - (Math.floor(tHk / 1000) + 24 * 3600)) < 30,
+    hkRot.ok ? { seq: hkRot.value.seq, oldValidToH: oldHk ? (oldHk.validTo * 1000 - tHk) / HOUR : null } : { error: hkRot.error },
+  );
+  const hkSynced = await attempt(() => until("member folds the host key rotation", async () => {
+    const j = await aJoinedNow();
+    const ow = await ownerRoomNow();
+    return j && ow && (!hkRot.ok || j.head.seq >= hkRot.value.seq) && j.head.seq === ow.head.seq ? j : null;
+  }, 15_000));
+  check("the member's own fold accepts the rotation and the entries signed by the new host key (no alerts)", hkSynced.ok && hkSynced.value.alerts.length === 0 && hkSynced.value.status === "open", hkSynced.ok ? { head: hkSynced.value.head.seq } : { error: hkSynced.error });
+  const stillOnline = (await laneHost())?.status === "online";
+  check("the lane stays online on the grant issued under the old host key", stillOnline && (await memberLane())?.gid === gBeforeHk, { online: stillOnline });
+  const gAfterHk = await attempt(() => until("a grant issued under the new host key", async () => {
+    const l = await memberLane();
+    return l && l.gid && l.gid !== gBeforeHk ? l : null;
+  }, GRANT_TTL_S * 1000 + 20_000, 250));
+  const hkGrantSeq = await attempt(() => until("grant.issued after the rotation", async () => (await ownerRoomNow())?.grants.find((g: any) => g.laneId === laneId && g.gid === (gAfterHk.ok ? gAfterHk.value.gid : "")), 10_000));
+  check("grants keep working after the rotation: the next grant is issued (under the new key) and accepted", gAfterHk.ok && hkGrantSeq.ok, gAfterHk.ok ? { reason: gAfterHk.value.lastRotation?.reason } : { error: gAfterHk.error });
+  await until("lane online after the host key rotation", async () => (await laneHost())?.status === "online", 30_000).catch(() => null);
+  const routedHk = openRouted();
+  const rcHk = await attempt(() => until("routed after host key rotation", async () => (await attempt(() => routedHk.connect())).ok, 30_000, 1000));
+  check("a routed view through the lane works with the new-key grant", rcHk.ok && (await attempt(() => routedHk.fetchAgent(agent.id))).ok, rcHk.ok ? {} : { error: rcHk.error });
+  await routedHk.close().catch(() => undefined);
 
   // ------------------------------------------------------------ 8b. device link: the same person's second device (I-11)
   const ownerRoom = async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
@@ -429,6 +471,60 @@ async function main() {
   }, 20_000, 250));
   check("MLS: each reads the other's message; B reads both; nobody reads its own back", exchanged.ok && !exchanged.value.ot.includes(alpha) && !exchanged.value.at.includes(bravo), exchanged.ok ? {} : { error: exchanged.error });
   const ownerMlsBefore = await mlsOf(o);
+
+  // ------------------------------------------------------------ 8c. device rekey by the admin route (I-12, keys 4.1)
+  const bJoined = async () => (await rpc(m2, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+  const bBefore = await bJoined();
+  const bLaneBefore = bBefore?.lanes.find((l: any) => l.laneId === laneId);
+  const rk = await attempt(() => rpc(m2, "rooms.v2.device.rekey", { roomId }));
+  check("device B requests its own rekey (device.rekeyed signed by its current key)", rk.ok, rk.ok ? { seq: rk.value.seq } : { error: rk.error });
+  const rkRef = rk.ok ? rk.value.ref : "";
+  const rkReq = await attempt(() => until("rekey request on the owner", async () => (await ownerRoom())?.deviceRequests.find((r: any) => r.ref === rkRef), 10_000));
+  const rq = rkReq.ok ? rkReq.value : null;
+  check("B is not the member's only device: the rekey is held 24 h", rq?.kind === "rekey" && rq.sole === false && rq.status === "pending" && rq.effectiveAfter >= rq.hts + 24 * HOUR && rq.effectiveAfter < rq.hts + 24 * HOUR + 10_000, { sole: rq?.sole, holdH: rq ? (rq.effectiveAfter - rq.hts) / HOUR : null });
+  check("B's rekey packages under the new credential are published", (await until("published", async () => (await bJoined())?.rekey?.published === true, 10_000).catch(() => false)) === true);
+  const aSeesRekey = await attempt(() => until("A sees the rekey prompt", async () => (await aJoined())?.deviceRequests.find((r: any) => r.ref === rkRef && r.kind === "rekey" && r.status === "pending"), 10_000));
+  check("device A shows the rekey to its person (Was this you?)", aSeesRekey.ok);
+  await rpc(o, "rooms.v2.test.clock.advance", { ms: 23 * HOUR });
+  const at23 = (await ownerRoom())?.deviceRequests.find((r: any) => r.ref === rkRef);
+  const bAt23 = await bJoined();
+  check("after 23 h on the admin daemon's clock: still held, B keeps its old keys and session", at23?.status === "pending" && bAt23?.status === "open" && bAt23.rekey?.ref === rkRef, { status: at23?.status, b: bAt23?.status });
+  const epochBeforeRekey = (await mlsOf(o))?.epoch;
+  const tRk = Date.now();
+  await rpc(o, "rooms.v2.test.clock.advance", { ms: HOUR + 5000 });
+  const rkApproved = await attempt(() => until("rekey approved", async () => ((await ownerRoom())?.deviceRequests.find((r: any) => r.ref === rkRef)?.status === "approved" ? true : null), 30_000, 250));
+  check("after 24 h the admin daemon approves the rekey automatically (admin route)", rkApproved.ok, rkApproved.ok ? { ms: Date.now() - tRk } : { error: rkApproved.error });
+  const bBack = await attempt(() => until("B reconnects with its new keys", async () => {
+    const j = await bJoined();
+    const ow = await ownerRoom();
+    return j?.status === "open" && j.rekey === null && ow?.sessions.some((x: any) => x.deviceId === req.deviceId) && j.head.seq === ow.head.seq ? j : null;
+  }, 30_000, 250));
+  check("B reconnects with its new DH key (old session superseded), its fold accepts the pair, no alerts", bBack.ok && bBack.value.alerts.length === 0 && bBack.value.deviceId === req.deviceId, bBack.ok ? { ms: Date.now() - tRk } : { error: bBack.error, b: await bJoined() });
+  // The approval and its commit are adjacent entries (mls-integration 4.4): the commit is the next epoch.
+  const bRejoined = await attempt(() => until("B rejoined by Welcome", async () => {
+    const v = await Promise.all([o, m, m2].map(mlsOf));
+    return v.every((x) => x?.inGroup && x.leaves === 3 && x.epoch === v[0].epoch && x.canSend) && v[0].epoch > (epochBeforeRekey ?? 0) ? v : null;
+  }, 60_000, 250));
+  check("MLS: B rejoined the room group at its new leaf by Welcome; three leaves at one later epoch, all may send", bRejoined.ok, bRejoined.ok ? { epoch: bRejoined.value[0].epoch, before: epochBeforeRekey, bJoin: bRejoined.value[2].join } : { error: bRejoined.error, views: await Promise.all([o, m, m2].map(mlsOf)) });
+  for (const [label, c] of [["owner", o], ["A", m], ["B", m2]] as const) {
+    const alerts = (((await mlsOf(c))?.alerts ?? []) as { type: string }[]).filter((a) => a.type !== "epoch_unconfirmed");
+    check(`MLS after the rekey: no roster or withholding alerts on ${label}`, alerts.length === 0, { alerts });
+  }
+  const delta = mark("delta");
+  const echo = mark("echo");
+  const sentD = await attempt(() => rpc(o, "rooms.v2.mls.send", { roomId, text: delta }));
+  const sentE = await attempt(() => until("B sends", async () => (await attempt(() => rpc(m2, "rooms.v2.mls.send", { roomId, text: echo }))).ok, 20_000, 500));
+  const chat = await attempt(() => until("chat across the rekey", async () => {
+    const [ot, at, bt] = await Promise.all([o, m, m2].map(textsOf));
+    return bt.includes(delta) && at.includes(delta) && ot.includes(echo) && at.includes(echo) ? true : null;
+  }, 20_000, 250));
+  check("chat continues across the rekey: B reads the owner's message, and the owner and A read B's", sentD.ok && sentE.ok && chat.ok, chat.ok ? {} : { error: chat.error });
+  const bLane = await attempt(() => until("B's new grant", async () => {
+    const l = (await bJoined())?.lanes.find((x: any) => x.laneId === laneId);
+    const g = (await ownerRoom())?.grants.find((x: any) => x.deviceId === req.deviceId && x.laneId === laneId);
+    return l?.gid && l.gid !== bLaneBefore?.gid && g?.gid === l.gid ? l : null;
+  }, 60_000, 500));
+  check("B's old grant left the allowlist and B got a new one (the grant names the new key)", bLane.ok, bLane.ok ? { reason: bLane.value.lastRotation?.reason } : { error: bLane.error, lane: (await bJoined())?.lanes });
 
   // Positive control for the secret scan: while registered, the member daemon's hosts.json (written by
   // Paseo, 0600) holds the current grant, and no other file of either home does.

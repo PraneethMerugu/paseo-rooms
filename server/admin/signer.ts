@@ -7,9 +7,12 @@
 //   code can call `confirm` as easily as the UI can. Protection against same-user callers needs the
 //   dedicated OS user (identity-model 7.6).
 // - Policy-automatic statements (`device.add.approved` in mode "auto", after its hold) and the no-op
-//   `producer.fence` are signed without a token. `device.rekey.approved` in mode "auto" is refused
-//   here: the daemon signs it only together with the MLS commit that applies it (decision round 6),
-//   which is I-13.
+//   `producer.fence` are signed without a token. `device.rekey.approved` is refused by
+//   `signAutomatic`: the daemon signs it only together with the MLS commit that applies it (decision
+//   round 6), through `signWithCommit`, which the admin-route commit builder calls (I-12).
+// - Admin key rotation (keys-rotation-recovery.md 4.3; I-12): `stageRotation` writes the new key to
+//   `admin-key.next.sealed` before `admin.key.rotated` is signed with the old key; `promote` installs it
+//   once the log carries the rotation (also at start, so a crash in between loses nothing).
 // - One statement at a time (section 2, forward base): while a signed statement is outstanding (no
 //   receipt and no definite rejection), nothing but a fence is signed. Outstanding statements are kept
 //   in `admin/<roomId>/state.sealed` before they are returned, so a restart still knows them.
@@ -19,18 +22,19 @@
 // The admin key is read from `admin/<roomId>/admin-key.sealed` (sealed under the KEK). Nothing here
 // logs key material, tokens or statement bodies.
 import { randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import nodePath from "node:path";
 import { inspect } from "node:util";
 import type { KeyObject } from "node:crypto";
 import { z } from "zod";
 import { bodyHash } from "../authority/entries";
 import { b64uBytes, firstIssue, Kid, MemberId, RoomId } from "../authority/schema";
-import { producerKindAllowed, STATEMENT_TYPES, type SignedStatement, type StatementBody, type StatementType } from "../authority/statements";
+import { producerKindAllowed, STATEMENT_TYPES, type KeyChange, type SignedStatement, type StatementBody, type StatementType } from "../authority/statements";
 import type { Kek } from "../keystore/keystore";
 import { SECURITY_EVENTS } from "../host/room-host";
 import { log } from "../log";
 import { b64u, b64uDecode } from "../proto/b64u";
-import { stmtContext } from "../proto/contexts";
+import { CTX_KEY_CHANGE_NEW, stmtContext } from "../proto/contexts";
 import { ed25519PrivateKeyFromSeed, kid as kidOf, rawPublicKey } from "../proto/keys";
 import { rjcs, rjcsParse } from "../proto/rjcs";
 import { sign } from "../proto/tbs";
@@ -44,6 +48,8 @@ export const adminDir = (dataDir: string, roomId: string) => nodePath.join(dataD
 export const adminKeyPath = (dataDir: string, roomId: string) => nodePath.join(adminDir(dataDir, roomId), ADMIN_KEY_FILE);
 export const adminStatePath = (dataDir: string, roomId: string) => nodePath.join(adminDir(dataDir, roomId), ADMIN_STATE_FILE);
 export const adminKeyPurpose = (roomId: string) => `admin-key:${roomId}`;
+export const ADMIN_NEXT_KEY_FILE = "admin-key.next.sealed";
+export const adminNextKeyPath = (dataDir: string, roomId: string) => nodePath.join(adminDir(dataDir, roomId), ADMIN_NEXT_KEY_FILE);
 export const adminStatePurpose = (roomId: string) => `admin-state:${roomId}`;
 
 const AdminKeyFile = z.strictObject({
@@ -219,6 +225,79 @@ export class AdminSigner {
     const body = this.buildBody(req);
     this.checkCanSign(body);
     return this.signAndRecord(body);
+  }
+
+  /**
+   * `device.rekey.approved` (mode "auto" after the hold on this daemon's clock, or "admin") for the
+   * admin route only (mls-integration.md 4.4): the caller submits it with its Remove plus Add commit
+   * in one `commit.submit`, so the host sequences both or neither. Not for `stmt.submit`.
+   */
+  signWithCommit(req: StatementRequest<"device.rekey.approved">): SignedStatement {
+    if (req.type !== "device.rekey.approved") throw new AdminSignerError("not_admin_statement", "only device.rekey.approved travels with a commit");
+    const body = this.buildBody(req);
+    this.checkCanSign(body);
+    return this.signAndRecord(body);
+  }
+
+  /**
+   * Admin key rotation, step 1 (keys 4.3): a fresh key, sealed in `admin-key.next.sealed` before
+   * anything is signed, and its KeyChange with `newKeySig`. Reuses a staged key that is not installed
+   * yet, so a retry signs the same change.
+   */
+  stageRotation(): { change: KeyChange; newKeySig: string } {
+    const path = adminNextKeyPath(this.dataDir, this.roomId);
+    let seed: Buffer | null = null;
+    const plain = this.kek.readSealed(path, adminKeyPurpose(this.roomId));
+    if (plain) {
+      try {
+        const p = AdminKeyFile.safeParse(rjcsParse(plain));
+        if (p.success && p.data.roomId === this.roomId && p.data.memberId === this.memberId) seed = b64uDecode(p.data.seed, 32);
+      } finally {
+        plain.fill(0);
+      }
+    }
+    if (!seed) {
+      seed = randomBytes(32);
+      const key = ed25519PrivateKeyFromSeed(seed);
+      const file: AdminKeyFile = { v: 2, typ: "admin-key", roomId: this.roomId, genesisHash: this.genesisHash, memberId: this.memberId, kid: kidOf("ed25519", rawPublicKey(key)), seed: b64u(seed) };
+      const out = Buffer.from(rjcs(file));
+      try {
+        this.kek.writeSealed(path, adminKeyPurpose(this.roomId), out);
+      } finally {
+        out.fill(0);
+      }
+    }
+    try {
+      const key = ed25519PrivateKeyFromSeed(seed);
+      const change: KeyChange = { v: 2, typ: "key-change", roomId: this.roomId, subject: { kind: "admin", id: this.memberId }, old: this.kid, newSig: b64u(rawPublicKey(key)), newDh: null };
+      return { change, newKeySig: b64u(sign(key, CTX_KEY_CHANGE_NEW, rjcs(change))) };
+    } finally {
+      seed.fill(0);
+    }
+  }
+
+  /**
+   * Admin key rotation, last step: when `isActive(nextKid)` (the log carries the rotation), the staged
+   * key replaces `admin-key.sealed` and the staged file is deleted. Returns the signer for the new
+   * key, or null when nothing was staged or the rotation is not in the log.
+   */
+  promote(isActive: (kid: string) => boolean): AdminSigner | null {
+    const path = adminNextKeyPath(this.dataDir, this.roomId);
+    const plain = this.kek.readSealed(path, adminKeyPurpose(this.roomId));
+    if (!plain) return null;
+    let file: AdminKeyFile;
+    try {
+      const p = AdminKeyFile.safeParse(rjcsParse(plain));
+      if (!p.success || p.data.roomId !== this.roomId) return null;
+      file = p.data;
+    } finally {
+      plain.fill(0);
+    }
+    if (!isActive(file.kid)) return null;
+    writeAdminKey(this.dataDir, this.kek, file);
+    fs.rmSync(path, { force: true });
+    log("admin_key_promoted", { roomId: this.roomId, kid: file.kid });
+    return AdminSigner.load({ dataDir: this.dataDir, kek: this.kek, roomId: this.roomId, now: this.now, tokenTtlMs: this.tokenTtlMs });
   }
 
   /** `producer.fence` (section 4.8): settles outstanding statements. Allowed while others are outstanding. */

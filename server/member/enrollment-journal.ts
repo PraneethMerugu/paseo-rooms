@@ -97,6 +97,16 @@ const Enrollment = z.strictObject({
    * Absent in journals written before round 9.
    */
   received: z.array(SignedEntry).max(2).optional(),
+  /**
+   * A device rekey of this device (keys-rotation-recovery.md 4.1; I-12): the next keys, sealed before
+   * `device.rekeyed` leaves, and the request's bodyHash once sequenced. Absent when none is open.
+   */
+  rekey: z.strictObject({ sigSeed: Hash32, dhSecret: Hash32, sig: Hash32, dh: Hash32, ref: Hash32.nullable(), at: nonNegInt() }).nullable().optional(),
+  /**
+   * The last room endpoint this device verified in its fold (keys 4.6): sessions go there, not to the
+   * genesis endpoint, once the room endpoint has rotated. Absent until the first rotation is seen.
+   */
+  endpoint: z.strictObject({ serverId: z.string().max(64), dh: Hash32, relay: z.strictObject({ host: z.string().max(253), port: z.number().int().min(1).max(65535) }) }).nullable().optional(),
   /** RJCS text of the verified genesis, once known. */
   genesis: z.string().nullable(),
   registrations: z.record(z.string(), z.string()),
@@ -334,6 +344,65 @@ export class EnrollmentJournal {
     return out;
   }
 
+  /** Rekey step 1: the next keys, durable before the request is signed. Replaces an unsent one. */
+  beginRekey(k: { sigSeed: Buffer; dhSecret: Buffer }): void {
+    this.expect("admitted", "registered");
+    if (this.st.enrollment.rekey?.ref) throw new JournalError("bad_transition", "a rekey of this device is already requested");
+    this.update({
+      rekey: {
+        sigSeed: b64u(k.sigSeed),
+        dhSecret: b64u(k.dhSecret),
+        sig: b64u(rawPublicKey(ed25519PrivateKeyFromSeed(k.sigSeed))),
+        dh: b64u(rawPublicKey(x25519PrivateKeyFromSecret(k.dhSecret))),
+        ref: null,
+        at: this.now(),
+      },
+    });
+  }
+
+  /** Rekey step 2: `device.rekeyed` was sequenced (its bodyHash is the request's ref). */
+  rekeyRequested(ref: string): void {
+    const r = this.st.enrollment.rekey;
+    if (!r) throw new JournalError("bad_transition", "no rekey in progress");
+    this.update({ rekey: { ...r, ref } });
+  }
+
+  /** The open rekey's public keys and ref, if any. */
+  get rekey(): { sig: string; dh: string; ref: string | null; at: number } | null {
+    const r = this.st.enrollment.rekey;
+    return r ? { sig: r.sig, dh: r.dh, ref: r.ref, at: r.at } : null;
+  }
+
+  /** The next keys (caller zeroes them). */
+  rekeyKeys(): { sigSeed: Buffer; dhSecret: Buffer } {
+    const r = this.st.enrollment.rekey;
+    if (!r) throw new JournalError("no_keys", "no rekey in progress");
+    return { sigSeed: b64uDecode(r.sigSeed, 32), dhSecret: b64uDecode(r.dhSecret, 32) };
+  }
+
+  /** The approval is in the log: the next keys become the device keys; the old ones are deleted. */
+  completeRekey(): void {
+    const r = this.st.enrollment.rekey;
+    if (!r) return;
+    this.update({ keys: { sigSeed: r.sigSeed, dhSecret: r.dhSecret }, deviceSig: r.sig, deviceDh: r.dh, rekey: null });
+  }
+
+  /** Vetoed, cancelled or refused: the next keys are deleted; the device keeps its keys. */
+  abandonRekey(): void {
+    if (this.st.enrollment.rekey) this.update({ rekey: null });
+  }
+
+  /** The last endpoint of the room this device verified (keys 4.6). */
+  get endpoint(): { serverId: string; dh: string; relay: { host: string; port: number } } | null {
+    return this.st.enrollment.endpoint ?? null;
+  }
+
+  setEndpoint(e: { serverId: string; dh: string; relay: { host: string; port: number } }): void {
+    const cur = this.st.enrollment.endpoint;
+    if (cur && cur.serverId === e.serverId && cur.dh === e.dh && cur.relay.host === e.relay.host && cur.relay.port === e.relay.port) return;
+    this.update({ endpoint: { serverId: e.serverId, dh: e.dh, relay: { host: e.relay.host, port: e.relay.port } } });
+  }
+
   registration(laneId: string, registrationId: string): void {
     this.expect("admitted", "registered");
     this.update({ registrations: { ...this.st.enrollment.registrations, [laneId]: registrationId } });
@@ -346,7 +415,7 @@ export class EnrollmentJournal {
 
   /** Terminal failure: keys, nonce and token key deleted; the reason stays for the UI. */
   fail(reason: string): void {
-    this.update({ state: "failed", failure: reason.slice(0, 64), keys: null, nm: null, tokenKey: null });
+    this.update({ state: "failed", failure: reason.slice(0, 64), keys: null, nm: null, tokenKey: null, rekey: null });
   }
 
   /** Removes the journal (after the user dismissed a failed join); link counters stay. */
