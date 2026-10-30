@@ -69,6 +69,32 @@ Known rough edges:
 - **No room archive or rename.** Closed lanes and rooms stay listed.
 - Revoking demo-member or closing the lane is fine to try, but it ends the demo; rerun `down.sh` and `up.sh` to reset.
 
+## Identity v2 screens (I-14)
+
+The v2 screens appear only when the daemon runs the v2 runtime (`PASEO_ROOMS_PROTOCOL=v2`); `rooms.bootstrap` then reports `protocol: "v2"`. Without the switch the M1 screens above are shown, unchanged. `up.sh` and `demo-setup.ts` set up M1 only; a v2 kit (`up-v2.sh`) is not written yet. To look at the v2 screens, start two disposable daemons as `test/e2e-v2/run.sh` does (homes under `plugin/.test-homes/v2-*`, ports 6920-6929, `PASEO_ROOMS_PROTOCOL=v2`, `PASEO_ROOMS_KEYSTORE=fallback-file`, and either the fake relay with `PASEO_ROOMS_RELAY_ENDPOINT=127.0.0.1:6923 PASEO_ROOMS_RELAY_TLS=false PASEO_ROOMS_DEV_INSECURE_RELAY=1` or the live relay), add them as hosts, and walk through the list below by hand.
+
+Nothing here was seen in a real app. The code passed `npm run typecheck:client` (no Node or DOM types) and the RPC contract tests only.
+
+Do each item on a wide window and a narrow window (compact layout), in a light and a dark theme.
+
+- [ ] Only under v2: the header badge "identity v2 (development)"; a daemon without the switch shows the M1 screen.
+- [ ] Fallback keystore notice (the test daemons use the file keystore): persistent warning box at the top, readable in both themes.
+- [ ] "Fix permissions": `chmod 755 <home>/plugin-data/rooms` on a stopped test daemon, start it, open Rooms: the problem list and the button; press it; Rooms starts.
+- [ ] Create room: the dialog preselects "Create a recovery key"; choosing Skip shows the warning. After Create, the recovery code dialog: code in groups, "Download file" (desktop and web: a `paseo-room-recovery-<roomId>.json` download; check where Electron puts it), "Save or share file" on iOS and Android (share sheet), "Copy code", "Copy file contents". The dialog does not close (backdrop, Escape, close button) until the last group is typed; note what happens when it is dismissed anyway.
+- [ ] Admin confirmation dialog for each action (create invite, admit, change role, remove member, remove device, approve device, resolve conflict, rotate host key, admin key, endpoint, lane, revoke keys, propose and confirm closing, create and confirm recovery key, share an agent from "Open room…"): title, "Now: …" line, details, warning colour, typed confirmation for remove, revoke and close.
+- [ ] `stale_base`: open "Change role" for one member in two app windows, confirm in one, then in the other: the dialog stays open, shows "This changed since you opened the dialog" and the new current role, and asks again.
+- [ ] Join request card (owner): note, self-reported name, six digits in large type, abandoned-attempts line, contested banner (red), countdown, Admit disabled until the code is revealed, "Codes do not match" asks before burning.
+- [ ] Member join: paste code, "Check code" preview (room name marked unverified, fingerprint, relay trust button), name, Join; then the six digits, "Codes match", "Codes do not match", Cancel; "Waiting for the owner to admit you…".
+- [ ] Device link: "Link another device" shows the `prl2.` code once with Copy; the second device joins with it; the first device shows the six digits, "N earlier attempts" when any, "Codes match" / "Codes do not match".
+- [ ] "Was this you?" box with "Not me" on the member's devices during a hold; the owner's device request notice, including the sole-device text; the conflict notices on both sides.
+- [ ] Alerts: member card boxes for fork, truncation, withholding, roster_mismatch (only reachable with a misbehaving host; check the layout with a fake alert if a dev build allows it).
+- [ ] Owner tabs (Members, Lanes, Keys) on a narrow window: chips wrap, long ids do not push buttons off screen, the "Revoke from seq" inputs fit.
+- [ ] Lane "Recent errors" opens a modal with full text (owner only); member cards never show free-text errors, only the mapped sentences.
+- [ ] "Agents from closed rooms" after a room is closed with the recovery code; "Open agent" opens it.
+- [ ] About: key storage, daemon OS, and the Windows durability sentence (highlighted on a Windows daemon).
+
+Record what you see in `ui-notes.md` under "Observed in the app".
+
 ## Tear down
 
 1. In the app, remove both hosts: **Settings → demo-owner (and demo-member) → Remove host**. If a routed "UI check room · Fork lane" entry remains, remove it too.

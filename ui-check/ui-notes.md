@@ -35,6 +35,16 @@ Ordered by likely user impact.
 11. **Closed lanes and rooms stay listed** (no archive or rename yet; M1 open issue 7).
 12. **Plugin UI with the routed host selected.** If the app lets you pick the routed lane host in a plugin screen's host picker, plugin RPCs are denied there, so the Rooms screen should show "Could not load rooms: …". Check that this is readable and that the sidebar item does not break.
 
+## Identity v2 screens (I-14), static review only
+
+Files: `client/v2-screen.tsx`, `v2-owner.tsx`, `v2-member.tsx`, `v2-dialogs.tsx`, `v2-text.ts`, `save-file.ts`, `protocol.ts`. The checklist is in README.md, section "Identity v2 screens".
+
+- The audit grep above now also hits `client/save-file.ts` (`g.document.createElement`, `g.document.body`). Intended: the web download path probes `globalThis.document` at run time only when `Platform.OS === "web"`, and falls back to the share sheet. `npm run typecheck:client` builds the client with no Node and no DOM types, so a direct DOM or Node use fails the check.
+- Unverified assumptions: the desktop app reports `Platform.OS === "web"` and lets an `<a download>` click save a file (Electron may show a save dialog or save to Downloads silently); `Share.share` exists on react-native-web in the app and on iOS and Android; `Modal`'s `onOpenChange(false)` is the only way the host closes a dialog (the recovery dialog ignores it until the last group is typed).
+- The recovery dialog cannot stop the app from being closed or the screen from unmounting; the code is then lost (by design it is not stored).
+- Owner card length: an owner with many members, requests and alerts gets a long card; tabs keep the members, lanes and keys apart.
+- No leave or lane-close buttons under v2 (no RPCs yet); the cards say so.
+
 ## Observed in the app
 
 (fill in: window size, theme, host, what you saw)

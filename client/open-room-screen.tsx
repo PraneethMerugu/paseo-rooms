@@ -1,18 +1,27 @@
 // "Open room…" screen for one agent: room name, lane origin (fork by default, or share live), create.
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useAgent, useRpc } from "@getpaseo/plugin/client";
-import { copyText, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, Loading, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Text, View } from "react-native";
 import { isForkVerifiedProvider } from "../shared/policy";
 import { roomsCreate, roomsInviteCreate, roomsLaneAgents } from "../shared/rpc";
+import { useRoomsProtocol } from "./protocol";
 import { OVERVIEW_KEY } from "./rooms-screen";
+import { OpenRoomV2Screen } from "./v2-screen";
 import { Button, commandCenterHint, errorText, relativeTime, Segmented, useStyles } from "./ui";
 
 type Origin = "fork" | "share";
 
-export function OpenRoomScreen({ theme, layout, params }: PluginScreenProps) {
+/** M1 by default; under the v2 runtime, "Open room…" shares the agent as a lane of an owned room (I-14). */
+export function OpenRoomScreen(props: PluginScreenProps) {
+  const protocol = useRoomsProtocol();
+  if (protocol === null) return <Loading />;
+  return protocol === "v2" ? <OpenRoomV2Screen {...props} /> : <OpenRoomM1Screen {...props} />;
+}
+
+function OpenRoomM1Screen({ theme, layout, params }: PluginScreenProps) {
   const styles = useStyles(theme, layout.compact);
   const agentId = params.agentId ?? "";
   const title = useAgent(agentId, (a) => a.title);

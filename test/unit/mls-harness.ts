@@ -58,7 +58,8 @@ export type Dev = {
 
 export class Harness {
   readonly devs = new Map<string, Dev>();
-  clock = 1_793_300_000_000;
+  // Starts at the real time: ts-mls checks KeyPackage lifetimes against the wall clock.
+  clock = Math.floor(Date.now() / 1000) * 1000;
   readonly now = () => this.clock;
   private constructor(
     readonly adapter: MlsAdapter,
@@ -81,7 +82,7 @@ export class Harness {
     if (s.state !== "ready") throw new KeyStoreError("unavailable", s.message);
     const adapter = await mlsAdapter();
     let h: Harness | null = null;
-    const now = () => h?.clock ?? 1_793_300_000_000;
+    const now = () => h?.clock ?? Math.floor(Date.now() / 1000) * 1000;
     const room = await createRoom({ dataDir, kek: s.kek, relay: { host: "relay.example.org", port: 443, tls: true }, recovery: "skip", lock: NO_TIMER, now });
     let endpoint: RoomEndpoint | null = null;
     const ds = new MlsDelivery({ dataDir, kek: s.kek, host: room.host, adapter, now, push: (d, f) => endpoint!.pushToDevice(d, f), afterAppend: () => endpoint!.afterAppend(), onPublished: (d) => h?.devs.get("C")?.member.packagesPublished(d) });

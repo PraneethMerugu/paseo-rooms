@@ -61,7 +61,8 @@ export type JoinedRoomView = z.infer<typeof JoinedRoomView>;
 export const roomsBootstrap = defineRpc({
   name: "rooms.bootstrap",
   input: Empty,
-  output: z.object({ ok: z.literal(true), version: z.string(), dataDir: z.literal("plugin-data/rooms") }),
+  /** `protocol`: which runtime the daemon started (I-14: the client shows the v2 UI only for "v2"). */
+  output: z.object({ ok: z.literal(true), version: z.string(), dataDir: z.literal("plugin-data/rooms"), protocol: z.enum(["v1", "v2"]).optional() }),
 });
 
 /** Problem found by the start-time file protection check (paths are relative to plugin-data/rooms). */

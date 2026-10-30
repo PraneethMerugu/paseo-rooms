@@ -63,6 +63,9 @@ import {
   roomsV2RecoveryCreate,
   roomsV2RecoveryConfirm,
   roomsV2RecoveryAct,
+  roomsV2AdminPrepare,
+  type AdminActionKind,
+  type AdminActionV2,
 } from "./shared/rpc-v2";
 
 const VERSION = "0.1.0";
@@ -88,7 +91,7 @@ export default function contribute(server: PluginServerContext) {
     });
   }
 
-  handle(roomsBootstrap, () => ({ ok: true as const, version: VERSION, dataDir: "plugin-data/rooms" as const }));
+  handle(roomsBootstrap, () => ({ ok: true as const, version: VERSION, dataDir: "plugin-data/rooms" as const, protocol: "v1" as const }));
   handle(roomsPermissionsFix, () => rt.fixPermissions());
   handle(roomsOverview, async (_i, paseo) => ({ owned: await rt.gateway.overview(paseo), joined: rt.member.view() }));
   handle(roomsCreate, (i: RpcInput<typeof roomsCreate>, paseo) => rt.gateway.createRoom(paseo, i));
@@ -185,27 +188,45 @@ function contributeV2(server: PluginServerContext) {
     });
   }
 
-  handle(roomsBootstrap, () => ({ ok: true as const, version: VERSION, dataDir: "plugin-data/rooms" as const }));
+  /**
+   * An interactive admin action (identity-model 5.3): the one-time token from `rooms.v2.admin.prepare`
+   * is consumed for exactly this action before it runs; `stale_base` sends the UI back to its dialog.
+   */
+  function handleAdmin<I extends ZodType, O extends ZodType, K extends AdminActionKind>(
+    contract: PluginRpcContract<I, O>,
+    kind: K,
+    fn: (input: ZodOutput<I>) => ZodInput<O> | Promise<ZodInput<O>>,
+  ): void {
+    handle(contract, async (input) => {
+      const { confirmToken, ...params } = input as { confirmToken: string } & Record<string, unknown>;
+      await rt.takeAdmin(confirmToken, { ...params, kind } as AdminActionV2);
+      return fn(input);
+    });
+  }
+
+  handle(roomsBootstrap, () => ({ ok: true as const, version: VERSION, dataDir: "plugin-data/rooms" as const, protocol: "v2" as const }));
+  handle(roomsPermissionsFix, () => rt.fixPermissions());
   handle(roomsV2Status, async () => {
     await rt.start();
     return rt.status();
   });
-  handle(roomsV2RoomCreate, () => rt.createRoom());
+  handle(roomsV2RoomCreate, (i) => rt.createRoom(i.recovery ?? "skip"));
+  handle(roomsV2AdminPrepare, (i) => rt.prepareAdmin(i.action));
   // Owner: invites and join requests (enrollment-v2.md 2.1, 6.3).
-  handle(roomsV2InviteCreate, (i) => rt.createInvite(i));
+  handleAdmin(roomsV2InviteCreate, "invite.create", ({ confirmToken: _t, ...i }) => rt.createInvite(i));
   handle(roomsV2InviteRevoke, async (i) => {
     await rt.revokeInvite(i.roomId, i.inviteId);
     return { ok: true as const };
   });
-  handle(roomsV2JoinAdmit, (i) => rt.admitJoin(i.roomId, i.pendingId));
+  handleAdmin(roomsV2JoinAdmit, "join.admit", (i) => rt.admitJoin(i.roomId, i.pendingId));
   handle(roomsV2JoinReject, async (i) => {
     await rt.rejectJoin(i.roomId, i.pendingId, i.reason);
     return { ok: true as const };
   });
-  handle(roomsV2MemberRemove, (i) => rt.removeMember(i.roomId, i.memberId, i.compromise === true));
-  handle(roomsV2MemberRole, (i) => rt.changeRole(i.roomId, i.memberId, i.role));
+  handleAdmin(roomsV2MemberRemove, "member.remove", (i) => rt.removeMember(i.roomId, i.memberId, i.compromise === true));
+  handleAdmin(roomsV2MemberRole, "member.role", (i) => rt.changeRole(i.roomId, i.memberId, i.role));
   // Owner: lanes (grants-v2; I-10).
-  handle(roomsV2LaneCreate, (i) => rt.createLane(i));
+  handleAdmin(roomsV2LaneCreate, "lane.create", (i) => rt.createLane({ roomId: i.roomId, agentId: i.agentId, label: i.label }));
   handle(roomsV2LaneErrors, async (i) => ({ errors: await rt.laneErrors(i.roomId, i.laneId) }));
   // Member: preview, join, compare, confirm (2.3, 6.4).
   handle(roomsV2JoinPreview, (i) => rt.previewJoin(i.code));
@@ -227,23 +248,24 @@ function contributeV2(server: PluginServerContext) {
     return { ok: true as const };
   });
   handle(roomsV2DeviceVeto, (i) => rt.vetoDevice(i.roomId, i.ref));
-  handle(roomsV2DeviceApprove, (i) => rt.approveDevice(i.roomId, i.ref));
-  handle(roomsV2ConflictResolve, (i) => rt.resolveConflict(i.roomId, i.memberId));
+  handleAdmin(roomsV2DeviceApprove, "device.approve", (i) => rt.approveDevice(i.roomId, i.ref));
+  handleAdmin(roomsV2ConflictResolve, "device.conflict.resolve", (i) => rt.resolveConflict(i.roomId, i.memberId));
   handle(roomsV2MlsSend, (i) => rt.mlsSend(i.roomId, i.text));
   handle(roomsV2MlsMessages, (i) => rt.mlsMessages(i.roomId));
-  // Rotation and recovery (I-12). The RPC call is the confirmation in the development runtime.
+  // Rotation and recovery (I-12). Admin actions need the token of their confirmation dialog (I-14);
+  // a member's own rekey and the recovery procedures (typed recovery code) do not.
   handle(roomsV2DeviceRekey, (i) => rt.requestRekey(i.roomId));
-  handle(roomsV2DeviceRemove, (i) => rt.removeDevice(i.roomId, i.memberId, i.deviceId, i.compromise));
-  handle(roomsV2HostKeyRotate, (i) => rt.rotateHostKey(i.roomId));
-  handle(roomsV2HostKeyRevoke, (i) => rt.revokeHostKey(i.roomId, i.kid, i.fromSeq));
-  handle(roomsV2AdminKeyRotate, (i) => rt.rotateAdminKey(i.roomId));
-  handle(roomsV2AdminKeyRevoke, (i) => rt.revokeAdminKey(i.roomId, i.kid, i.fromSeq));
-  handle(roomsV2EndpointRotate, (i) => rt.rotateEndpoint(i.roomId));
-  handle(roomsV2LaneRotate, (i) => rt.rotateLane(i.roomId, i.laneId));
-  handle(roomsV2CloseProposed, (i) => rt.proposeClose(i.roomId));
-  handle(roomsV2CloseConfirm, (i) => rt.confirmClose(i.roomId, i.proposal));
-  handle(roomsV2RecoveryCreate, (i) => rt.createRecoveryKey(i.roomId));
-  handle(roomsV2RecoveryConfirm, (i) => rt.confirmRecoveryKey(i.roomId, i.proposal));
+  handleAdmin(roomsV2DeviceRemove, "device.remove", (i) => rt.removeDevice(i.roomId, i.memberId, i.deviceId, i.compromise));
+  handleAdmin(roomsV2HostKeyRotate, "host.key.rotate", (i) => rt.rotateHostKey(i.roomId));
+  handleAdmin(roomsV2HostKeyRevoke, "host.key.revoke", (i) => rt.revokeHostKey(i.roomId, i.kid, i.fromSeq));
+  handleAdmin(roomsV2AdminKeyRotate, "admin.key.rotate", (i) => rt.rotateAdminKey(i.roomId));
+  handleAdmin(roomsV2AdminKeyRevoke, "admin.key.revoke", (i) => rt.revokeAdminKey(i.roomId, i.kid, i.fromSeq));
+  handleAdmin(roomsV2EndpointRotate, "endpoint.rotate", (i) => rt.rotateEndpoint(i.roomId));
+  handleAdmin(roomsV2LaneRotate, "lane.rotate", (i) => rt.rotateLane(i.roomId, i.laneId));
+  handleAdmin(roomsV2CloseProposed, "room.close.propose", (i) => rt.proposeClose(i.roomId));
+  handleAdmin(roomsV2CloseConfirm, "room.close.confirm", (i) => rt.confirmClose(i.roomId, i.proposal));
+  handleAdmin(roomsV2RecoveryCreate, "recovery.create", (i) => rt.createRecoveryKey(i.roomId));
+  handleAdmin(roomsV2RecoveryConfirm, "recovery.confirm", (i) => rt.confirmRecoveryKey(i.roomId, i.proposal));
   handle(roomsV2RecoveryAct, (i) => rt.recoveryAction(i.roomId, i.code, i.action));
   // TEST-ONLY: exists only on an e2e test home with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts).
   if (rt.clock.enabled) handle(roomsV2TestClockAdvance, (i) => rt.advanceTestClock(i.ms));

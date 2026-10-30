@@ -2,7 +2,7 @@
 import type { PluginTheme } from "@getpaseo/plugin";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
-import { copyText, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/ui";
+import { copyText, Loading, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Text, View } from "react-native";
@@ -20,11 +20,20 @@ import {
   type JoinedRoomView,
   type OwnedRoomView,
 } from "../shared/rpc";
+import { useRoomsProtocol } from "./protocol";
 import { Badge, Button, commandCenterHint, ConfirmButton, errorText, relativeTime, Section, useStyles, type Styles } from "./ui";
+import { RoomsV2Screen } from "./v2-screen";
 
 export const OVERVIEW_KEY = ["rooms", "overview"] as const;
 
-export function RoomsScreen({ theme, layout, navigation }: PluginScreenProps) {
+/** M1 is the default; the v2 screen appears only when the daemon reports the v2 runtime (I-14). */
+export function RoomsScreen(props: PluginScreenProps) {
+  const protocol = useRoomsProtocol();
+  if (protocol === null) return <Loading />;
+  return protocol === "v2" ? <RoomsV2Screen {...props} /> : <RoomsM1Screen {...props} />;
+}
+
+function RoomsM1Screen({ theme, layout, navigation }: PluginScreenProps) {
   const styles = useStyles(theme, layout.compact);
   const overview = useRpc(roomsOverview);
   const q = useQuery({ queryKey: OVERVIEW_KEY, queryFn: () => overview({}), refetchInterval: 5000 });

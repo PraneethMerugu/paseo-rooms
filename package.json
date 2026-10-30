@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "typecheck:client": "tsc -p tsconfig.client.json",
     "gen:profile": "ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin node_modules/tsx/dist/cli.mjs tools/gen-room-profile.ts",
     "test": "ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin --test --import ./node_modules/tsx/dist/esm/index.mjs test/unit/*.test.ts",
     "test:e2e": "bash test/e2e/run.sh"

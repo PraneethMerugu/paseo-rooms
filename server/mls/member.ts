@@ -166,6 +166,9 @@ const SENT_MAX = 256;
 const KP_KEEP = 32;
 const LAST_RESORT_KEEP_MS = 7 * 24 * 3600 * 1000;
 const KP_LIFETIME_S = 30 * 24 * 3600 - 600;
+// Back-dates notBefore so a receiver whose clock is behind ours still accepts the package (ts-mls checks
+// the lifetime against its own wall clock). Device clocks commonly differ by minutes.
+const KP_SKEW_S = 3600;
 
 export class MlsMember {
   readonly groupId: Uint8Array;
@@ -975,7 +978,7 @@ export class MlsMember {
     const signer = await a.newLeafSigner();
     const nowS = Math.floor(this.now() / 1000);
     const identity = signMlsIdentity({ v: 2, typ: "mls-identity", roomId: this.o.roomId, memberId: this.o.memberId, deviceId: this.o.deviceId, deviceSig: dev.sigPub, mlsSig: b64u(signer.publicKey), notBefore: nowS }, dev.sigKey);
-    const kp = await a.keyPackage(identity, signer, { notBefore: nowS - 60, notAfter: nowS + KP_LIFETIME_S });
+    const kp = await a.keyPackage(identity, signer, { notBefore: nowS - KP_SKEW_S, notAfter: nowS + KP_LIFETIME_S });
     return { ref: kp.ref, pool, lastResort, sig: dev.sigPub, pub: b64u(kp.bytes), priv: { init: b64u(kp.privatePackage.initPrivateKey), hpke: b64u(kp.privatePackage.hpkePrivateKey), sig: b64u(kp.privatePackage.signaturePrivateKey) }, at: this.now() };
   }
 

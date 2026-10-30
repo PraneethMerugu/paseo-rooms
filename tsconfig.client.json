@@ -1,0 +1,11 @@
+{
+  // X-12: the client bundle runs on desktop, web, iOS and Android. No Node types, no DOM lib:
+  // anything that needs node:*, Buffer, process or document fails this check.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["react"],
+    "lib": ["ES2023"]
+  },
+  "include": ["index.client.tsx", "client/**/*.ts", "client/**/*.tsx"],
+  "exclude": ["node_modules", ".test-homes", "review"]
+}

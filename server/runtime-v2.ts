@@ -8,9 +8,11 @@
 // registration and opens its room session (C-12: armed at start, not on first app contact).
 //
 // Enrollment (I-9): the owner creates invites and admits join requests after the SAS comparison; the
-// member previews and joins with a `prc2.` code, compares the SAS and confirms. Admin actions are
-// signed through the AdminSigner's confirmation token; the RPC call is the confirmation in this
-// development runtime (the UI flow is I-14).
+// member previews and joins with a `prc2.` code, compares the SAS and confirms. Interactive admin
+// actions are confirmed in the Rooms UI (I-14, identity-model 5.3): `prepareAdmin` describes the
+// action and issues a one-time token bound to it and to the current values it depends on, and
+// `takeAdmin` consumes that token before the action runs (`stale_base` when the values changed;
+// server/admin/confirmations.ts). Policy-automatic approvals are signed without a token.
 //
 // Lanes and grants (I-10): the owner creates a lane for an agent of its daemon (`lane.created`), the
 // lane endpoint runs under grants v2 (server/host/grants.ts, lane-service.ts) and revocations are
@@ -55,7 +57,9 @@ import * as fs from "node:fs";
 import nodePath from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import { randomBytes } from "node:crypto";
-import { createRoom, memberKeysPath, memberKeysPurpose } from "./admin/genesis";
+import { createRoom, memberKeysPath, memberKeysPurpose, recoveryOfferOf, type RecoveryKeyOffer } from "./admin/genesis";
+import { ConfirmationBook, describeAdminAction, type DescribeContext, type Described } from "./admin/confirmations";
+import type { AdminActionV2 } from "../shared/rpc-v2";
 import { AdminSigner, adminKeyPath, writeAdminKey } from "./admin/signer";
 import { closeConfirmationBlocker, newRecoveryKey, RecoveryKey, recoverFromStolenAdmin } from "./admin/recovery";
 import { bodyHash, type SignedEntry } from "./authority/entries";
@@ -101,7 +105,7 @@ import { MlsMember, type MlsTimings } from "./mls/member";
 import { SealedMlsStore } from "./mls/sealed-store";
 import { dataDir as roomsDataDir, resolvePaseoHome } from "./paths";
 import { writePrivateFile } from "./platform/durable";
-import { defaultProtection, ProtectionError, type FileProtection } from "./platform/file-protection";
+import { defaultProtection, ProtectionError, type FileProtection, type ProtectionProblem } from "./platform/file-protection";
 import { b64u, b64uDecode } from "./proto/b64u";
 import { isValidLabel } from "./proto/enroll";
 import { isId, isRoomId } from "./proto/ids";
@@ -214,6 +218,10 @@ export class RoomsRuntimeV2 {
   private readonly reconnectAt = new Map<string, number>();
   /** Member: rooms whose rekey packages are published (in this process). */
   private readonly rekeyPublished = new Set<string>();
+  /** I-14: one-time confirmations of interactive admin actions (identity-model 5.3). */
+  readonly confirmations = new ConfirmationBook();
+  /** Files the start check found unprotected (relative paths), until "Fix permissions" succeeds. */
+  private permissionProblems: ProtectionProblem[] | null = null;
   /**
    * Clock of the room hosts' `hts` and of automatic approvals. Date.now, except on an e2e test home
    * with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts), where tests may move it forward.
@@ -242,9 +250,33 @@ export class RoomsRuntimeV2 {
     this.started ??= this.startInner().catch((e) => {
       this.state = "error";
       this.error = e instanceof ProtectionError ? "permission_error" : String((e as Error)?.message ?? e).slice(0, 200);
+      if (e instanceof ProtectionError) this.permissionProblems = e.problems;
+      else if (this.keystore?.state === "permission_error") this.permissionProblems = this.keystore.problems ?? [];
       logError("v2_runtime_start_failed", e);
     });
     return this.started;
+  }
+
+  /**
+   * "Fix permissions" (I-2, audit X-2): only after the start check failed on file protection. Repairs
+   * what the protection backend may repair (never symlinks or foreign owners), then starts again.
+   */
+  async fixPermissions(): Promise<{ ok: boolean; problems: ProtectionProblem[] }> {
+    await this.start();
+    if (this.state === "ready") return { ok: true, problems: [] };
+    if (this.permissionProblems === null) return { ok: false, problems: [] };
+    const r = this.protection.fix(this.dataDir);
+    log("permissions_fix", { ok: r.ok, problems: r.ok ? [] : r.problems.slice(0, 10) });
+    if (!r.ok) {
+      this.permissionProblems = r.problems;
+      return { ok: false, problems: r.problems };
+    }
+    this.permissionProblems = null;
+    this.state = "starting";
+    this.error = null;
+    this.started = null;
+    await this.start();
+    return { ok: (this.state as RoomsRuntimeV2["state"]) === "ready", problems: this.permissionProblems ?? [] };
   }
 
   private async startInner(): Promise<void> {
@@ -547,7 +579,11 @@ export class RoomsRuntimeV2 {
       state: this.state,
       error: this.error,
       ...(this.clock.enabled ? { testClockOffsetMs: this.clock.offset } : {}),
-      keystore: ks ? { state: ks.state, backend: ks.backend, fallback: ks.state === "ready" ? ks.fallback : false } : null,
+      keystore: ks
+        ? { state: ks.state, backend: ks.backend, fallback: ks.state === "ready" ? ks.fallback : false, notice: ks.state === "ready" ? ks.notice : null, message: ks.state === "ready" ? null : ks.message }
+        : null,
+      ...(this.permissionProblems ? { permissionProblems: this.permissionProblems.slice(0, 20).map((p) => ({ path: p.path, code: p.code, detail: p.detail })) } : {}),
+      platform: process.platform,
       owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes, holds, signer, moved }) => ({
         roomId: host.roomId,
         serverId: endpoint.serverId,
@@ -555,6 +591,15 @@ export class RoomsRuntimeV2 {
         endpoint: endpoint.status,
         sessions: endpoint.sessions().map((s) => ({ memberId: s.memberId, deviceId: s.deviceId })),
         members: Object.keys(host.state.members).length,
+        roster: rosterView(host.state, endpoint, signer?.memberId ?? null),
+        policy: {
+          deviceAddApproval: host.state.auth.policy.deviceAddApproval,
+          soleDeviceChange: host.state.auth.policy.soleDeviceChange,
+          rotateLaneOnRemove: host.state.auth.policy.rotateLaneOnRemove,
+          recoveryEscrow: host.state.auth.policy.recoveryEscrow,
+          closeDelayS: host.state.auth.policy.closeDelay,
+        },
+        lineages: lineageCount(host.state.auth),
         invites: (endpoint.enrollment?.invites() ?? []).map(inviteView),
         joinRequests: (endpoint.enrollment?.pendings() ?? []).map(pendingView),
         lanes: lanes.lanes(),
@@ -574,6 +619,7 @@ export class RoomsRuntimeV2 {
           movedEndpoints: moved.filter((m) => m.status !== "closed").map((m) => m.serverId),
           closed: host.state.auth.closed,
           closeProposals: Object.entries(host.state.auth.pendingClose).filter(([, p]) => !p.used).map(([ref, p]) => ({ ref, kid: p.kid, hts: p.hts, exp: p.exp })),
+          recoveryProposals: Object.entries(host.state.auth.pendingRecovery).filter(([, p]) => !p.used).map(([ref, p]) => ({ ref, kid: p.kid, exp: p.exp })),
         },
         uncertified: host.uncertifiedAlerts(),
       })),
@@ -608,12 +654,49 @@ export class RoomsRuntimeV2 {
     };
   }
 
-  async createRoom(): Promise<{ roomId: string; serverId: string }> {
+  /**
+   * Identity-model 5.4: the create-room dialog preselects "Create a recovery key"; the code is
+   * returned once and never stored. Default "skip" for callers that would not show it.
+   */
+  async createRoom(recovery: "create" | "skip" = "skip"): Promise<{ roomId: string; serverId: string; recovery: RecoveryOfferView | null; recoverySkippedWarning: string | null }> {
     const kek = await this.ready();
-    // Development runtime: the recovery key is skipped so no recovery code is ever produced here.
-    const room = await createRoom({ dataDir: this.dataDir, kek, relay: genesisRelay(this.env), recovery: "skip", now: this.clock.now });
+    const room = await createRoom({ dataDir: this.dataDir, kek, relay: genesisRelay(this.env), recovery, now: this.clock.now });
     this.serve(room.host, room.signer);
-    return { roomId: room.roomId, serverId: room.genesis.body.endpoint.serverId };
+    return { roomId: room.roomId, serverId: room.genesis.body.endpoint.serverId, recovery: room.recovery ? offerView(room.recovery) : null, recoverySkippedWarning: room.recoverySkippedWarning };
+  }
+
+  // ------------------------------------------------------------------------------ owner: confirmations (I-14)
+
+  /** Step one of an interactive admin action: what will be signed, and a one-time token (identity-model 5.3). */
+  async prepareAdmin(action: AdminActionV2): Promise<{ confirmToken: string; expiresAt: number; description: Omit<Described, "subject"> }> {
+    await this.ready();
+    const d = this.describe(action);
+    const t = this.confirmations.prepare(action, d);
+    const { subject: _subject, ...description } = d;
+    return { ...t, description };
+  }
+
+  /** Step two: consumes the token before the action runs; `stale_base` when what it described changed. */
+  async takeAdmin(confirmToken: string, action: AdminActionV2): Promise<void> {
+    await this.ready();
+    this.confirmations.take(confirmToken, action, () => this.describe(action));
+  }
+
+  private describe(action: AdminActionV2): Described {
+    const o = this.ownedRoom(action.roomId);
+    const pendings = o.endpoint.enrollment?.pendings() ?? [];
+    const ctx: DescribeContext = {
+      state: o.host.state,
+      label: (memberId) => pendings.find((p) => p.memberId === memberId)?.label ?? null,
+      lanes: o.lanes.lanes(),
+      joinRequest: (pendingId) => {
+        const p = pendings.find((x) => x.pendingId === pendingId);
+        return p ? pendingView(p) : null;
+      },
+      ownAdminKid: o.signer?.kid ?? null,
+      ownMemberId: o.signer?.memberId ?? null,
+    };
+    return describeAdminAction(ctx, action);
   }
 
   // ------------------------------------------------------------------------------ owner: enrollment
@@ -860,18 +943,18 @@ export class RoomsRuntimeV2 {
    * `recovery.key.proposed` (exp in 3 days), which an admin of another lineage confirms. The code is a
    * secret, returned once and never stored or logged.
    */
-  async createRecoveryKey(roomId: string): Promise<{ seq: number; kid: string; code: string; proposal: string | null }> {
+  async createRecoveryKey(roomId: string): Promise<{ seq: number; proposal: string | null; recovery: RecoveryOfferView }> {
     await this.ready();
     const o = this.ownedRoom(roomId);
     if (o.host.state.auth.recovery) throw new Error("This room already has a recovery key; rotate it with the recovery code");
     const k = newRecoveryKey(roomId);
     if (lineageCount(o.host.state.auth) <= 1) {
       const r = this.adminSubmit(roomId, "recovery.key.rotated", { change: k.change, newKeySig: k.newKeySig, proposal: null });
-      return { seq: r.receipt.entry.seq, kid: k.kid, code: k.code, proposal: null };
+      return { seq: r.receipt.entry.seq, proposal: null, recovery: offerView(recoveryOfferOf(k.kid, k.code, roomId, o.host.genesisHash)) };
     }
     const exp = Math.floor(this.clock.now() / 1000) + 3 * 24 * 3600;
     const r = this.adminSubmit(roomId, "recovery.key.proposed", { change: k.change, newKeySig: k.newKeySig, exp });
-    return { seq: r.receipt.entry.seq, kid: k.kid, code: k.code, proposal: r.receipt.entry.bodyHash };
+    return { seq: r.receipt.entry.seq, proposal: r.receipt.entry.bodyHash, recovery: offerView(recoveryOfferOf(k.kid, k.code, roomId, o.host.genesisHash)) };
   }
 
   /** Keys 4.4 (two lineages): confirms another lineage's proposal with its byte-identical change. */
@@ -892,7 +975,7 @@ export class RoomsRuntimeV2 {
    * - `close`: `room.closed {proposal: null}`, final.
    * - `rotate`: a new recovery code (returned once).
    */
-  async recoveryAction(roomId: string, code: string, a: { kind: "revoke_admin"; kid: string; fromSeq: number } | { kind: "close" } | { kind: "rotate" }): Promise<{ seq: number; freshAdminKid?: string; code?: string }> {
+  async recoveryAction(roomId: string, code: string, a: { kind: "revoke_admin"; kid: string; fromSeq: number } | { kind: "close" } | { kind: "rotate" }): Promise<{ seq: number; freshAdminKid?: string; recovery?: RecoveryOfferView }> {
     const kek = await this.ready();
     const o = this.ownedRoom(roomId);
     const r = RecoveryKey.fromCode(code, o.host.state, this.clock.now);
@@ -909,7 +992,7 @@ export class RoomsRuntimeV2 {
       if (a.kind === "rotate") {
         const x = r.rotate(o.host.head);
         submit(x.statement);
-        return { seq: o.host.head.seq, code: x.code };
+        return { seq: o.host.head.seq, recovery: offerView(recoveryOfferOf(x.kid, x.code, roomId, o.host.genesisHash)) };
       }
       const memberId = o.signer?.memberId ?? this.ownMemberId(kek, roomId);
       const out = await recoverFromStolenAdmin({ r, state: () => o.host.state, head: () => o.host.head, submit, stolenKid: a.kid, fromSeq: a.fromSeq, ownKid: o.signer?.kid ?? null, freshFor: memberId });
@@ -1640,6 +1723,27 @@ function deviceRequestsView(st: Readonly<RoomState>, memberId?: string, holds?: 
     .sort(([, a], [, b]) => b.seq - a.seq)
     .slice(0, 64)
     .map(([ref, p]) => ({ ref, kind: p.kind, memberId: p.memberId, deviceId: p.deviceId, requester: p.requester, seq: p.seq, hts: p.hts, sole: p.sole, young: p.young, status: p.status, effectiveAfter: holds ? holds.endsAt(st, ref, p) : autoApprovalEndsAt(st, p) }));
+}
+
+type RecoveryOfferView = { kid: string; code: string; file: { name: string; text: string } };
+function offerView(r: RecoveryKeyOffer): RecoveryOfferView {
+  return { kid: r.kid, code: r.code, file: { name: r.fileName, text: r.fileText } };
+}
+
+/** The owner's member list: roles, lanes, devices (ids only) and the self-reported label from enrollment. */
+function rosterView(st: Readonly<RoomState>, endpoint: RoomEndpoint, selfMemberId: string | null) {
+  const online = new Set(endpoint.sessions().map((x) => x.deviceId));
+  const pendings = endpoint.enrollment?.pendings() ?? [];
+  return Object.values(st.members)
+    .map((m) => ({
+      memberId: m.memberId,
+      role: m.role,
+      lanes: [...m.lanes],
+      label: m.memberId === selfMemberId ? null : (pendings.find((p) => p.memberId === m.memberId && p.label)?.label ?? null),
+      self: m.memberId === selfMemberId,
+      devices: m.devices.map((d) => ({ deviceId: d.deviceId, kind: d.kind, since: st.deviceSince[d.deviceId] ?? null, connected: online.has(d.deviceId) })),
+    }))
+    .sort((a, b) => Number(b.self) - Number(a.self) || a.memberId.localeCompare(b.memberId));
 }
 
 function inviteView(i: InviteView) {

@@ -109,6 +109,12 @@ async function daemonClient(home: string, name: string): Promise<any> {
   return c;
 }
 const rpc = (client: any, method: string, input: unknown): Promise<any> => client.invokePluginRpc(PLUGIN, method, input);
+/** An interactive admin action (I-14): prepare (the dialog) returns a one-time token, the action uses it. */
+async function adminRpc(client: any, method: string, input: Record<string, unknown>): Promise<any> {
+  const kind = method.replace(/^rooms\.v2\./, "");
+  const p = await rpc(client, "rooms.v2.admin.prepare", { action: { kind, ...input } });
+  return rpc(client, method, { ...input, confirmToken: p.confirmToken });
+}
 async function attempt<T>(f: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
   try {
     return { ok: true, value: await f() };
@@ -181,17 +187,19 @@ async function main() {
   log("room_created", { roomId, serverId: `${String(created.serverId).slice(0, 10)}…` });
   const online = await attempt(() => until("endpoint online", async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.endpoint === "online", 30_000));
   check("room endpoint registered on the relay", online.ok, online.ok ? {} : { error: online.error });
+  const noToken = await attempt(() => rpc(o, "rooms.v2.endpoint.rotate", { roomId }));
+  check("an interactive admin action without its confirmation token is refused (I-14)", !noToken.ok, { error: noToken.ok ? null : noToken.error });
   // The lane's agent: one Claude Haiku agent created WITHOUT a prompt (no model call).
   const agent = await o.createAgent({ provider: "claude", model: "claude-haiku-4-5", cwd: SCRATCH, title: "rooms v2 e2e lane" });
   AGENT_ID = agent.id;
   log("lane_agent_created", { agentId: String(agent.id).slice(0, 8), prompt: false });
-  const lane = await rpc(o, "rooms.v2.lane.create", { roomId, agentId: agent.id, label: "Live" });
+  const lane = await adminRpc(o, "rooms.v2.lane.create", { roomId, agentId: agent.id, label: "Live" });
   const laneId: string = lane.laneId;
   const laneUp = await attempt(() => until("lane endpoint online", async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.lanes.find((l: any) => l.laneId === laneId)?.endpoint === "online", 30_000));
   check("lane created (lane.created in the log) and its endpoint online on the relay", laneUp.ok, laneUp.ok ? { laneId } : { error: laneUp.error });
   const so2 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
   check("grant lifetime is the development short value (switch on the host only)", so2?.grantTtlS === GRANT_TTL_S, { grantTtlS: so2?.grantTtlS });
-  const invite = await rpc(o, "rooms.v2.invite.create", { roomId, lanes: [laneId], note: "for the e2e member", roomName: "E2E room" });
+  const invite = await adminRpc(o, "rooms.v2.invite.create", { roomId, lanes: [laneId], note: "for the e2e member", roomName: "E2E room" });
   const code: string = invite.code;
   const token = JSON.parse(Buffer.from(code.slice(5), "base64url").toString("utf8")).token as string;
   check("invite code is prc2 and about 700 characters", code.startsWith("prc2.") && code.length > 500 && code.length < 2048, { length: code.length, inviteRef: `${String(invite.inviteRef).slice(0, 8)}…` });
@@ -252,7 +260,7 @@ async function main() {
   await rpc(m, "rooms.v2.join.confirm", { roomId, match: true });
   await until("host saw the member's confirmation", async () => (await cardOf(o))?.state === "member_ok", 30_000);
   const t1 = Date.now();
-  await rpc(o, "rooms.v2.join.admit", { roomId, pendingId: card.pendingId });
+  await adminRpc(o, "rooms.v2.join.admit", { roomId, pendingId: card.pendingId });
   const joinedOk = await attempt(() => until("member session open", async () => {
     const st = await rpc(m, "rooms.v2.status", {});
     const j = st.joined.find((r: any) => r.roomId === roomId);
@@ -349,7 +357,7 @@ async function main() {
   const hk0 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId).keys;
   const gBeforeHk = (await memberLane())!.gid;
   const tHk = Date.now();
-  const hkRot = await attempt(() => rpc(o, "rooms.v2.host.key.rotate", { roomId }));
+  const hkRot = await attempt(() => adminRpc(o, "rooms.v2.host.key.rotate", { roomId }));
   const hk1 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.keys;
   const oldHk = hk1?.hostKeys.find((k: any) => k.kid === hk0.hostKid);
   check(
@@ -545,7 +553,7 @@ async function main() {
   check("routed view open again before the removal", rc2.ok && (await attempt(() => routed2.fetchAgent(agent.id))).ok);
   const before = st2.length;
   const t2 = Date.now();
-  const removed = await rpc(o, "rooms.v2.member.remove", { roomId, memberId: mv.memberId });
+  const removed = await adminRpc(o, "rooms.v2.member.remove", { roomId, memberId: mv.memberId });
   const rpcMs = Date.now() - t2;
   const cut = await attempt(() => until("routed view cut", () => st2.slice(before).find((x) => x.status !== "connected"), 10_000, 5));
   check("revocation cuts the open lane view immediately", cut.ok && cut.value.at - t2 < 1500, cut.ok ? { rpcMs, cutAfterMs: cut.value.at - t2 } : { error: cut.error });

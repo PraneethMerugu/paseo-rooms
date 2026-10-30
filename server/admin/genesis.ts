@@ -324,7 +324,11 @@ export async function createRoom(o: CreateRoomOptions): Promise<CreatedRoom> {
 }
 
 function recoveryOffer(r: Ed, roomId: string, genesisHash: string): RecoveryKeyOffer {
-  const code = encodeRecoveryCode(r.seed);
-  const fileText = `${JSON.stringify({ v: 2, typ: "recovery-key", roomId, genesisHash, kid: r.kid, code }, null, 2)}\n`;
-  return { kid: r.kid, fingerprint: fingerprintOfKid(r.kid), code, fileText, fileName: `paseo-room-recovery-${roomId}.json` };
+  return recoveryOfferOf(r.kid, encodeRecoveryCode(r.seed), roomId, genesisHash);
+}
+
+/** The offer for a recovery code: the code and the saved file of section 5.4.1 (the same code in JSON). */
+export function recoveryOfferOf(kid: string, code: string, roomId: string, genesisHash: string): RecoveryKeyOffer {
+  const fileText = `${JSON.stringify({ v: 2, typ: "recovery-key", roomId, genesisHash, kid, code }, null, 2)}\n`;
+  return { kid, fingerprint: fingerprintOfKid(kid), code, fileText, fileName: `paseo-room-recovery-${roomId}.json` };
 }
