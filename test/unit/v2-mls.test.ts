@@ -370,9 +370,16 @@ test("MLS 6: a Welcome whose authority extension has another adminSetHash is ref
 class FlakyStore extends MemoryMlsStore {
   /** Fails the first write whose cursor reaches this entry (other writes, e.g. KeyPackage records, pass). */
   failAt: number | null = null;
+  /**
+   * Called at the failed write: a crash ends the process, so the test stops the member there. Without it
+   * the member survives the throw, and any later pump (e.g. from `idle()`) retries the entry from the
+   * stored state, which is correct recovery but makes "nothing processed before the restart" a race.
+   */
+  onCrash: (() => void) | null = null;
   write(r: MemberRecord): void {
     if (this.failAt !== null && r.cursor >= this.failAt) {
       this.failAt = null;
+      this.onCrash?.();
       throw new Error("crash before the state write");
     }
     super.write(r);
@@ -389,10 +396,15 @@ test("MLS 7: write ordering, a crash before the state write or before the ack lo
     flaky.record = structuredClone(A.store.record);
     A = h.restart("A", flaky);
     await h.settle(); // witnesses of the earlier adds are sent first
-    flaky.failAt = h.room.host.head.seq + 1;
+    const failAt = h.room.host.head.seq + 1;
+    flaky.failAt = failAt;
+    flaky.onCrash = () => A.member.stop();
     await C.member.sendText("m1");
     await deliver(h);
+    assert.equal(flaky.failAt, null, "the write for m1 was attempted and failed");
     assert.equal(A.member.messages.length, 0, "the crash happened before the state write");
+    assert.ok((h.ds.lastAck(A.deviceId)?.seq ?? -1) < failAt, "no ack for an entry whose state was not written");
+    flaky.onCrash = null;
     A = h.restart("A", flaky);
     await deliver(h);
     assert.deepEqual(A.member.messages.map((m) => m.text), ["m1"], "processed once from the stored state");
