@@ -192,3 +192,11 @@ After Spike A (`spikes/security/RESULTS.md`):
 3. **Retired keys never return to use,** including host keys, even when a re-fold voids the rotation that retired them. The room then needs a fresh statement from a valid admin.
 4. **Revocation nesting is capped** in the spec (for example, depth 8), and the implementation's re-fold cost must grow linearly, not exponentially.
 5. **Silent points:** the four I-5 choices and the other ten I-6 choices are written into the specs as rules.
+
+## Decisions, round 9 (user approved, 2026-10-30)
+
+1. **R8-5a confirmed:** an admin key may not revoke the last active admin key; the recovery key may, and then adds a fresh admin key.
+2. **Proposal (a):** the host refuses an `endpoint.rotated` naming an endpoint it does not serve.
+3. **Proposal (c):** after admission, the member checks every pre-admission authority-chain entry against the fetched log; a mismatch is equivocation evidence.
+4. **Joiner confirmation:** a joiner's epoch is confirmed by matching anchors from min(2, number of other leaves) other leaves.
+5. **Prompt Add:** the admitting admin daemon adds a newly admitted device to the room group at once; the repair path is only the fallback.
