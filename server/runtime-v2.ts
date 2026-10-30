@@ -72,6 +72,11 @@ import { EnrollmentJournal } from "./member/enrollment-journal";
 import { checkInvite, DEFAULT_TRUSTED_RELAYS, laneHostLabel, requireRelayTrust, type InvitePreview } from "./member/invite-check";
 import { LaneRegistrar, type HostsApi } from "./member/lane-registration";
 import { RoomClient } from "./member/room-client";
+import { RoomLogFold } from "./authority/fold";
+import { MlsDelivery } from "./host/mls-delivery";
+import { mlsAdapter, type MlsAdapter } from "./mls/adapter";
+import { MlsMember, type MlsTimings } from "./mls/member";
+import { SealedMlsStore } from "./mls/sealed-store";
 import { dataDir as roomsDataDir, resolvePaseoHome } from "./paths";
 import { writePrivateFile } from "./platform/durable";
 import { defaultProtection, ProtectionError, type FileProtection } from "./platform/file-protection";
@@ -83,6 +88,9 @@ import { rjcsParse } from "./proto/rjcs";
 import type { RelayAddress } from "./transport/relay-server";
 
 export const PROTOCOL_ENV = "PASEO_ROOMS_PROTOCOL";
+/** DEV-ONLY: short MLS timers (repair delay, witness, joiner check) so the offline e2e runs in seconds. */
+export const ENV_DEV_MLS_FAST = "PASEO_ROOMS_DEV_MLS_FAST";
+const DEV_MLS_TIMINGS: Partial<MlsTimings> = { repairDelayMs: 0, repairJitterMs: 0, witnessMaxDelayMs: 1000, epochConfirmMs: 5000, retryMs: 2000 };
 
 /** Read once at plugin start (contribute). */
 export function roomsProtocol(env: NodeJS.ProcessEnv = process.env): "v1" | "v2" {
@@ -112,7 +120,7 @@ export function relayAddress(relay: { host: string; port: number }, env: NodeJS.
 }
 
 
-type Owned = { host: RoomHost; signer: AdminSigner | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService; approver: ReturnType<typeof setInterval> | null };
+type Owned = { host: RoomHost; signer: AdminSigner | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService; approver: ReturnType<typeof setInterval> | null; mls: MlsDelivery | null; mlsTick: ReturnType<typeof setInterval> | null; ownFeed: (() => void) | null };
 type Joined = { client: RoomClient; memberId: string; deviceId: string };
 
 const SCHEDULE_FILE = "grant-schedule.json";
@@ -157,6 +165,9 @@ export class RoomsRuntimeV2 {
   private stopping = false;
   /** Member: the confirming-device side of device links, by room. */
   private readonly linkers = new Map<string, DeviceLinker>();
+  /** MLS (I-13): the adapter, and this daemon's member device of each room it is in (owned or joined). */
+  private mlsLib: MlsAdapter | null = null;
+  readonly mlsMembers = new Map<string, MlsMember>();
   /** Admin daemon: automatic approvals that failed, retried after this time (by request bodyHash). */
   private readonly approveRetryAt = new Map<string, number>();
   /**
@@ -207,6 +218,12 @@ export class RoomsRuntimeV2 {
     this.keystore = status;
     if (status.state !== "ready") throw new Error(`keystore ${status.state}`);
     this.kek = status.kek;
+    try {
+      this.mlsLib = await mlsAdapter();
+    } catch (e) {
+      logError("v2_mls_unavailable", e);
+    }
+    if (this.mlsLib && this.env[ENV_DEV_MLS_FAST] === "1") log("dev_mls_fast_timers", { warning: "DEV-ONLY short MLS timers", timings: DEV_MLS_TIMINGS });
     const hostDir = nodePath.join(this.dataDir, "host");
     for (const roomId of fs.existsSync(hostDir) ? fs.readdirSync(hostDir) : []) {
       if (!isRoomId(roomId) || !fs.existsSync(genesisPath(this.dataDir, roomId))) continue;
@@ -248,23 +265,159 @@ export class RoomsRuntimeV2 {
     const roomId = host.roomId;
     const grants = new HostGrants({ dataDir: this.dataDir, kek: this.kek!, host, env: this.env });
     let lanes: LaneService | null = null;
-    const endpoint = new RoomEndpoint({
+    let endpoint: RoomEndpoint | null = null;
+    let ownFeed: (() => void) | null = null;
+    const mls = this.mlsLib
+      ? new MlsDelivery({ dataDir: this.dataDir, kek: this.kek!, host, adapter: this.mlsLib, now: this.clock.now, push: (d, f) => endpoint?.pushToDevice(d, f) ?? false, afterAppend: () => endpoint?.afterAppend() })
+      : null;
+    endpoint = new RoomEndpoint({
       host,
       endpointKey: endpointKeyFromHost(this.dataDir, this.kek!, host),
       relay: relayAddress(g, this.env),
       ...(this.tuning.timings ? { timings: this.tuning.timings } : {}),
       enrollment: { dataDir: this.dataDir, kek: this.kek!, admin: signer ? (type, data) => this.adminSubmit(roomId, type, data) : null },
       grants,
-      onAppended: () => lanes?.sync(),
+      ...(mls ? { mls } : {}),
+      onAppended: () => {
+        lanes?.sync();
+        ownFeed?.();
+      },
     });
     grants.afterAppend = () => endpoint.afterAppend();
     lanes = new LaneService({ dataDir: this.dataDir, kek: this.kek!, host, grants, relay: relayAddress(g, this.env), paseoHome: this.paseoHome });
     // The admin daemon's automatic approvals of held device adds (identity-model.md 6.3).
     const approver = signer ? setInterval(() => this.autoApprove(roomId), 2000) : null;
     (approver as { unref?: () => void } | null)?.unref?.();
-    this.owned.set(roomId, { host, signer, endpoint, grants, lanes, approver });
+    const mlsTick = mls ? setInterval(() => mls.tick(), 30_000) : null;
+    (mlsTick as { unref?: () => void } | null)?.unref?.();
+    const owned: Owned = { host, signer, endpoint, grants, lanes, approver, mls, mlsTick, ownFeed: null };
+    this.owned.set(roomId, owned);
     endpoint.start();
     lanes.start();
+    try {
+      ownFeed = this.startOwnMember(owned);
+      owned.ownFeed = ownFeed;
+    } catch (e) {
+      logError("v2_mls_member_failed", e, { roomId });
+    }
+  }
+
+  // ------------------------------------------------------------------------------ MLS (I-13)
+
+  private mlsTimings(): Partial<MlsTimings> | undefined {
+    return this.env[ENV_DEV_MLS_FAST] === "1" ? DEV_MLS_TIMINGS : undefined;
+  }
+
+  /**
+   * The owner's own member device in the room group (the creator's device, member keys written by
+   * createRoom). It reaches the delivery service in process and follows the host log through its own
+   * fold, so the owner holds no relay session to its own room. Returns the feed to call after appends.
+   */
+  private startOwnMember(o: Owned): (() => void) | null {
+    const roomId = o.host.roomId;
+    if (!this.mlsLib || !o.mls || !fs.existsSync(memberKeysPath(this.dataDir, roomId))) return null;
+    const kek = this.kek!;
+    const plain = kek.readSealed(memberKeysPath(this.dataDir, roomId), memberKeysPurpose(roomId));
+    if (!plain) return null;
+    let memberId: string;
+    let deviceId: string;
+    try {
+      const k = MemberKeysFile(rjcsParse(plain));
+      memberId = k.memberId;
+      deviceId = k.deviceId;
+    } finally {
+      plain.fill(0);
+    }
+    const sigKey = this.sigKeyFor(kek, roomId);
+    const endpoint = o.endpoint;
+    const host = o.host;
+    const dhOf = () => host.state.members[memberId]?.devices.find((d) => d.deviceId === deviceId)?.dh ?? "";
+    const member = new MlsMember({
+      adapter: this.mlsLib,
+      roomId,
+      genesisHash: host.genesisHash,
+      memberId,
+      deviceId,
+      device: { sigPub: b64u(rawPublicKey(sigKey)), sigKey },
+      store: new SealedMlsStore({ dataDir: this.dataDir, kek, roomId, deviceId }),
+      link: () => ({ request: (frame) => endpoint.localRequest(dhOf(), frame) }),
+      creator: true,
+      now: this.clock.now,
+      timings: this.mlsTimings(),
+      blocked: () => host.isStopped,
+      onAlert: (a) => log("mls_member_alert", { roomId, type: a.type, seq: a.seq }),
+    });
+    this.mlsMembers.set(roomId, member);
+    endpoint.onLocalPush(deviceId, (f) => void member.onPush(f));
+    const fold = RoomLogFold.fromGenesis(host.genesis);
+    const feed = () => {
+      for (const r of host.entries(fold.head.seq + 1)) {
+        const before = fold.state;
+        fold.append(r.signed, r.body);
+        member.ingest(r.signed, before, fold.state);
+      }
+    };
+    feed();
+    member.checkRollback(o.mls.lastAck(deviceId));
+    member.start();
+    return feed;
+  }
+
+  /** A joined room's member device: its MLS member persists across sessions; the link is the current session. */
+  private memberMlsFor(kek: Kek, roomId: string, genesisHash: string, memberId: string, deviceId: string): MlsMember | null {
+    const have = this.mlsMembers.get(roomId);
+    if (have || !this.mlsLib) return have ?? null;
+    const sigKey = this.sigKeyFor(kek, roomId);
+    const member = new MlsMember({
+      adapter: this.mlsLib,
+      roomId,
+      genesisHash,
+      memberId,
+      deviceId,
+      device: { sigPub: b64u(rawPublicKey(sigKey)), sigKey },
+      store: new SealedMlsStore({ dataDir: this.dataDir, kek, roomId, deviceId }),
+      link: () => {
+        const c = this.joined.get(roomId)?.client;
+        if (!c || c.status !== "open") return null;
+        return {
+          request: async (frame, timeoutMs) => {
+            try {
+              return (await c.request(frame as Omit<Frame, "id">, timeoutMs)) as Record<string, unknown>;
+            } catch (e) {
+              throw e instanceof RoomSessionError ? Object.assign(new Error(e.code), { code: e.code, fields: e.fields ?? {} }) : e;
+            }
+          },
+        };
+      },
+      timings: this.mlsTimings(),
+      onAlert: (a) => log("mls_member_alert", { roomId, type: a.type, seq: a.seq }),
+    });
+    this.mlsMembers.set(roomId, member);
+    member.start();
+    return member;
+  }
+
+  /** Sends a chat message in the room group (development RPC; the chat UI is M2). */
+  async mlsSend(roomId: string, text: string): Promise<{ seq: number }> {
+    await this.ready();
+    const m = this.mlsMembers.get(roomId);
+    if (!m) throw new Error("No MLS group member for that room on this daemon");
+    return m.sendText(text);
+  }
+
+  async mlsMessages(roomId: string): Promise<{ messages: { seq: number; epoch: number; from: { memberId: string; deviceId: string } | null; text: string }[] }> {
+    await this.ready();
+    const m = this.mlsMembers.get(roomId);
+    if (!m) throw new Error("No MLS group member for that room on this daemon");
+    await m.idle();
+    return { messages: m.messages.map((x) => ({ seq: x.seq, epoch: x.epoch, from: x.from, text: x.text })) };
+  }
+
+  private mlsView() {
+    return [...this.mlsMembers.entries()].map(([roomId, m]) => {
+      const v = m.view();
+      return { roomId, inGroup: v.inGroup, epoch: v.epoch, cursor: v.cursor, leaves: v.leaves.length, join: v.join?.status ?? null, stalled: v.stalled !== null, disabled: v.disabled, canSend: v.canSend, messages: m.messages.length, alerts: m.alerts.slice(-16).map((a) => ({ type: a.type, seq: a.seq })) };
+    });
   }
 
   /**
@@ -316,6 +469,7 @@ export class RoomsRuntimeV2 {
         deviceRequests: deviceRequestsView(host.state),
         conflicts: Object.keys(host.state.conflicts).sort(),
       })),
+      mls: this.mlsView(),
       joining: [...this.joining.values()].map((e) => joinView(e.view())),
       joined: [...this.joined.entries()].map(([roomId, j]) => ({
         roomId,
@@ -821,6 +975,11 @@ export class RoomsRuntimeV2 {
   /** Session pushes: `grant.revoked` (theft, role change) asks for a new grant through the session. */
   private onSessionPush(roomId: string, frame: Frame): void {
     if (this.linkers.get(roomId)?.onPush(frame)) return;
+    // MLS pushes of an owned room reach the owner's device in process (endpoint.onLocalPush).
+    if (frame.t === "pending_remove" || frame.t === "kp.low") {
+      if (!this.owned.has(roomId)) this.mlsMembers.get(roomId)?.onPush(frame as Record<string, unknown>);
+      return;
+    }
     if (frame.t !== "grant.revoked" || typeof frame.laneId !== "string") return;
     log("grant_revoked_push", { roomId, laneId: frame.laneId, reason: String(frame.reason ?? "").slice(0, 32) });
     void this.schedulers.get(roomId)?.get(frame.laneId)?.rotate(`revoked_${String(frame.reason ?? "unknown").slice(0, 24)}`);
@@ -851,11 +1010,24 @@ export class RoomsRuntimeV2 {
     this.joined.get(roomId)?.client.close();
     const keys = this.deviceFor(kek, roomId);
     const v = verifyGenesis(keys.genesis);
-    const client = new RoomClient({ genesis: keys.genesis, device: keys.device, relay: keys.relay(v.genesis), timings: this.tuning.timings, onPush: (f) => this.onSessionPush(roomId, f) });
+    const mls = this.memberMlsFor(kek, roomId, v.genesisHash, keys.memberId, keys.deviceId);
+    const client = new RoomClient({
+      genesis: keys.genesis,
+      device: keys.device,
+      relay: keys.relay(v.genesis),
+      timings: this.tuning.timings,
+      onPush: (f) => this.onSessionPush(roomId, f),
+      ...(mls && !this.owned.has(roomId) ? { onIngest: (s, b, a) => mls.ingest(s, b, a) } : {}),
+    });
     this.joined.set(roomId, { client, memberId: keys.memberId, deviceId: keys.deviceId });
     this.linkerFor(kek, roomId, v.genesisHash, keys.memberId, keys.deviceId, client);
     try {
-      await client.connect();
+      const hello = await client.connect();
+      if (mls && !this.owned.has(roomId)) {
+        const la = hello.lastAck as { seq?: unknown; epoch?: unknown } | null;
+        mls.checkRollback(la && Number.isSafeInteger(la.seq) && Number.isSafeInteger(la.epoch) ? { seq: la.seq as number, epoch: la.epoch as number } : null);
+        void mls.maintain().catch(() => undefined);
+      }
       const m = client.state.members[keys.memberId];
       if (!m?.devices.some((d) => d.deviceId === keys.deviceId)) log("v2_admission_not_in_log", { roomId, memberId: keys.memberId });
     } catch (e) {
@@ -927,8 +1099,10 @@ export class RoomsRuntimeV2 {
     void this.observing?.release().catch(() => undefined);
     for (const e of this.joining.values()) e.close();
     for (const j of this.joined.values()) j.client.close();
+    for (const m of this.mlsMembers.values()) m.stop();
     for (const o of this.owned.values()) {
       if (o.approver) clearInterval(o.approver);
+      if (o.mlsTick) clearInterval(o.mlsTick);
       await o.lanes.stop();
       o.grants.stop();
       o.endpoint.stop();

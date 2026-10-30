@@ -20,13 +20,17 @@
 //   session's handshake hash is `handshakeHash`. Frames the host pushes outside a reply
 //   (`enroll.admitted`, `enroll.closed`) go to `onPush`.
 //
+// - `onIngest` hands every accepted entry, with the fold state before and after it, to the MLS member
+//   (I-13), which fetches MLS bodies itself with `msg.fetch`.
+//
 // Not here: persistence of the verified copy, maxSignedHead and receipts (not yet in the member
-// journal; truncation is detected within one process lifetime only), MLS gossip
-// transport (I-13), and the UI for alerts (I-14). Alerts are kept in memory and passed to `onAlert`.
+// journal; truncation is detected within one process lifetime only), MLS gossip of log heads
+// (`logHead` is sent in every MLS message's authenticated data, but `checkPeerHead` is not yet fed from
+// it), and the UI for alerts (I-14). Alerts are kept in memory and passed to `onAlert`.
 import WebSocket from "ws";
 import { z } from "zod";
 import { isEquivocationProof, SignedEntry as SignedEntrySchema, verifySignedEntry, type SignedEntry } from "../authority/entries";
-import { FoldError, RoomLogFold } from "../authority/fold";
+import { FoldError, RoomLogFold, type RoomState } from "../authority/fold";
 import { verifyGenesis, type RoomGenesis } from "../authority/genesis";
 import { log } from "../log";
 import { NOISE_MAX_MESSAGE_BYTES } from "../noise/cipher-state";
@@ -94,6 +98,8 @@ export interface RoomClientOptions {
   evidenceTimeoutMs?: number;
   now?: () => number;
   onAlert?(alert: RoomAlert): void;
+  /** Every entry the fold accepted, with the fold state before and after it (the MLS member, I-13). */
+  onIngest?(signed: SignedEntry, before: Readonly<RoomState>, after: Readonly<RoomState>): void;
   /** Test only: bind the handshake to something else than this room (wrong prologue). */
   bindingOverride?: RoomEndpointBinding;
   /** Test only: inject the first handshake message's ephemeral. */
@@ -495,6 +501,7 @@ export class RoomClient {
     for (const e of entries) {
       if (this.processingStopped) return;
       const seq = this.head.seq + 1;
+      const before = this.requireFold().state;
       try {
         this.requireFold().append(e, bodies.get(seq));
       } catch (err) {
@@ -503,7 +510,13 @@ export class RoomClient {
         this.raise({ type: "invalid_entry", roomId: this.roomId, seq, at: this.now(), proof: [], reason: err.reason });
         return;
       }
-      this.chain.push(SignedEntrySchema.parse(e));
+      const signed = SignedEntrySchema.parse(e);
+      this.chain.push(signed);
+      try {
+        this.o.onIngest?.(signed, before, this.requireFold().state);
+      } catch (err) {
+        log("room_client_ingest_hook_failed", { roomId: this.roomId, error: String((err as Error)?.message ?? err).slice(0, 160) });
+      }
     }
   }
 

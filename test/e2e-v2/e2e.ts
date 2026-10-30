@@ -5,6 +5,10 @@
 // no model call is made) for the lane to share, and archives it at the end. Prints evidence as JSON
 // lines; never prints keys, credentials, the genesis, invite codes, grants or their tokens.
 //
+// MLS (I-13), between the device link and the removal: the owner's device, A and B exchange room group
+// messages (random markers); after the removal the owner's next message is at an epoch A and B never
+// reach; no marker appears in any file. The run script sets PASEO_ROOMS_DEV_MLS_FAST=1 (DEV-ONLY timers).
+//
 // Grants are short: the run script sets PASEO_ROOMS_DEV_SHORT_GRANTS=1 and
 // PASEO_ROOMS_DEV_GRANT_TTL_S (40 s): idle rotation at 20 s, forced at 30 s.
 //
@@ -380,6 +384,40 @@ async function main() {
   const bGrant = await attempt(() => until("B's own lane grant", async () => (await ownerRoom())?.grants.find((g: any) => g.deviceId === req.deviceId && g.laneId === laneId), 60_000));
   check("B gets its own lane grant (per device)", bGrant.ok, bGrant.ok ? {} : { error: bGrant.error });
 
+  // ------------------------------------------------------------ MLS room group (I-13)
+  // The owner's own device (in process, no relay session), device A and device B are leaves of the room
+  // group: the owner's device created it and committed the adds. The dev runtime runs with
+  // PASEO_ROOMS_DEV_MLS_FAST=1 (repair delay 0, joiner check 5 s), so this takes seconds. The texts are
+  // random markers; the scan at the end looks for them in every file.
+  const mlsOf = async (c: any) => (await rpc(c, "rooms.v2.status", {})).mls.find((r: any) => r.roomId === roomId);
+  const textsOf = async (c: any) => ((await rpc(c, "rooms.v2.mls.messages", { roomId })).messages as any[]).map((x) => x.text);
+  const groupUp = await attempt(() => until("room group with three leaves", async () => {
+    const v = await Promise.all([o, m, m2].map(mlsOf));
+    return v.every((x) => x?.inGroup && x.leaves === 3 && x.epoch === v[0].epoch && x.canSend) ? v : null;
+  }, 60_000, 500));
+  check("MLS: owner device, A and B are in the room group at one epoch and may send", groupUp.ok, groupUp.ok ? { epoch: groupUp.value[0].epoch, joins: groupUp.value.map((x: any) => x.join) } : { error: groupUp.error, views: await Promise.all([o, m, m2].map(mlsOf)) });
+  // A joined a group of two leaves: only the owner's device could confirm its epoch, so the joiner check
+  // ends with epoch_unconfirmed (two other leaves are needed, see member.ts). B joined with two others.
+  for (const [label, c, allowed] of [["owner", o, []], ["A", m, ["epoch_unconfirmed"]], ["B", m2, []]] as const) {
+    const alerts = ((await mlsOf(c))?.alerts ?? []) as { type: string }[];
+    check(`MLS: no group alerts on ${label}${allowed.length ? " except epoch_unconfirmed" : ""}`, alerts.every((a) => (allowed as readonly string[]).includes(a.type)), { alerts });
+  }
+  const bJoinState = (await mlsOf(m2))?.join;
+  check("MLS: B's epoch is confirmed by the witnesses of two other leaves", bJoinState === "confirmed", { join: bJoinState });
+  const mark = (w: string) => `e2e-mls-${w}-${randomUUID()}`;
+  const alpha = mark("alpha");
+  const bravo = mark("bravo");
+  const charlie = mark("charlie");
+  const sentA = await attempt(() => rpc(o, "rooms.v2.mls.send", { roomId, text: alpha }));
+  const sentB = await attempt(() => rpc(m, "rooms.v2.mls.send", { roomId, text: bravo }));
+  check("MLS: the owner's device and device A each send an application message", sentA.ok && sentB.ok, { owner: sentA.ok ? sentA.value.seq : sentA.error, a: sentB.ok ? sentB.value.seq : sentB.error });
+  const exchanged = await attempt(() => until("messages exchanged", async () => {
+    const [ot, at, bt] = await Promise.all([o, m, m2].map(textsOf));
+    return ot.includes(bravo) && at.includes(alpha) && bt.includes(alpha) && bt.includes(bravo) ? { ot, at, bt } : null;
+  }, 20_000, 250));
+  check("MLS: each reads the other's message; B reads both; nobody reads its own back", exchanged.ok && !exchanged.value.ot.includes(alpha) && !exchanged.value.at.includes(bravo), exchanged.ok ? {} : { error: exchanged.error });
+  const ownerMlsBefore = await mlsOf(o);
+
   // Positive control for the secret scan: while registered, the member daemon's hosts.json (written by
   // Paseo, 0600) holds the current grant, and no other file of either home does.
   const grantFiles: string[] = [];
@@ -422,6 +460,16 @@ async function main() {
   check("owner: no live session, no lane link, no current grant, no persist error", after?.sessions.length === 0 && after.lanes[0].links === 0 && after.grants.length === 0 && after.persistError === null, { sessions: after?.sessions.length, links: after?.lanes[0].links, grants: after?.grants.length, persistError: after?.persistError });
   const again = await rpc(m, "rooms.v2.room.connect", { roomId });
   check("a new session of the removed device gets access_ended", again.status === "ended" && again.lastError === "access_ended", again);
+
+  // MLS after the removal: the owner's device commits both leaves out (pending_remove) before it sends,
+  // so the next message is of an epoch the removed devices never reach.
+  const sentC = await attempt(() => rpc(o, "rooms.v2.mls.send", { roomId, text: charlie }));
+  const ownerAfter = await mlsOf(o);
+  check("MLS: after the removal the owner's device is alone in the group, at a later epoch, and sends", sentC.ok && ownerAfter?.leaves === 1 && ownerAfter.epoch > ownerMlsBefore.epoch, { sent: sentC.ok, leaves: ownerAfter?.leaves, epoch: ownerAfter?.epoch, before: ownerMlsBefore?.epoch });
+  await sleep(3000);
+  const [aAfter, bAfter] = await Promise.all([m, m2].map(mlsOf));
+  const [aTexts, bTexts] = await Promise.all([m, m2].map(textsOf));
+  check("MLS: the removed devices cannot read the next message and stay at the old epoch", !aTexts.includes(charlie) && !bTexts.includes(charlie) && aAfter.epoch < ownerAfter.epoch && bAfter.epoch < ownerAfter.epoch, { aEpoch: aAfter?.epoch, bEpoch: bAfter?.epoch, ownerEpoch: ownerAfter?.epoch });
   await origin.close().catch(() => undefined);
 
   // ------------------------------------------------------------ 8. files, logs and relay evidence
@@ -460,6 +508,23 @@ async function main() {
   check("no plaintext secret fields in either data tree; key and state files sealed", plaintextSecrets.length === 0, { found: plaintextSecrets });
   check("the invite and link codes and tokens appear in no file of any home (data, logs)", tokenFound.length === 0, { found: tokenFound });
   check("secret scan: no prc2., no prl2. and no prg2. outside the members' hosts.json (logs, plugin data, owner)", prefixHits.length === 0, { found: prefixHits, hostsJsonWithGrant: grantsInHostsJson.length });
+  // MLS: no message text in any file of any home (host log, delivery state, member state, daemon logs)
+  // or in the relay log. The host's files are the ones that matter (the host never sees plaintext);
+  // the others are checked too.
+  const markerHits: string[] = [];
+  for (const [label, home] of [["owner", OWNER], ["member", MEMBER], ["member2", MEMBER2]] as const) {
+    for (const f of files(home)) {
+      if (/node_modules|\/plugins\//.test(f)) continue;
+      const text = readFileSync(f).toString("latin1");
+      for (const x of [alpha, bravo, charlie]) if (text.includes(x) || text.includes(x.slice(8))) markerHits.push(`${label}:${f.slice(home.length + 1)}`);
+    }
+  }
+  if (RELAY_LOG && existsSync(RELAY_LOG)) {
+    const text = readFileSync(RELAY_LOG).toString("latin1");
+    for (const x of [alpha, bravo, charlie]) if (text.includes(x.slice(8))) markerHits.push("relay-log");
+  }
+  const hostFiles = files(join(OWNER, "plugin-data", "rooms", "host"));
+  check("MLS: no message text in any file of any home or the relay log (host files included)", markerHits.length === 0 && hostFiles.some((f) => /mls\.sealed$/.test(f)), { found: [...new Set(markerHits)], hostFilesScanned: hostFiles.length });
   check("data dirs 0700 and sealed files 0600", Object.entries(modes).every(([k, v]) => (k.endsWith("rooms") ? v === "700" : v === "600")), { modes });
   if (!LIVE && RELAY_LOG && existsSync(RELAY_LOG)) {
     const lines = readFileSync(RELAY_LOG, "utf8");

@@ -17,10 +17,11 @@
 // - `securityNotices` lists the events of section 4.6 with their producer; `access.jsonl` (4.7) holds
 //   the host-local access log.
 //
-// Not here (later milestones): sessions, log.fetch and subscribe (I-8), invites and enrollment (I-9),
-// host key rotation (the host refuses a host.key.rotated naming a key it does not hold;
-// I-12), the adjacent rekey approval plus commit write (I-13), revocation enforce-first ordering
-// (grants-v2 7.1; nothing to enforce before grants and sessions exist).
+// - I-13: `appendMls` sequences MLS messages (`mls.commit`, `mls.app`), and `submitWithCommit` writes a
+//   `device.rekey.approved` and its commit as two adjacent entries in one durable write, or neither.
+//
+// Not here (later milestones): host key rotation (the host refuses a host.key.rotated naming a key it
+// does not hold; I-12).
 import * as fs from "node:fs";
 import nodePath from "node:path";
 import { z } from "zod";
@@ -473,25 +474,97 @@ export class RoomHost {
     return signer;
   }
 
-  private sequence(sb: StatementBody, body: Uint8Array): SubmitResult {
+  /** A signed entry at `seq` after `prev`, signed by the current host key. */
+  private buildEntry(seq: number, prev: string, hts: number, cls: "stmt" | "mls", type: string, body: Uint8Array, epoch: number | null): SignedEntry {
     const signer = this.currentSigner();
+    const entry: LogEntry = { v: 2, typ: "log-entry", roomId: this.roomId, seq, prev, hts, epoch, cls, type: type as LogEntry["type"], bodyHash: bodyHash(body), hostKid: signer.kid };
+    return { entry, hash: entryHash(entry), hsig: b64u(signer.sign(CTX_LOG_ENTRY, rjcs(entry))) };
+  }
+
+  /** Appends records to the store, then to the fold; a failed write stops the room (8.1). */
+  private commitRecords(records: StoredRecord[], hts: number): void {
+    try {
+      if (records.length === 1) this.store.append(records[0].signed, records[0].body);
+      else this.store.appendMany(records);
+    } catch (err) {
+      this.stopped = err instanceof LogLockLostError ? "the log lock was lost" : err instanceof PersistFailedError ? "a log write failed" : "a log write failed unexpectedly";
+      log("room_host_stopped", { roomId: this.roomId, reason: this.stopped, code: (err as { code?: string }).code ?? null });
+      throw err;
+    }
+    for (const r of records) {
+      this.fold.append(r.signed, r.body);
+      this.records.push(r);
+    }
+    this.lastHts = hts;
+  }
+
+  /**
+   * Appends an MLS message (`mls.commit` or `mls.app`, room-log-v2.md 4.5) at the head. `epoch` is the
+   * room group's epoch after this entry. The host cannot read the body; members validate it.
+   */
+  appendMls(type: "mls.commit" | "mls.app", body: Uint8Array, epoch: number | null): SignedEntry {
+    this.assertRunning();
+    const hts = Math.max(this.now(), this.lastHts);
+    const signed = this.buildEntry(this.head.seq + 1, this.head.hash, hts, "mls", type, body, epoch);
+    this.fold.check(signed, body);
+    this.commitRecords([{ signed, body }], hts);
+    return signed;
+  }
+
+  /**
+   * `commit.submit {…, statement}` for `device.rekey.approved` (decision round 6; mls-integration.md 4.4,
+   * 6.1): the statement at `s` and the commit at `s + 1`, adjacent, in one durable write, or neither.
+   * `checkCommit` sees the state the statement produces (for `stale_roster`); a non-null answer refuses
+   * both. A pair torn by a crash is moved aside on the next open (room-log-store.ts).
+   */
+  submitWithCommit(
+    input: Uint8Array | unknown,
+    commitBody: Uint8Array,
+    commitEpoch: number | null,
+    checkCommit: (next: Readonly<RoomState>) => { code: string; fields: Record<string, unknown> } | null,
+  ): { ok: true; statement: SignedEntry; commit: SignedEntry } | Extract<SubmitResult, { ok: false }> | { ok: false; code: "commit_refused"; refusal: { code: string; fields: Record<string, unknown> } } {
+    this.assertRunning();
+    let body: Uint8Array;
+    let stmt: SignedStatement;
+    try {
+      body = input instanceof Uint8Array ? input : rjcs(input, RJCS_MAX_BYTES);
+      stmt = parseSignedStatement(rjcsParse(body, RJCS_MAX_BYTES));
+    } catch (err) {
+      const reason = err instanceof StatementError ? err.reason : "bad_statement";
+      return this.reject("not_permitted", reason, err instanceof Error ? err.message : "not strict RJCS") as Extract<SubmitResult, { ok: false }>;
+    }
+    if (stmt.body.type !== "device.rekey.approved") return this.reject("not_permitted", "bad_statement", "only device.rekey.approved travels with a commit") as Extract<SubmitResult, { ok: false }>;
+    const hts = Math.max(this.now(), this.lastHts);
+    const s = this.head.seq + 1;
+    const first = this.buildEntry(s, this.head.hash, hts, "stmt", stmt.body.type, body, this.fold.state.epoch);
+    let next: Readonly<RoomState>;
+    try {
+      next = this.fold.check(first, body);
+    } catch (err) {
+      if (!(err instanceof FoldError)) throw err;
+      const code: SubmitRejection = STALE_REASONS.has(err.reason) ? "stale_base" : UNKNOWN_BASE_REASONS.has(err.reason) ? "unknown_base" : "not_permitted";
+      return this.reject(code, err.reason, err.message) as Extract<SubmitResult, { ok: false }>;
+    }
+    const refusal = checkCommit(next);
+    if (refusal) return { ok: false, code: "commit_refused", refusal };
+    const second = this.buildEntry(s + 1, first.hash, hts, "mls", "mls.commit", commitBody, commitEpoch);
+    const prev = this.fold.state;
+    for (const fn of [...this.decideListeners]) {
+      try {
+        fn(next, prev, stmt.body.type);
+      } catch (err) {
+        log("room_host_decide_failed", { roomId: this.roomId, type: stmt.body.type, error: String((err as Error)?.message ?? err).slice(0, 200) });
+      }
+    }
+    this.commitRecords([{ signed: first, body }, { signed: second, body: commitBody }], hts);
+    return { ok: true, statement: first, commit: second };
+  }
+
+  private sequence(sb: StatementBody, body: Uint8Array): SubmitResult {
     const seq = this.head.seq + 1;
     // hts never goes backwards: holds are measured in hts (room-log-v2 5).
     const hts = Math.max(this.now(), this.lastHts);
-    const entry: LogEntry = {
-      v: 2,
-      typ: "log-entry",
-      roomId: this.roomId,
-      seq,
-      prev: this.head.hash,
-      hts,
-      epoch: this.fold.state.epoch,
-      cls: "stmt",
-      type: sb.type,
-      bodyHash: bodyHash(body),
-      hostKid: signer.kid,
-    };
-    const signed: SignedEntry = { entry, hash: entryHash(entry), hsig: b64u(signer.sign(CTX_LOG_ENTRY, rjcs(entry))) };
+    const signed = this.buildEntry(seq, this.head.hash, hts, "stmt", sb.type, body, this.fold.state.epoch);
     let next: Readonly<RoomState>;
     try {
       next = this.fold.check(signed, body);
@@ -509,18 +582,9 @@ export class RoomHost {
         log("room_host_decide_failed", { roomId: this.roomId, type: sb.type, error: String((err as Error)?.message ?? err).slice(0, 200) });
       }
     }
-    try {
-      this.store.append(signed, body);
-    } catch (err) {
-      // The files may now hold the body, or the body and the entry; memory does not. Stop, and let a
-      // reopen re-fold the log, which is the source of truth.
-      this.stopped = err instanceof LogLockLostError ? "the log lock was lost" : err instanceof PersistFailedError ? "a log write failed" : "a log write failed unexpectedly";
-      log("room_host_stopped", { roomId: this.roomId, reason: this.stopped, code: (err as { code?: string }).code ?? null });
-      throw err;
-    }
-    this.fold.append(signed, body);
-    this.records.push({ signed, body });
-    this.lastHts = hts;
+    // The files may now hold the body, or the body and the entry; memory does not. On failure the room
+    // stops, and a reopen re-folds the log, which is the source of truth.
+    this.commitRecords([{ signed, body }], hts);
     return { ok: true, receipt: signed };
   }
 }

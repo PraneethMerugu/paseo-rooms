@@ -34,8 +34,14 @@
 //   active device go to the enrollment host, which pushes `link.request`, `link.reveal` and
 //   `link.closed` to the link's creator; a creator whose session opens gets what it has not answered.
 //
+// - MLS delivery (I-13, mls-integration.md 6): `kp.publish`, `kp.fetch`, `commit.submit`, `welcome.fetch`,
+//   `msg.send`, `msg.fetch` and `msg.ack` go to MlsDelivery when the room serves MLS; `session.hello.ok`
+//   carries the device's `lastAck`. A device whose key was rekeyed loses its old session with
+//   `superseded`. The owner's own member device reaches the same service in process (`localRequest`),
+//   without a relay session.
+//
 // Not here (later milestones): per-device budgets of every operation (only grants are limited),
-// endpoint rotation and `moved` (I-12), MLS operations (I-13).
+// endpoint rotation and `moved` (I-12).
 import { x25519 } from "@noble/curves/ed25519.js";
 import { RoomLogFold } from "../authority/fold";
 import type { SignedEntry } from "../authority/entries";
@@ -69,6 +75,7 @@ import { EnrollmentHost, LINK_OPS, type EnrollmentHostOptions, type EnrollSessio
 import { grantStatusFrame, isGrantId, isLaneIdV2, type HostGrants } from "./grants";
 import type { RoomState } from "../authority/fold";
 import { readHostKeys, type RoomHost, type SubmitResult } from "./room-host";
+import { MLS_OPS, type MlsDelivery } from "./mls-delivery";
 import type { Kek } from "../keystore/keystore";
 
 export type RoomEndpointStatus = "starting" | "online" | "offline" | "closed";
@@ -98,6 +105,8 @@ export interface RoomEndpointOptions {
   grants?: HostGrants;
   /** Called at the end of every afterAppend (lane endpoints follow the log). */
   onAppended?: () => void;
+  /** MLS delivery service (I-13). Without it the MLS operations answer `not_permitted`. */
+  mls?: MlsDelivery;
   now?: () => number;
 }
 
@@ -168,15 +177,48 @@ export class RoomEndpoint {
     return this.o.grants ?? null;
   }
 
+  /** In-process receivers of pushes for the owner's own device (no relay session). */
+  private readonly localPush = new Map<string, (frame: Record<string, unknown>) => void>();
+
+  get mls(): MlsDelivery | null {
+    return this.o.mls ?? null;
+  }
+
+  /** The owner's own member device: pushes to it are delivered in process. Returns the unregister function. */
+  onLocalPush(deviceId: string, fn: (frame: Record<string, unknown>) => void): () => void {
+    this.localPush.set(deviceId, fn);
+    return () => {
+      if (this.localPush.get(deviceId) === fn) this.localPush.delete(deviceId);
+    };
+  }
+
+  /**
+   * MLS operations of the owner's own active device, in process (the same checks as a session, by its
+   * DH key). Resolves with the reply frame or rejects with `{code, fields}` like a room client.
+   */
+  async localRequest(deviceDh: string, frame: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const access = this.accessOf(deviceDh);
+    if (access.kind !== "active") throw Object.assign(new Error(access.kind === "ended" ? "access_ended" : "not_authorized"), { code: access.kind === "ended" ? "access_ended" : "not_authorized", fields: {} });
+    const t = String(frame.t);
+    if (!this.o.mls || !MLS_OPS.has(t)) throw Object.assign(new Error("not_permitted"), { code: "not_permitted", fields: {} });
+    const r = this.o.mls.handle({ memberId: access.memberId, deviceId: access.deviceId, role: access.role, sigKid: access.sigKid }, frame);
+    if (!r.ok) throw Object.assign(new Error(r.code), { code: r.code, fields: r.fields ?? {} });
+    return r.frame;
+  }
+
   /** Sends an event frame to a device's live session, if it has one. */
   pushToDevice(deviceId: string, frame: Record<string, unknown>): boolean {
+    // The owner's in-process device gets the frame, and so does a live session of the same device
+    // (the owner may also hold one, e.g. while linking a device): each ignores frames it does not use.
+    const local = this.localPush.get(deviceId);
+    if (local) queueMicrotask(() => local(frame));
     for (const c of this.live.values()) {
       if (c.access.kind === "active" && c.access.deviceId === deviceId) {
         c.send(frame as Frame);
         return true;
       }
     }
-    return false;
+    return !!local;
   }
 
   /** 7.1 steps 1 and 2 for sessions: devices gone in `next` lose their sessions before the append. */
@@ -275,7 +317,13 @@ export class RoomEndpoint {
       const access = this.accessOf(conn.deviceDh!);
       if (access.kind === "active") continue;
       if (access.kind === "ended") conn.fail("access_ended", undefined, { reason: access.reason });
+      else if (conn.access.kind === "active" && [...this.active.values()].some((a) => a.deviceId === (conn.access as { deviceId: string }).deviceId)) conn.fail("superseded");
       else conn.fail("not_authorized");
+    }
+    try {
+      this.o.mls?.onAppended();
+    } catch (e) {
+      logError("room_endpoint_mls_follow_failed", e, { roomId: this.roomId });
     }
     for (const conn of this.live.values()) conn.pump();
     try {
@@ -301,6 +349,13 @@ export class RoomEndpoint {
     }
     if (conn.access.kind === "active") {
       const deviceId = conn.access.deviceId;
+      queueMicrotask(() => {
+        try {
+          if (conn.isOpen()) this.o.mls?.onSessionOpen(deviceId);
+        } catch (e) {
+          logError("room_endpoint_mls_session_open_failed", e, { roomId: this.roomId });
+        }
+      });
       // After the reply to the frame that confirmed the session: link requests the device has not answered.
       queueMicrotask(() => {
         try {
@@ -533,6 +588,14 @@ export class RoomConnection implements EnrollSession {
         case "grant.status":
         case "grant.report":
           return this.onGrant(frame, access);
+        case "kp.publish":
+        case "kp.fetch":
+        case "commit.submit":
+        case "welcome.fetch":
+        case "msg.send":
+        case "msg.fetch":
+        case "msg.ack":
+          return this.onMls(frame, access);
         case "device.link.create":
         case "link.nonce":
         case "link.confirm":
@@ -571,7 +634,7 @@ export class RoomConnection implements EnrollSession {
       memberId: access.memberId,
       deviceId: access.deviceId,
       head: head ? { seq: head.entry.seq, hash: head.hash, hsig: head.hsig } : null,
-      lastAck: null,
+      lastAck: this.endpoint.mls?.lastAck(access.deviceId) ?? null,
     });
   }
 
@@ -641,6 +704,21 @@ export class RoomConnection implements EnrollSession {
     }
     this.send({ t: "stmt.submit.ok", re: frame.id, receipt: res.receipt } as unknown as Frame);
     this.endpoint.afterAppend();
+  }
+
+  /** MLS delivery (mls-integration.md 6.1). Errors other than `internal` keep the session open. */
+  private onMls(frame: Frame, access: Extract<DeviceAccess, { kind: "active" }>): void {
+    const mls = this.endpoint.mls;
+    if (!mls) return this.fail("not_permitted", frame.id);
+    this.endpoint.submitting = this;
+    let r: ReturnType<MlsDelivery["handle"]>;
+    try {
+      r = mls.handle({ memberId: access.memberId, deviceId: access.deviceId, role: access.role, sigKid: access.sigKid }, frame as unknown as Record<string, unknown>);
+    } finally {
+      this.endpoint.submitting = null;
+    }
+    if (!r.ok) return this.fail(r.code, frame.id, r.fields ?? {});
+    this.send({ ...r.frame, re: frame.id } as unknown as Frame);
   }
 
   /** Grants-v2 3, 6.2 and 6.3. Errors other than `internal` keep the session open. */

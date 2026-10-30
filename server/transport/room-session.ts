@@ -66,7 +66,7 @@ export type AccessEndedReason = "removed" | "left" | "room_closed";
 /** Operations any initiator may call before it is known (section 4). Served from I-9 on. */
 export const PREAUTH_OPS: ReadonlySet<string> = new Set(["enroll.request", "sas.reveal", "enroll.confirm", "enroll.abort", "enroll.resume"]);
 
-/** Active-device operations served (I-8; grants from I-10, when the room serves them; device links from I-11). */
+/** Active-device operations served (I-8; grants from I-10, when the room serves them; device links from I-11; MLS from I-13). */
 export const SESSION_OPS: ReadonlySet<string> = new Set([
   "session.hello",
   "log.fetch",
@@ -80,12 +80,6 @@ export const SESSION_OPS: ReadonlySet<string> = new Set([
   "link.nonce",
   "link.confirm",
   "link.abort",
-]);
-
-/** Active-device operations of section 4 that later milestones serve; answered `not_permitted` until then. */
-export const LATER_OPS: ReadonlySet<string> = new Set([
-  "authority.get",
-  "device.rekey",
   "kp.publish",
   "kp.fetch",
   "commit.submit",
@@ -94,6 +88,9 @@ export const LATER_OPS: ReadonlySet<string> = new Set([
   "msg.fetch",
   "msg.ack",
 ]);
+
+/** Active-device operations of section 4 that later milestones serve; answered `not_permitted` until then. */
+export const LATER_OPS: ReadonlySet<string> = new Set(["authority.get", "device.rekey"]);
 
 /** `log.fetch` bounds (room-log-v2.md 8.3). */
 export const LOG_FETCH_MAX = 1000;

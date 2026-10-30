@@ -27,6 +27,7 @@
     "@noble/ciphers": "2.4.0",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
+    "ts-mls": "1.6.4",
     "ws": "8.22.0"
   },
   "devDependencies": {
@@ -41,5 +42,11 @@
     "tsx": "4.23.15",
     "typescript": "^5.9.3",
     "zod": "^4.4.3"
+  },
+  "overrides": {
+    "ts-mls": {
+      "@noble/ciphers": "$@noble/ciphers",
+      "@noble/curves": "$@noble/curves"
+    }
   }
 }

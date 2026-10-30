@@ -56,7 +56,7 @@ export class RoomLogCorruptError extends Error {
 
 export type StoredRecord = { signed: SignedEntry; body: Uint8Array };
 
-export type TornReport = { file: string; movedTo: string; bytes: number; reason: "no_newline" | "unparsable" | "orphan_body" };
+export type TornReport = { file: string; movedTo: string; bytes: number; reason: "no_newline" | "unparsable" | "orphan_body" | "unpaired_rekey" };
 
 type Line = { text: string; start: number; end: number; complete: boolean };
 
@@ -149,6 +149,15 @@ export class RoomLogStore {
       eValidEnd = line.end;
     }
 
+    // A `device.rekey.approved` is only ever written together with the commit after it (mls-integration
+    // 4.4, 6.1). One that ends the log is the first half of a pair whose write was torn: never
+    // acknowledged, so it is moved aside like a torn line, and its body becomes an orphan below.
+    if (entries.at(-1)?.entry.type === "device.rekey.approved") {
+      const keepEnd = entries.length === 1 ? 0 : elines[entries.length - 2].end;
+      torn.push(this.moveAside(this.entriesPath, "entries", readOrEmpty(this.entriesPath), keepEnd, "unpaired_rekey"));
+      entries.pop();
+    }
+
     // ---- bodies ----
     const bbuf = readOrEmpty(this.bodiesPath);
     const blines = splitLines(bbuf);
@@ -187,6 +196,16 @@ export class RoomLogStore {
   append(signed: SignedEntry, body: Uint8Array): void {
     this.lock.append(this.bodiesPath, new TextDecoder().decode(rjcs({ seq: signed.entry.seq, body: b64u(body) }, BODY_LINE_MAX)));
     this.lock.append(this.entriesPath, new TextDecoder().decode(rjcs(signed)));
+  }
+
+  /**
+   * Several records in one durable write per file (the rekey pair of mls-integration 4.4): all body
+   * lines in one write and fsync, then all entry lines in one write and fsync.
+   */
+  appendMany(records: readonly StoredRecord[]): void {
+    const td = new TextDecoder();
+    this.lock.append(this.bodiesPath, records.map((r) => td.decode(rjcs({ seq: r.signed.entry.seq, body: b64u(r.body) }, BODY_LINE_MAX))).join("\n"));
+    this.lock.append(this.entriesPath, records.map((r) => td.decode(rjcs(r.signed))).join("\n"));
   }
 
   /** Copies the bytes after `keepEnd` to `<name>.torn.<unix ms>`, then truncates the file to `keepEnd`. */

@@ -5,7 +5,8 @@
 // is a bearer secret: it is returned once to the caller and never logged. Device links (I-11): a
 // member device creates a `prl2.` link code (also a bearer secret, returned once), compares the SAS
 // with the new device and confirms; the new device joins with `rooms.v2.join.*`. Members veto, admins
-// approve held adds and resolve conflicts. `rooms.v2.test.clock.advance` is TEST-ONLY and registered
+// approve held adds and resolve conflicts. `rooms.v2.mls.*` (I-13) send and read room group messages
+// for development; the chat UI is product milestone M2. `rooms.v2.test.clock.advance` is TEST-ONLY and registered
 // only on e2e test homes.
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
@@ -161,6 +162,21 @@ export const JoinedRoomV2View = z.object({
   ),
 });
 
+/** The room group as one device sees it (mls-integration.md; I-13). No message text, no key material. */
+export const MlsV2View = z.object({
+  roomId: z.string(),
+  inGroup: z.boolean(),
+  epoch: z.number().int().nullable(),
+  cursor: z.number().int(),
+  leaves: z.number().int(),
+  join: z.enum(["pending", "confirmed", "unconfirmed", "fork"]).nullable(),
+  stalled: z.boolean(),
+  disabled: z.string().nullable(),
+  canSend: z.boolean(),
+  messages: z.number().int(),
+  alerts: z.array(z.object({ type: z.string(), seq: z.number().int() })),
+});
+
 export const roomsV2Status = defineRpc({
   name: "rooms.v2.status",
   input: Empty,
@@ -172,6 +188,8 @@ export const roomsV2Status = defineRpc({
     owned: z.array(OwnedRoomV2View),
     joining: z.array(JoiningV2View),
     joined: z.array(JoinedRoomV2View),
+    /** This daemon's member device in each room's MLS group (I-13): counts and states only, no content. */
+    mls: z.array(MlsV2View),
     /** Only on an e2e test home with the test clock switch. */
     testClockOffsetMs: z.number().int().optional(),
   }),
@@ -337,6 +355,24 @@ export const roomsV2ConflictResolve = defineRpc({
   name: "rooms.v2.device.conflict.resolve",
   input: RoomIdIn.extend({ memberId: z.string().regex(/^mem_[0-9a-f]{32}$/) }),
   output: z.object({ seq: z.number().int() }),
+});
+
+// ------------------------------------------------------------------------------ MLS (I-13)
+
+/** Development only: sends a `chat.message` in the room group (the chat UI is product milestone M2). */
+export const roomsV2MlsSend = defineRpc({
+  name: "rooms.v2.mls.send",
+  input: RoomIdIn.extend({ text: z.string().min(1).max(4000) }),
+  output: z.object({ seq: z.number().int() }),
+});
+
+/** Development only: the messages this device decrypted in the room group since the daemon started. */
+export const roomsV2MlsMessages = defineRpc({
+  name: "rooms.v2.mls.messages",
+  input: RoomIdIn,
+  output: z.object({
+    messages: z.array(z.object({ seq: z.number().int(), epoch: z.number().int(), from: z.object({ memberId: z.string(), deviceId: z.string() }).nullable(), text: z.string() })),
+  }),
 });
 
 /** TEST-ONLY: registered only on e2e test homes (server/platform/test-clock.ts). */

@@ -48,6 +48,8 @@ import {
   roomsV2DeviceApprove,
   roomsV2ConflictResolve,
   roomsV2TestClockAdvance,
+  roomsV2MlsSend,
+  roomsV2MlsMessages,
 } from "./shared/rpc-v2";
 
 const VERSION = "0.1.0";
@@ -214,6 +216,8 @@ function contributeV2(server: PluginServerContext) {
   handle(roomsV2DeviceVeto, (i) => rt.vetoDevice(i.roomId, i.ref));
   handle(roomsV2DeviceApprove, (i) => rt.approveDevice(i.roomId, i.ref));
   handle(roomsV2ConflictResolve, (i) => rt.resolveConflict(i.roomId, i.memberId));
+  handle(roomsV2MlsSend, (i) => rt.mlsSend(i.roomId, i.text));
+  handle(roomsV2MlsMessages, (i) => rt.mlsMessages(i.roomId));
   // TEST-ONLY: exists only on an e2e test home with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts).
   if (rt.clock.enabled) handle(roomsV2TestClockAdvance, (i) => rt.advanceTestClock(i.ms));
   handle(roomsV2RoomDisconnect, (i) => {

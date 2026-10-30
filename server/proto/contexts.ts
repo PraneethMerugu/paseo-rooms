@@ -56,6 +56,8 @@ export const H_INVITE_REF = "invite-ref";
 export const H_LINK_REF = "link-ref";
 export const H_ADMIN_SET = "admin-set";
 export const H_MLS_GROUP = "mls-group";
+/** The joiner's epoch anchor in MLS authenticated data (mls-integration.md 5, 5.1; decision round 8). */
+export const H_MLS_EPOCH_AUTH = "mls-epoch-auth";
 export const H_SAS_COMMIT = "sas-commit";
 export const H_SAS_TRANSCRIPT = "sas-transcript";
 /** Recovery code checksum (identity-model.md section 5.4.1). */
@@ -65,5 +67,5 @@ export const H_RECOVERY_CODE = "recovery-code";
 export const PROLOGUE_NOISE_IK = "noise-ik";
 
 export const SIGNATURE_CONTEXTS = [CTX_GENESIS, CTX_LOG_ENTRY, CTX_LANE_GRANT, CTX_ENROLL_REQUEST, CTX_KEY_CHANGE_NEW, CTX_MLS_IDENTITY] as const;
-export const HASH_LABELS = [H_KID, H_GENESIS, H_LOG_ENTRY, H_LOG_BODY, H_ROSTER, H_INVITE_REF, H_LINK_REF, H_ADMIN_SET, H_MLS_GROUP, H_SAS_COMMIT, H_SAS_TRANSCRIPT, H_RECOVERY_CODE] as const;
+export const HASH_LABELS = [H_KID, H_GENESIS, H_LOG_ENTRY, H_LOG_BODY, H_ROSTER, H_INVITE_REF, H_LINK_REF, H_ADMIN_SET, H_MLS_GROUP, H_MLS_EPOCH_AUTH, H_SAS_COMMIT, H_SAS_TRANSCRIPT, H_RECOVERY_CODE] as const;
 export const DERIVATION_LABELS = [MAC_ENROLL_TOKEN, KDF_INVITE_TOKEN_KEY, KDF_LINK_TOKEN_KEY, KDF_SAS, KDF_FILE_KEY, PROLOGUE_NOISE_IK] as const;

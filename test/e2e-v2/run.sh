@@ -88,6 +88,8 @@ export PASEO_DICTATION_ENABLED=false PASEO_VOICE_MODE_ENABLED=false
 export PASEO_ROOMS_PROTOCOL=v2 PASEO_ROOMS_KEYSTORE=fallback-file
 # Development short grants (grants-v2 section 5): honoured by the host only; never set outside tests.
 export PASEO_ROOMS_DEV_SHORT_GRANTS=1 PASEO_ROOMS_DEV_GRANT_TTL_S=40
+# Development MLS timers (I-13): repair delay 0, joiner check 5 s. Honoured by the v2 runtime only.
+export PASEO_ROOMS_DEV_MLS_FAST=1
 unset PASEO_ROOMS_KEK_FILE
 if [ "$LIVE" = 1 ]; then
   unset PASEO_ROOMS_RELAY_ENDPOINT PASEO_ROOMS_RELAY_TLS PASEO_ROOMS_DEV_INSECURE_RELAY   # default: relay.paseo.sh:443 over TLS
