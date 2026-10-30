@@ -13,7 +13,10 @@ import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { autoApprovalBlocker, autoApprovalEndsAt, SOLE_HOLD_MS } from "../../server/authority/holds";
+import { AdminHoldClock } from "../../server/admin/hold-clock";
+import { autoApprovalBlocker, autoApprovalEndsAt, HOLD_MS, SOLE_HOLD_MS } from "../../server/authority/holds";
+import type { RoomState } from "../../server/authority/state";
+import type { Kek } from "../../server/keystore/keystore";
 import { DeviceLinker, LINK_LIMITS } from "../../server/member/device-link";
 import { checkInvite } from "../../server/member/invite-check";
 import { b64u, b64uDecode } from "../../server/proto/b64u";
@@ -435,8 +438,10 @@ test("a sole device's link is held 72 h (not 71), then approved by the admin dae
   try {
     const { owner, phone } = env;
     const { roomId, join: join_, room, req, memberId } = await linkPhone(owner, phone);
-    assert.equal(req.effectiveAfter, req.hts + 72 * HOUR);
-    assert.equal(phone.joining.get(roomId)!.journal.e.held?.effectiveAfter, req.effectiveAfter, "enroll.held names when the hold ends");
+    // The admin daemon times the hold from when it first saw the request (its own clock), which is at
+    // or just after the entry's hts; enroll.held names the hts end the fold checks.
+    assert.ok(req.effectiveAfter! >= req.hts + 72 * HOUR && req.effectiveAfter! < req.hts + 72 * HOUR + 2000, `effectiveAfter ${req.effectiveAfter! - req.hts}`);
+    assert.equal(phone.joining.get(roomId)!.journal.e.held?.effectiveAfter, req.hts + 72 * HOUR, "enroll.held names when the hold ends");
     // The member's own devices see the request ("Was this you?").
     assert.equal(owner.status().joined.find((j) => j.roomId === roomId)!.deviceRequests[0]?.ref, req.ref);
     owner.advanceTestClock(71 * HOUR);
@@ -504,6 +509,10 @@ test("policy soleDeviceChange admin: no hold and no automatic approval; an admin
     await owner.approveDevice(roomId, req.ref);
     await until("B admitted", () => phone.status().joined.find((j) => j.roomId === roomId)?.status === "open", 5000);
     assert.equal(owner.ownedHostState(roomId).members[memberId].devices.length, 2);
+    // Enrollment 5.7 (round 9, item 3): the held and admission entries were checked against the log.
+    const anchors = phone.joining.get(roomId)!.journal.preAdmissionAnchors();
+    assert.deepEqual(anchors.map((a) => [a.source, a.signed.entry.type]), [["held", "device.added"], ["admission", "device.add.approved"]]);
+    assert.deepEqual(phone.status().joined.find((j) => j.roomId === roomId)?.alerts, []);
   } finally {
     await env.cleanup();
   }
@@ -527,4 +536,31 @@ test("removing the requesting device cancels the held add in the fold; B's join 
   } finally {
     await env.cleanup();
   }
+});
+
+test("admin hold clock: the hold runs on the admin daemon's own clock from first sight, not from a back-dated hts; persisted", () => {
+  const files = new Map<string, Buffer>();
+  const kek = { readSealed: (p: string) => (files.has(p) ? Buffer.from(files.get(p)!) : null), writeSealed: (p: string, _purpose: string, b: Uint8Array) => void files.set(p, Buffer.from(b)) } as unknown as Kek;
+  let now = 1_793_400_000_000;
+  const clock = () => now;
+  const roomId = `room_${randomBytes(16).toString("hex")}`;
+  const ref = b64u(randomBytes(32));
+  const req = { kind: "add", memberId: newId("member"), deviceId: newId("device"), requester: newId("device"), device: {}, seq: 7, hts: now - 30 * 24 * 3_600_000, sole: false, young: false, status: "pending" };
+  const st = { pending: { [ref]: req }, conflicts: {}, auth: { policy: { deviceAddApproval: "same-person", soleDeviceChange: "held" } } } as unknown as RoomState;
+  // A standalone host claims the request is 30 days old: by hts alone the hold is long over.
+  assert.ok(autoApprovalEndsAt(st, req as never)! < now);
+  const holds = new AdminHoldClock("/data", kek, roomId, clock);
+  assert.equal(holds.endsAt(st, ref, req as never), null, "not seen yet: no approval");
+  holds.observe(st);
+  assert.equal(holds.endsAt(st, ref, req as never), now + HOLD_MS, "24 h from first sight on the daemon's clock");
+  now += HOLD_MS - 1000;
+  holds.observe(st);
+  // A restart keeps the first-seen time.
+  const again = new AdminHoldClock("/data", kek, roomId, clock);
+  assert.equal(again.endsAt(st, ref, req as never), holds.endsAt(st, ref, req as never));
+  assert.ok(now < again.endsAt(st, ref, req as never)!, "still held");
+  // A request that is no longer pending is forgotten.
+  (req as { status: string }).status = "approved";
+  again.observe(st);
+  assert.equal(again.firstSeen(ref), undefined);
 });

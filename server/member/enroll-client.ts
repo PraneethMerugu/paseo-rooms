@@ -5,8 +5,8 @@
 // - State `keys`: per session, `h` is journaled in `sentH` before `enroll.request` (same keys, Nm and
 //   sasCommit on every retry, signed over that session's `h`).
 // - `enroll.pending` (or `enroll.resume.ok` after a lost reply) is accepted only if its `h` is in
-//   `sentH` (R-4), its genesis hashes to the invite's genesisHash and is signed by a listed admin, its
-//   endpoint equals the invite's, and the authority-key chain verifies and yields that endpoint (5.5;
+//   `sentH` (R-4), its genesis hashes to the invite's genesisHash and is signed by a listed admin, and
+//   the authority-key chain verifies and its last certified endpoint equals the invite's (5.5, I9-3;
 //   server/authority/authority-chain.ts: no roster or history is sent before admission). The SAS is
 //   computed once from the pinned `h`, Nm and Nh, journaled with the content bytes, and only then is
 //   `sas.reveal` sent.
@@ -16,8 +16,9 @@
 // - "Codes match" journals `confirmed` before `enroll.confirm`; "Codes do not match" sends
 //   `enroll.abort sas_mismatch` and fails the join.
 // - `enroll.admitted` is checked against the journal (pendingId, own keys, inviteRef, the SAS
-//   transcript) and journaled before anything else; the caller then registers lanes and opens a
-//   normal session, whose log sync folds and verifies the admission entry.
+//   transcript) and journaled, with the signed entry, before anything else; the caller then opens a
+//   normal session, whose log sync folds the log and checks every pre-admission entry (the authority
+//   chain, `enroll.held`, `enroll.admitted`) at its seq with its hash (5.7, round 9 item 3).
 // Transport failures retry with backoff; terminal errors fail the journal (keys deleted).
 //
 // Device links (I-11; identity-model.md 6.4): the same flow with a `prl2.` code. The request names
@@ -312,7 +313,6 @@ export class MemberEnrollment {
     try {
       const v = verifyGenesis(p.genesis);
       if (v.genesisHash !== e.invite.genesisHash) throw new Error("genesis hash");
-      if (rjcsText(v.genesis.body.endpoint) !== rjcsText(e.invite.endpoint)) throw new Error("endpoint");
       genesisText = rjcsText(v.genesis);
       // The authority-key chain only (no roster or history before admission); the full fold runs
       // over log.fetch once admitted.
@@ -363,7 +363,7 @@ export class MemberEnrollment {
     const prev = j.e.held;
     if (prev && (prev.hash !== h.data.entry.hash || prev.seq !== h.data.entry.entry.seq)) return this.fail("bad_admission");
     if (!prev) {
-      j.held({ seq: h.data.entry.entry.seq, hash: h.data.entry.hash, bodyHash: h.data.entry.entry.bodyHash, effectiveAfter: h.data.effectiveAfter });
+      j.held({ seq: h.data.entry.entry.seq, hash: h.data.entry.hash, bodyHash: h.data.entry.entry.bodyHash, effectiveAfter: h.data.effectiveAfter }, h.data.entry);
       log("join_held", { roomId: this.roomId, seq: h.data.entry.entry.seq, effectiveAfter: h.data.effectiveAfter });
     }
     this.changed();
@@ -393,7 +393,7 @@ export class MemberEnrollment {
         d.confirmation.inviteRef === inviteRef(e.invite.inviteId) &&
         d.confirmation.transcript === e.transcript;
       if (!ok) throw new Refuse("bad_admission");
-      j.admitted(a.memberId, a.deviceId, { seq: a.entry.entry.seq, hash: a.entry.hash });
+      j.admitted(a.memberId, a.deviceId, { seq: a.entry.entry.seq, hash: a.entry.hash }, a.entry);
     } catch (err) {
       return this.fail(err instanceof Refuse ? err.reason : "bad_admission");
     }
@@ -429,7 +429,7 @@ export class MemberEnrollment {
         d.memberId === a.memberId &&
         d.ref === e.held.bodyHash;
       if (!ok) throw new Refuse("bad_admission");
-      j.admitted(a.memberId, a.deviceId, { seq: a.entry.entry.seq, hash: a.entry.hash });
+      j.admitted(a.memberId, a.deviceId, { seq: a.entry.entry.seq, hash: a.entry.hash }, a.entry);
     } catch (err) {
       return this.fail(err instanceof Refuse ? err.reason : "bad_admission");
     }

@@ -13,6 +13,11 @@
 // - Gossip checks of 6.3 (`checkPeerHead`): `fork` only with proof, else `unverified_head_claim`
 //   attributed to the sender; `withholding` with proof when the host does not serve an entry it
 //   signed. Peer evidence (MLS `log.evidence.request`, I-13) is supplied by the caller.
+// - Pre-admission anchors (enrollment 5.7; round 9, item 3): the signed entries the host showed this
+//   device before admission (authority chain, `enroll.held`, `enroll.admitted`) must appear in the
+//   fetched log at the same seq with the same hash. A different entry there is `fork` (the two
+//   host-signed entries are the equivocation proof); an anchor beyond the host's head once synced is
+//   `truncation`. The alert's `reason` names the anchor's source.
 // - Section 3.5 timers: ping after 30 s of silence, close after 90 s, reconnect before 12 h.
 //
 // - Enrollment (I-9) uses the same client before the member has the genesis: `target` names the
@@ -64,7 +69,7 @@ export type RoomAlert = {
   proof: SignedEntry[];
   /** unverified_head_claim and peer-sourced alerts: who made the claim. */
   peer?: { memberId: string; deviceId: string };
-  /** invalid_entry: the fold reason. */
+  /** invalid_entry: the fold reason. fork and truncation from a pre-admission anchor: `pre_admission:<source>`. */
   reason?: string;
 };
 
@@ -100,6 +105,8 @@ export interface RoomClientOptions {
   onAlert?(alert: RoomAlert): void;
   /** Every entry the fold accepted, with the fold state before and after it (the MLS member, I-13). */
   onIngest?(signed: SignedEntry, before: Readonly<RoomState>, after: Readonly<RoomState>): void;
+  /** Signed entries received before admission, checked against the fetched log (enrollment 5.7). */
+  anchors?: readonly { source: string; signed: SignedEntry }[];
   /** Test only: bind the handshake to something else than this room (wrong prologue). */
   bindingOverride?: RoomEndpointBinding;
   /** Test only: inject the first handshake message's ephemeral. */
@@ -152,6 +159,8 @@ export class RoomClient {
   private readonly pending = new Map<number, Pending>();
   private syncing: Promise<void> = Promise.resolve();
   private readonly now: () => number;
+  /** Pre-admission anchors by seq; removed once checked. */
+  private readonly anchors = new Map<number, { source: string; signed: SignedEntry }[]>();
 
   constructor(private readonly o: RoomClientOptions) {
     if (o.genesis) {
@@ -166,6 +175,16 @@ export class RoomClient {
     } else throw new Error("room client needs a genesis or an enrollment target");
     this.timings = resolveTimings(o.timings);
     this.now = o.now ?? Date.now;
+    for (const a of o.anchors ?? []) {
+      const list = this.anchors.get(a.signed.entry.seq) ?? [];
+      list.push(a);
+      this.anchors.set(a.signed.entry.seq, list);
+    }
+  }
+
+  /** Pre-admission anchors not yet matched against the fetched log. */
+  get uncheckedAnchors(): number {
+    return this.anchors.size;
   }
 
   /** Own verified head: `{-1, genesisHash}` before the first entry. */
@@ -470,7 +489,9 @@ export class RoomClient {
         entries = entries.slice(1);
       }
       this.ingest(entries, page.bodies);
-      if (entries.length === 0 || hostHead === null || this.head.seq >= hostHead.entry.seq) return;
+      const atHostHead = hostHead === null || this.head.seq >= hostHead.entry.seq;
+      if (atHostHead && !this.processingStopped) this.checkAnchorsBeyondHead();
+      if (entries.length === 0 || atHostHead) return;
     }
   }
 
@@ -512,6 +533,7 @@ export class RoomClient {
       }
       const signed = SignedEntrySchema.parse(e);
       this.chain.push(signed);
+      this.checkAnchors(signed);
       try {
         this.o.onIngest?.(signed, before, this.requireFold().state);
       } catch (err) {
@@ -549,6 +571,29 @@ export class RoomClient {
     if (!isEquivocationProof(a, b, this.requireFold().hostKeyAt)) return "unverified_head_claim";
     this.raise({ type: "fork", roomId: this.roomId, seq, at: this.now(), proof: [a, b], ...(peer ? { peer } : {}) });
     return "fork";
+  }
+
+  /** Enrollment 5.7: the fetched entry at an anchor's seq must be the anchor itself. */
+  private checkAnchors(signed: SignedEntry): void {
+    const list = this.anchors.get(signed.entry.seq);
+    if (!list) return;
+    this.anchors.delete(signed.entry.seq);
+    for (const a of list) {
+      if (a.signed.hash === signed.hash) continue;
+      // Both are host-signed entries at one seq: an equivocation proof when both verify under the
+      // fold's host key for that seq. Otherwise still a fork, but the proof does not stand alone.
+      const proven = isEquivocationProof(a.signed, signed, this.requireFold().hostKeyAt);
+      this.raise({ type: "fork", roomId: this.roomId, seq: signed.entry.seq, at: this.now(), proof: [a.signed, signed], reason: `pre_admission${proven ? "" : "_unproven"}:${a.source}` });
+    }
+  }
+
+  /** At the host's head: an anchor past it is an entry the host signed and no longer serves. */
+  private checkAnchorsBeyondHead(): void {
+    for (const [seq, list] of [...this.anchors]) {
+      if (seq <= this.head.seq) continue;
+      this.anchors.delete(seq);
+      for (const a of list) this.raise({ type: "truncation", roomId: this.roomId, seq, at: this.now(), proof: [a.signed], reason: `pre_admission:${a.source}` });
+    }
   }
 
   private raiseUnverified(seq: number, peer: { memberId: string; deviceId: string }): PeerHeadResult {

@@ -84,7 +84,7 @@ export class Harness {
     const now = () => h?.clock ?? 1_793_300_000_000;
     const room = await createRoom({ dataDir, kek: s.kek, relay: { host: "relay.example.org", port: 443, tls: true }, recovery: "skip", lock: NO_TIMER, now });
     let endpoint: RoomEndpoint | null = null;
-    const ds = new MlsDelivery({ dataDir, kek: s.kek, host: room.host, adapter, now, push: (d, f) => endpoint!.pushToDevice(d, f), afterAppend: () => endpoint!.afterAppend() });
+    const ds = new MlsDelivery({ dataDir, kek: s.kek, host: room.host, adapter, now, push: (d, f) => endpoint!.pushToDevice(d, f), afterAppend: () => endpoint!.afterAppend(), onPublished: (d) => h?.devs.get("C")?.member.packagesPublished(d) });
     endpoint = new RoomEndpoint({ host: room.host, endpointKey: endpointKeyFromHost(dataDir, s.kek, room.host), relay: { endpoint: "127.0.0.1:1", useTls: false }, mls: ds, onAppended: () => h?.syncAll(), now });
     h = new Harness(adapter, room, s.kek, dataDir, endpoint, ds, t.cleanup, timings, random);
     // The creator's own device (member keys written by createRoom).

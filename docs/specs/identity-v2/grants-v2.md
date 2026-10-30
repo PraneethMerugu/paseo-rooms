@@ -4,6 +4,7 @@
 - **Resolves:** P-9, P-12/C-9, P-13, P-24, P-22 for grants; documents D3 and P-21.
 - **Formats:** `signatures-and-encoding.md`. Vector: `vectors/vectors.json` → `grant`.
 - **Revised** 2026-10-29 after the independent review (`README.md` section 10): fixed 12 h lifetime, role check, role downgrades revoke, standalone lane endpoints fail closed, per-lane project names. Revised again after the re-review (decisions round 4): log lock ownership check and atomic takeover (R-6), persisted held time for pruning (R-11).
+- **Revised** 2026-10-30 (`README.md` section 10.5): the I-10 choices written in (sections 5, 6.1, 6.3, 7.2, 12).
 
 ## 1. Where proof of possession applies, and where bearer remains
 
@@ -100,7 +101,7 @@ All failures are reported to the link as Paseo's normal authentication failure. 
 - the member daemon's own registration for that lane is `online` in `hosts.observe`;
 - the lane-reported link start time is within 30 s of the time the member saw its registration become online (both converted to the member's clock with `serverTime`).
 
-Otherwise it rotates now. A link the member cannot account for never defers rotation (P-9).
+Otherwise it rotates now. A link the member cannot account for never defers rotation (P-9). A link with no routes is idle and rotates at once; the three conditions above apply only to a link with routes (written in after I-10).
 
 Lifetime and schedule were decided on 2026-10-29 (`README.md` section 7): 12 h grants, rotation preferably when idle, forced at 75 %; the lifetime is fixed, and only an org policy can shorten it (round 3).
 
@@ -116,9 +117,9 @@ The lane endpoint keeps at most one accepted link per (deviceId, laneId).
 
 When a second link presents a grant that passes steps 1 to 6 while a link for the same (device, lane) is live:
 
-1. The endpoint sends a Paseo-level ping on the existing link and waits up to 5 s.
-2. **Existing link does not answer:** it is treated as dead (the member's own reconnect after a network change). It is closed, the new link is accepted.
-3. **Existing link answers:** two live holders of the same grant exist. The endpoint closes **both** links, removes `current[(deviceId, laneId)]` (so the gid stops working everywhere), and the host appends `grant.suspected-theft {memberId, deviceId, laneId, gid}`. The owner sees a notice. The member's device gets an event on its room session and re-issues through proof of possession; a thief cannot.
+1. The endpoint watches the existing link for 12 s. Any inbound frame in that window counts as an answer. (Written in after I-10, answering Q2 by reading the 0.13.2 server and client packages, not by a run: the destination side has no Paseo-level ping that the source answers, but the source's `DaemonClient` sends its own liveness ping every 10 s. The original 5 s window would miss it.)
+2. **Existing link sends nothing in 12 s:** it is treated as dead (the member's own reconnect after a network change). It is closed, the new link is accepted.
+3. **Existing link sends a frame:** two live holders of the same grant exist. The endpoint closes **both** links, removes `current[(deviceId, laneId)]` (so the gid stops working everywhere), and the host appends `grant.suspected-theft {memberId, deviceId, laneId, gid}`. The owner sees a notice. The member's device gets an event on its room session and re-issues through proof of possession; a thief cannot.
 
 ### 6.2 Status reports with link identity
 
@@ -131,7 +132,7 @@ H→M { t:"grant.status.ok", re, gid, links: [ { since: <unix ms>, routes: <n> }
 
 ### 6.3 Member-side report
 
-If the member sees a live link it cannot account for (registration offline while the lane reports a link, or `since` far from its own connection time), it sends:
+If the member sees a live link it cannot account for, it sends the report below. Written in after I-10: the trigger is that the member saw its own registration offline for at least 30 s while the lane reports a link. It never reports when it does not know when its registration was online (for example right after a start), and a `since` far from its own connection time alone does not trigger a report; it only stops the idle deferral of section 5, so the grant rotates. This avoids reports caused by clock conversion.
 
 ```
 M→H { t:"grant.report", id, laneId, gid, reason: "unaccounted_link" }
@@ -158,7 +159,9 @@ Every operation that reduces access (member removed or left, device removed, lan
 
 ### 7.2 Failure handling
 
-- If step 3 or 4 fails, the in-memory state stays revoked (access remains cut while the process runs). The RPC returns `persist_failed`, not success. The Rooms UI shows a persistent error: "Access was cut, but the change could not be saved. It will be lost if the daemon restarts. Free disk space or fix permissions." The host retries every 10 s and clears the error on success.
+- Roster-driven reductions (member or device removed, member left, role lowered, lane access removed, lane closed) log only the reducing statement itself in step 4; no separate `grant.revoked` entry is written (written in after I-10).
+- If step 3 fails, the in-memory state stays revoked (access remains cut while the process runs). The RPC returns `persist_failed`, not success. The Rooms UI shows a persistent error: "Access was cut, but the change could not be saved. It will be lost if the daemon restarts. Free disk space or fix permissions." The host retries every 10 s and clears the error on success.
+- If step 4 fails (the log append), the room host stops (`room-log-v2.md` section 8), as for any failed append: access stays cut by the endpoint's in-memory state, the owner sees `room_stopped`, and the append is not retried; reopening the room re-folds the log (written in after I-10).
 - If the daemon restarts before a successful persist, the revocation is lost and the member's next grant check passes again. The owner saw `persist_failed` and the persistent error, so the loss is visible. A revocation the owner saw succeed is durable (section 7.3).
 - Enforcement in step 2 never waits for the member: the member daemon learns of revocation from its session (`access_ended`) or from the link failure (Paseo reports it 5 to 7 s later, M1 open issue 2).
 - **Unreachable lane endpoints** (S-23). With the embedded host, the lane endpoints share the host's process, so step 2 cannot miss them. A standalone lane gateway (later) keeps a connection to the host. When it (re)connects, it fetches the full allowlist and the revocation list before it accepts any link, and it accepts no link while it has none. After 60 s without contact with the host it stops accepting new links and closes existing ones (fail closed), until it has fetched the current allowlist again. So a push that missed a disconnected gateway cannot leave a revoked grant usable until its `exp`.
@@ -229,7 +232,7 @@ Other resource limits (frame sizes, queues) are hardening item B3 and not repeat
 
 Resolved and moved to `README.md` section 7 (decisions log): former Q1 (12 h grants, idle-preferred rotation, forced at 75 %). Question numbers are kept stable.
 
-- **Q2.** The 5 s ping in 6.1 needs a Paseo-level ping on a connected-host link. Confirm that the 0.13.2 link protocol has one the destination side can send; otherwise use the relay's socket liveness only (weaker: a half-open socket looks alive until TCP times out).
+- **Q2.** Answered after I-10 by source reading (not run): there is no ping the destination side can send, so 6.1 watches the existing link for 12 s and counts the source's own 10 s liveness ping. Still to confirm on a live relay run.
 - **Q3.** Should a suspected theft also rotate the lane endpoint key (evicting everyone who ever saw the lane offer)? Proposed: only on the second event (6.4), because rotation disrupts every member of the lane.
 
 ## 13. What viewers see: errors and project names

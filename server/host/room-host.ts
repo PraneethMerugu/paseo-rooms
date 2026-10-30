@@ -20,8 +20,9 @@
 // - I-13: `appendMls` sequences MLS messages (`mls.commit`, `mls.app`), and `submitWithCommit` writes a
 //   `device.rekey.approved` and its commit as two adjacent entries in one durable write, or neither.
 //
-// Not here (later milestones): host key rotation (the host refuses a host.key.rotated naming a key it
-// does not hold; I-12).
+// Not here (later milestones): creating a new endpoint for rotation (I-12). The host refuses a
+// host.key.rotated naming a key it does not hold, and an endpoint.rotated naming an endpoint it does
+// not serve (keys 4.5, 4.6; decision round 9, item 2).
 import * as fs from "node:fs";
 import nodePath from "node:path";
 import { z } from "zod";
@@ -59,13 +60,19 @@ const Seed = b64uBytes(32);
  * endpoint keys). The genesisHash is pinned here, inside the AEAD, so a swapped genesis.json is
  * detected. Secrets are 32-byte seeds in b64u; the file is only ever written sealed.
  */
+const RoomEndpointKey = z.strictObject({ serverId: z.string().refine((s) => isServerId("roomEndpoint", s)), kid: Kid, secret: Seed });
 const HostKeys = z.strictObject({
   v: z.literal(2),
   typ: z.literal("host-keys"),
   roomId: RoomId,
   genesisHash: b64uBytes(32),
   hostKeys: z.array(z.strictObject({ kid: Kid, seed: Seed })).min(1).max(64),
-  endpoint: z.strictObject({ serverId: z.string().refine((s) => isServerId("roomEndpoint", s)), kid: Kid, secret: Seed }),
+  endpoint: RoomEndpointKey,
+  /**
+   * A new endpoint created for a rotation (keys 4.6 step 1) and not yet installed by
+   * `endpoint.rotated`. Written by the I-12 rotation; absent until then.
+   */
+  endpointNext: RoomEndpointKey.optional(),
   lanes: z.record(z.string(), z.strictObject({ kid: Kid, secret: Seed })),
 });
 export type HostKeys = z.infer<typeof HostKeys>;
@@ -90,6 +97,12 @@ export function readHostKeys(dataDir: string, kek: Kek, roomId: string): HostKey
   } finally {
     plain.fill(0);
   }
+}
+
+/** The room endpoints a host serves: the current one and one created for a rotation (keys 4.6). */
+export function servedEndpoints(keys: HostKeys | null): { serverId: string; kid: string }[] {
+  if (!keys) return [];
+  return [keys.endpoint, ...(keys.endpointNext ? [keys.endpointNext] : [])].map((e) => ({ serverId: e.serverId, kid: e.kid }));
 }
 
 /** genesis.json: the RJCS text of the signed genesis. Plaintext and public; pinned by hash in keys.sealed. */
@@ -210,7 +223,7 @@ export type DecideListener = (next: Readonly<RoomState>, prev: Readonly<RoomStat
 export type SubmitRejection = "stale_base" | "unknown_base" | "not_permitted";
 export type SubmitResult =
   | { ok: true; receipt: SignedEntry }
-  | { ok: false; code: SubmitRejection; reason: FoldReason | "bad_statement" | "unknown_type" | "submit_only_with_commit" | "host_statement" | "host_key_not_held"; message: string; head: SignedEntry | null };
+  | { ok: false; code: SubmitRejection; reason: FoldReason | "bad_statement" | "unknown_type" | "submit_only_with_commit" | "host_statement" | "host_key_not_held" | "endpoint_not_served"; message: string; head: SignedEntry | null };
 
 /** Fold reasons that mean "the state moved" (section 2): a `ver` (or KeyChange.old) or the forward-base rule. */
 const STALE_REASONS = new Set<FoldReason>(["stale_version", "base_regressed"]);
@@ -378,6 +391,21 @@ export class RoomHost {
       const newSig = (sb.data as { change: { newSig: string | null } }).change.newSig;
       if (!newSig || !this.signers.has(kidOf("ed25519", b64uDecode(newSig, 32)))) {
         return this.reject("not_permitted", "host_key_not_held", "the host does not hold the new host key");
+      }
+    }
+    if (sb.type === "endpoint.rotated") {
+      // Keys 4.6 step 1: the host creates and serves the new endpoint first. Sequencing a rotation to
+      // an endpoint nobody answers would send every member to a dead address (round 9, item 2).
+      // Read at submit time (a rare statement), so an endpoint created after open counts.
+      const d = sb.data as { serverId: string; dh: { kid: string } };
+      let served: { serverId: string; kid: string }[] = [];
+      try {
+        served = servedEndpoints(readHostKeys(this.opts.dataDir, this.opts.kek, this.roomId));
+      } catch {
+        // An unreadable key file serves nothing; refusing is the safe answer.
+      }
+      if (!served.some((e) => e.serverId === d.serverId && e.kid === d.dh.kid)) {
+        return this.reject("not_permitted", "endpoint_not_served", "the host does not serve the named endpoint");
       }
     }
     return this.sequence(sb, body);

@@ -7,7 +7,9 @@
 //
 // MLS (I-13), between the device link and the removal: the owner's device, A and B exchange room group
 // messages (random markers); after the removal the owner's next message is at an epoch A and B never
-// reach; no marker appears in any file. The run script sets PASEO_ROOMS_DEV_MLS_FAST=1 (DEV-ONLY timers).
+// reach; no marker appears in any file. The run script sets PASEO_ROOMS_DEV_MLS_FAST=1 (DEV-ONLY timers:
+// witness and joiner check), which keeps the production repair delay (60 s plus jitter), so A's and B's
+// group joins measure the admitting admin daemon's prompt Add (round 9, item 5).
 //
 // Grants are short: the run script sets PASEO_ROOMS_DEV_SHORT_GRANTS=1 and
 // PASEO_ROOMS_DEV_GRANT_TTL_S (40 s): idle rotation at 20 s, forced at 30 s.
@@ -249,6 +251,11 @@ async function main() {
     return j?.status === "open" ? { j, join: st.joining.find((r: any) => r.roomId === roomId) } : null;
   }, 30_000, 250));
   check("admitted: member room session open", joinedOk.ok, joinedOk.ok ? { ms: Date.now() - t1, memberId: joinedOk.value.j.memberId } : { error: joinedOk.error });
+  // Prompt Add (round 9, item 5): the owner's admin daemon adds A to the room group as soon as A has
+  // published KeyPackages, not after the 60 s repair delay.
+  const groupOf = async (c: any) => (await rpc(c, "rooms.v2.status", {})).mls.find((r: any) => r.roomId === roomId);
+  const aGroup = await attempt(() => until("A in the room group", async () => ((await groupOf(m))?.inGroup ? Date.now() - t1 : null), 55_000, 100));
+  check("prompt Add: A is in the room group well under the 60 s repair delay after admission", aGroup.ok && aGroup.value < 20_000, aGroup.ok ? { ms: aGroup.value, repairDelayMs: 60_000 } : { error: aGroup.error });
   const ownerView = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
   const memberJoined = (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
   check("owner sees the member in the roster and the invite used", ownerView?.members === 2 && ownerView.invites[0]?.state === "used" && ownerView.joinRequests[0]?.memberId === memberJoined?.memberId, { members: ownerView?.members, invite: ownerView?.invites[0]?.state });
@@ -358,7 +365,7 @@ async function main() {
   const held = await attempt(() => until("B held", async () => ((await bJoin())?.state === "held" ? bJoin() : null), 30_000));
   const req = await until("owner sees the held add", async () => (await ownerRoom())?.deviceRequests.find((r: any) => r.kind === "add" && r.status === "pending"), 10_000);
   check("both confirmed: device.added logged and B held", held.ok, held.ok ? { seq: req.seq } : { error: held.error });
-  check("A is the member's only device and not young: the hold is 72 h", req.sole === true && req.young === false && req.effectiveAfter === req.hts + 72 * HOUR && req.memberId === mv.memberId, { sole: req.sole, young: req.young, holdH: (req.effectiveAfter - req.hts) / HOUR });
+  check("A is the member's only device and not young: the hold is 72 h", req.sole === true && req.young === false && req.effectiveAfter >= req.hts + 72 * HOUR && req.effectiveAfter < req.hts + 72 * HOUR + 10_000 && req.memberId === mv.memberId, { sole: req.sole, young: req.young, holdH: (req.effectiveAfter - req.hts) / HOUR });
   check("device A shows the request to its person (Was this you?)", (await aJoined())?.deviceRequests.some((r: any) => r.ref === req.ref && r.status === "pending"), {});
   await rpc(o, "rooms.v2.test.clock.advance", { ms: 71 * HOUR });
   await sleep(2500); // longer than the admin daemon's approval interval
@@ -368,6 +375,7 @@ async function main() {
   await rpc(o, "rooms.v2.test.clock.advance", { ms: HOUR + 5000 });
   const approved = await attempt(() => until("approved", async () => (await ownerRoom())?.deviceRequests.find((r: any) => r.ref === req.ref && r.status === "approved"), 15_000));
   check("after 72 h the admin daemon approves automatically (device.add.approved, mode auto)", approved.ok, approved.ok ? { ms: Date.now() - t3 } : { error: approved.error });
+  const tApproved = Date.now();
   const bOpen = await attempt(() => until("B session open", async () => {
     const j = (await rpc(m2, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
     return j?.status === "open" ? j : null;
@@ -383,11 +391,13 @@ async function main() {
   check("owner sees live sessions of both devices of the member", sessionsNow.some((x: any) => x.deviceId === mv.deviceId) && sessionsNow.some((x: any) => x.deviceId === req.deviceId), { sessions: sessionsNow.length });
   const bGrant = await attempt(() => until("B's own lane grant", async () => (await ownerRoom())?.grants.find((g: any) => g.deviceId === req.deviceId && g.laneId === laneId), 60_000));
   check("B gets its own lane grant (per device)", bGrant.ok, bGrant.ok ? {} : { error: bGrant.error });
+  const bGroup = await attempt(() => until("B in the room group", async () => ((await groupOf(m2))?.inGroup ? Date.now() - tApproved : null), 55_000, 100));
+  check("prompt Add: B is in the room group well under the 60 s repair delay after the approval", bGroup.ok && bGroup.value < 20_000, bGroup.ok ? { ms: bGroup.value, repairDelayMs: 60_000 } : { error: bGroup.error });
 
   // ------------------------------------------------------------ MLS room group (I-13)
   // The owner's own device (in process, no relay session), device A and device B are leaves of the room
-  // group: the owner's device created it and committed the adds. The dev runtime runs with
-  // PASEO_ROOMS_DEV_MLS_FAST=1 (repair delay 0, joiner check 5 s), so this takes seconds. The texts are
+  // group: the owner's device created it and committed the adds at once (prompt Add). The dev runtime
+  // runs with PASEO_ROOMS_DEV_MLS_FAST=1 (witness within 1 s, joiner check 5 s). The texts are
   // random markers; the scan at the end looks for them in every file.
   const mlsOf = async (c: any) => (await rpc(c, "rooms.v2.status", {})).mls.find((r: any) => r.roomId === roomId);
   const textsOf = async (c: any) => ((await rpc(c, "rooms.v2.mls.messages", { roomId })).messages as any[]).map((x) => x.text);
@@ -396,12 +406,14 @@ async function main() {
     return v.every((x) => x?.inGroup && x.leaves === 3 && x.epoch === v[0].epoch && x.canSend) ? v : null;
   }, 60_000, 500));
   check("MLS: owner device, A and B are in the room group at one epoch and may send", groupUp.ok, groupUp.ok ? { epoch: groupUp.value[0].epoch, joins: groupUp.value.map((x: any) => x.join) } : { error: groupUp.error, views: await Promise.all([o, m, m2].map(mlsOf)) });
-  // A joined a group of two leaves: only the owner's device could confirm its epoch, so the joiner check
-  // ends with epoch_unconfirmed (two other leaves are needed, see member.ts). B joined with two others.
-  for (const [label, c, allowed] of [["owner", o, []], ["A", m, ["epoch_unconfirmed"]], ["B", m2, []]] as const) {
+  // A joined a group of two leaves: min(2, other leaves) = 1, so the owner's device confirms its epoch
+  // alone (round 9, item 4) and A has no epoch_unconfirmed. B joined with two others and needs both.
+  for (const [label, c] of [["owner", o], ["A", m], ["B", m2]] as const) {
     const alerts = ((await mlsOf(c))?.alerts ?? []) as { type: string }[];
-    check(`MLS: no group alerts on ${label}${allowed.length ? " except epoch_unconfirmed" : ""}`, alerts.every((a) => (allowed as readonly string[]).includes(a.type)), { alerts });
+    check(`MLS: no group alerts on ${label}`, alerts.length === 0, { alerts });
   }
+  const aJoinState = (await mlsOf(m))?.join;
+  check("MLS: A's epoch (two-leaf group) is confirmed by the one other leaf", aJoinState === "confirmed", { join: aJoinState });
   const bJoinState = (await mlsOf(m2))?.join;
   check("MLS: B's epoch is confirmed by the witnesses of two other leaves", bJoinState === "confirmed", { join: bJoinState });
   const mark = (w: string) => `e2e-mls-${w}-${randomUUID()}`;

@@ -26,7 +26,7 @@ import { adminKeyPath, adminKeyPurpose, AdminSigner, AdminSignerError, adminStat
 import { bodyHash } from "../../server/authority/entries";
 import { verifyGenesis } from "../../server/authority/genesis";
 import { STATEMENT_TYPES, type SignedStatement, type StatementType } from "../../server/authority/statements";
-import { RoomHost, RoomHostError, genesisPath, hostKeysPath, hostKeysPurpose, HOST_STATEMENT_TYPES, SECURITY_EVENTS } from "../../server/host/room-host";
+import { readHostKeys, RoomHost, RoomHostError, writeHostKeys, genesisPath, hostKeysPath, hostKeysPurpose, HOST_STATEMENT_TYPES, SECURITY_EVENTS } from "../../server/host/room-host";
 import { BODIES_FILE, ENTRIES_FILE, hostLogDir, RoomLogCorruptError } from "../../server/host/room-log-store";
 import { openKeyStore, type Kek } from "../../server/keystore/keystore";
 import { SealedFileError } from "../../server/keystore/sealed";
@@ -84,6 +84,17 @@ async function newRoom(env: Env, extra: Partial<Parameters<typeof createRoom>[0]
 
 function reopen(env: Env, roomId: string, lock: object = NO_TIMER): Promise<RoomHost> {
   return RoomHost.open({ dataDir: env.dataDir, kek: env.kek, roomId, now: env.now, lock });
+}
+
+/** Keys 4.6 step 1, as the I-12 rotation will do it: the host creates the next endpoint in its key file. */
+function stageEndpoint(env: Env, roomId: string): { serverId: string; dh: ReturnType<typeof newX> } {
+  const secret = randomBytes(32);
+  const pub = rawPublicKey(x25519PrivateKeyFromSecret(secret));
+  const dh = { alg: "x25519" as const, kid: kidOf("x25519", pub), pub: b64u(pub) };
+  const serverId = newServerId("roomEndpoint");
+  const keys = readHostKeys(env.dataDir, env.kek, roomId)!;
+  writeHostKeys(env.dataDir, env.kek, { ...keys, endpointNext: { serverId, kid: dh.kid, secret: b64u(secret) } });
+  return { serverId, dh };
 }
 
 /** Interactive admin action through the confirmation token, then stmt.submit; returns the receipt seq. */
@@ -515,7 +526,13 @@ test("4.6 (P-27): every security event is in the notice table, and each appears 
     adminDo(host, signer, "admin.added", keyChange(roomId, { kind: "admin", id: signer.memberId }, null, b));
     adminDo(host, signer, "lane.created", { laneId, owner: signer.memberId, offer: { serverId: newServerId("laneEndpoint"), dh: newX(), relay: RELAY }, visibility: "room" });
     adminDo(host, signer, "lane.offer.rotated", { laneId, offer: { serverId: newServerId("laneEndpoint"), dh: newX(), relay: RELAY }, ver: host.state.auth.versions[`laneOffer:${laneId}`] });
-    adminDo(host, signer, "endpoint.rotated", { serverId: newServerId("roomEndpoint"), dh: newX(), relay: RELAY, ver: -1 });
+    // Round 9, item 2: only an endpoint the host serves; then the staged one.
+    const unserved = signer.prepare({ type: "endpoint.rotated", data: { serverId: newServerId("roomEndpoint"), dh: newX(), relay: RELAY, ver: -1 }, base: host.head });
+    const unservedStmt = signer.confirm(unserved.confirmToken);
+    const refused = host.submit(unservedStmt);
+    assert.ok(!refused.ok && refused.code === "not_permitted" && refused.reason === "endpoint_not_served");
+    signer.settle(bodyHash(rjcs(unservedStmt)), { rejected: true });
+    adminDo(host, signer, "endpoint.rotated", { ...stageEndpoint(env, roomId), relay: RELAY, ver: -1 });
     adminDo(host, signer, "invite.created", { inviteRef: ref, role: "watch", lanes: [], exp: Math.floor(T0 / 1000) + 3600 });
     const bobDev = { deviceId: newId("device"), kind: "person" as const, sig: newEd().pub, dh: newX().pub };
     adminDo(host, signer, "member.admitted", { member: { memberId: bob, role: "watch", lanes: [], devices: [bobDev] }, confirmation: { method: "sas6", inviteRef: ref, transcript: b64u(randomBytes(32)) } });

@@ -383,6 +383,53 @@ test("equivocation is detected from two signed heads; a claim without evidence i
   }
 });
 
+test("enrollment 5.7 (round 9, item 3): pre-admission entries must be in the fetched log with the same hash", async () => {
+  const env = await setup();
+  try {
+    const d = newDevice();
+    const admittedAt = admit(env, d);
+    const keys = readHostKeys(env.dataDir, env.kek, env.room.roomId)!;
+    const hostPriv = ed25519PrivateKeyFromSeed(b64uDecode(keys.hostKeys[0].seed, 32));
+    const signEntry = (entry: SignedEntry["entry"]): SignedEntry => ({ entry, hash: entryHash(entry), hsig: b64u(sign(hostPriv, CTX_LOG_ENTRY, rjcs(entry))) });
+
+    // Matching anchors: no alert, all checked.
+    const ok = client(env, d);
+    await ok.connect();
+    const real = ok.entry(admittedAt)!;
+    const first = ok.entry(0)!;
+    ok.close();
+    const c1 = client(env, d, { anchors: [{ source: "authority_chain", signed: first }, { source: "admission", signed: real }] });
+    await c1.connect();
+    assert.deepEqual(c1.alerts, []);
+    assert.equal(c1.uncheckedAnchors, 0);
+    assert.equal(c1.sendingStopped, false);
+    c1.close();
+
+    // A chain entry the host showed before admission differs from the log's entry at that seq: fork,
+    // with the two host-signed entries as the proof.
+    const forged = signEntry({ ...first.entry, bodyHash: b64u(randomBytes(32)) });
+    const c2 = client(env, d, { anchors: [{ source: "authority_chain", signed: forged }] });
+    await c2.connect();
+    const fork = c2.alerts.find((a) => a.type === "fork")!;
+    assert.ok(fork, "fork raised");
+    assert.equal(fork.seq, 0);
+    assert.equal(fork.reason, "pre_admission:authority_chain");
+    assert.ok(isEquivocationProof(fork.proof[0], fork.proof[1], (kid) => (kid === keys.hostKeys[0].kid ? rawPublicKey(hostPriv) : null)));
+    assert.equal(c2.sendingStopped, true);
+    c2.close();
+
+    // An admission entry beyond the host's head: the host signed it and no longer serves it.
+    const head = env.room.host.headEntry!;
+    const ahead = signEntry({ ...head.entry, seq: head.entry.seq + 1, prev: head.hash });
+    const c3 = client(env, d, { anchors: [{ source: "admission", signed: ahead }] });
+    await c3.connect();
+    assert.deepEqual(c3.alerts.map((a) => [a.type, a.reason]), [["truncation", "pre_admission:admission"]]);
+    assert.equal(c3.sendingStopped, true);
+  } finally {
+    await env.cleanup();
+  }
+});
+
 test("session timers: pings keep a quiet session alive; repeated eviction is logged as endpoint.evicted", async () => {
   const env = await setup({ timings: { ...FAST, pingAfterMs: 60, idleCloseMs: 200 }, evictionThreshold: 1 });
   try {

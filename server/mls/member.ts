@@ -18,11 +18,15 @@
 //   checks the authority extension and the tree against it, then the epoch anchors of later messages.
 //   ts-mls 1.6.4 exposes neither the GroupInfo signer nor the sender of an application message through
 //   its public API; the sender is derived from the secret tree (adapter.ts), and an epoch counts as
-//   confirmed once decryptable messages with the joiner's anchor came from two other leaves, so at
-//   least one of them is not the GroupInfo signer (a stricter reading of 5.1).
+//   confirmed once decryptable messages with the joiner's anchor came from min(2, other leaves) other
+//   leaves (5.1; decision round 9, item 4): with two or more other leaves at least one confirmer is not
+//   the GroupInfo signer; in a group of two the only other leaf confirms alone.
 // - Committing (4.2, 4.4, 6.3): a commit carries every pending removal (old-key leaves included) and the
-//   pending adds it has a valid KeyPackage for. Removals are committed at once (`pending_remove`); adds
-//   after the repair delay (60 s, plus up to 60 s at random for devices that are not admins). Every
+//   pending adds it has a valid KeyPackage for. Removals are committed at once (`pending_remove`). The
+//   admitting admin daemon adds a device it admitted at once (`promptAdd`, 4.4; decision round 9, item
+//   5): when the admission is logged and again whenever that device publishes KeyPackages. Any other
+//   pending add waits for the repair delay (60 s, plus up to 60 s at random for devices that are not
+//   admins), which is only the fallback. Every
 //   fetched KeyPackage is checked against the reference roster before use (6.4). The device runs the
 //   4.2 checks on its own result before it submits.
 // - Admin route (4.4): `approveRekey` fetches the device's `rekey` package, signs `device.rekey.approved`
@@ -65,7 +69,8 @@ export interface MlsLink {
 }
 
 type KpRecord = { ref: string; pool: "current" | "rekey"; lastResort: boolean; sig: string; pub: string; priv: { init: string; hpke: string; sig: string }; at: number };
-type JoinRecord = { seq: number; epoch: number; at: number; anchor: string; confirmers: string[]; status: "pending" | "confirmed" | "unconfirmed" | "fork" };
+/** `needed`: confirming leaves required, min(2, other leaves) at the join (absent in older records: 2). */
+type JoinRecord = { seq: number; epoch: number; at: number; anchor: string; confirmers: string[]; needed?: number; status: "pending" | "confirmed" | "unconfirmed" | "fork" };
 
 /** Sealed per device and group (8.1). Holds private keys: never logged. */
 export type MemberRecord = {
@@ -171,6 +176,10 @@ export class MlsMember {
   private welcomeCache: { welcome: Uint8Array; entry: SignedEntry } | null = null;
   private expectCommitAt = -1;
   private addSeen = new Map<string, number>();
+  /** Devices this admin daemon admitted, still pending adds (round 9, item 5). */
+  private readonly promptEligible = new Set<string>();
+  /** Eligible devices to try now: armed at admission and when the device publishes KeyPackages. */
+  private readonly promptArmed = new Set<string>();
   private witnessAt: number | null = null;
   private anchorsSeen = new Map<number, Set<string>>();
   private retryAt = 0;
@@ -331,6 +340,26 @@ export class MlsMember {
       }
       this.checkJoinTimeout();
     });
+  }
+
+  /**
+   * Prompt Add (4.4; decision round 9, item 5): this admin daemon just logged the admission of these
+   * devices. Each is added to the group at the next maintenance pass, and again whenever it publishes
+   * KeyPackages, until a commit adds it; the repair delay stays the fallback for everyone else.
+   */
+  promptAdd(deviceIds: readonly string[]): void {
+    for (const id of deviceIds) {
+      this.promptEligible.add(id);
+      this.promptArmed.add(id);
+    }
+    if (deviceIds.length > 0) void this.maintain().catch(() => undefined);
+  }
+
+  /** The delivery service stored `current` KeyPackages of this device (the host side calls this). */
+  packagesPublished(deviceId: string): void {
+    if (!this.promptEligible.has(deviceId)) return;
+    this.promptArmed.add(deviceId);
+    void this.maintain().catch(() => undefined);
   }
 
   /** Prepares a rekey (keys-rotation-recovery 4.1 step 2): publishes `rekey` KeyPackages under the new key. */
@@ -622,7 +651,7 @@ export class MlsMember {
     if (aad.epochAuth === j.anchor) {
       if (decrypted && sender && sender.deviceId !== this.o.deviceId && !j.confirmers.includes(sender.deviceId)) {
         j.confirmers = [...j.confirmers, sender.deviceId];
-        if (j.confirmers.length >= 2 && (j.status === "pending" || j.status === "unconfirmed")) {
+        if (j.confirmers.length >= (j.needed ?? 2) && (j.status === "pending" || j.status === "unconfirmed")) {
           j.status = "confirmed";
           log("mls_epoch_confirmed", { roomId: this.o.roomId, epoch });
         }
@@ -720,7 +749,10 @@ export class MlsMember {
       this.nextDevice = null;
     }
     const epoch = this.o.adapter.epoch(state);
-    this.rec.join = { seq: e.seq, epoch, at: this.now(), anchor: this.anchor(), confirmers: [], status: "pending" };
+    // 5.1 (round 9, item 4): min(2, other leaves) confirmers. No other leaf cannot happen (the committer
+    // stays a leaf); it would leave nothing to compare with, so the epoch counts as confirmed.
+    const needed = Math.min(2, (leaves ?? []).filter((l) => l.deviceId !== this.o.deviceId).length);
+    this.rec.join = { seq: e.seq, epoch, at: this.now(), anchor: this.anchor(), confirmers: [], needed, status: needed === 0 ? "confirmed" : "pending" };
     this.rec.cursor = e.seq;
     this.save();
     await ack();
@@ -746,16 +778,24 @@ export class MlsMember {
       if (!this.addSeen.has(k)) this.addSeen.set(k, now + this.t.repairDelayMs + (this.isAdmin(st) ? 0 : Math.floor(this.random() * this.t.repairJitterMs)));
     }
     for (const k of [...this.addSeen.keys()]) if (!seen.has(k)) this.addSeen.delete(k);
-    const dueAdds = removalsOnly ? [] : pend.adds.filter((a) => (this.addSeen.get(`${a.deviceId}/${a.deviceSig}`) ?? Infinity) <= now && now >= this.retryAt);
+    // Prompt adds (round 9, item 5): an armed device this daemon admitted is tried now, once per arming.
+    const pendingIds = new Set(pend.adds.map((a) => a.deviceId));
+    for (const id of [...this.promptEligible]) if (!pendingIds.has(id)) (this.promptEligible.delete(id), this.promptArmed.delete(id));
+    const prompt = new Set(removalsOnly ? [] : pend.adds.filter((a) => this.promptArmed.has(a.deviceId)).map((a) => a.deviceId));
+    for (const id of prompt) this.promptArmed.delete(id);
+    const dueAdds = removalsOnly ? [] : pend.adds.filter((a) => prompt.has(a.deviceId) || ((this.addSeen.get(`${a.deviceId}/${a.deviceSig}`) ?? Infinity) <= now && now >= this.retryAt));
     if (pend.removals.length === 0 && dueAdds.length === 0) return;
     const link = this.o.link();
     if (!link) return;
     const adds: MlsKeyPackage[] = [];
+    let repairMissed = false;
     for (const a of dueAdds.slice(0, 8)) {
       const kp = await this.fetchPackage(link, { memberId: a.memberId, deviceId: a.deviceId, for: "current" }, ref);
       if (kp) adds.push(kp);
+      // A prompt add without a package waits for the device's kp.publish, not for the retry timer.
+      else if (!prompt.has(a.deviceId)) repairMissed = true;
     }
-    if (dueAdds.length > 0 && adds.length < dueAdds.length) this.retryAt = now + this.t.retryMs;
+    if (repairMissed) this.retryAt = now + this.t.retryMs;
     if (pend.removals.length === 0 && adds.length === 0) return;
     const built = await this.buildCommit(ref, this.latest.head, adds, pend.removals.map((l) => l.leafIndex));
     this.pendingOwn = { bodyHash: bodyHash(built.commit), newState: built.newState, adds: adds.length };

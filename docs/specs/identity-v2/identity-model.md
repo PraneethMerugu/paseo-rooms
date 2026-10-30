@@ -3,6 +3,7 @@
 - **Status:** proposed specification, not implemented. Independently reviewed on 2026-10-29 (`review/identity-v2-review.md`), revised, re-reviewed (`review/identity-v2-rereview.md`) and revised again under decisions round 4 (`README.md` section 10). Decision round 5, item 3 extends the 72 h sole-device hold to rekeys (section 6.3). Decision round 6: the admin daemon that approves a device rekey also applies it in MLS (section 5.3; `mls-integration.md` section 4.4). A targeted check of the R findings follows before code (decisions round 4, item 4).
 - **Resolves:** A2 (P-3, P-29), A3 (P-4, P-14), A6 in part (P-22), A8 (P-2, M-6).
 - **Depends on:** `signatures-and-encoding.md` for every byte format named here.
+- **Revised** 2026-10-30 (`README.md` section 10.5): the admin daemon's hold clock (6.3), the I-11 link choices (6.4), storage (7.1).
 
 ## 1. Scope
 
@@ -270,6 +271,7 @@ A member adds a device by **device linking** (protocol in section 6.4). It reuse
    - **`"same-person"` (default):** the add is **held for 24 hours** (decision round 3), or **72 hours when A is the member's only active device** (decision round 4, item 2). During the hold, every active device of the member, including A, shows "A new device, *<label>*, will join your membership in this room at *<time>*. Was this you?" with a **Not me** button. Every member sees "Sam is adding a device". When the hold passes with no veto, the admin's daemon signs `device.add.approved {mode: "auto"}` without a prompt. The owner gets a notification and every member sees "Sam added a device" with the key-change marker.
    - **Sole device.** When A is the member's only active device, the admins' notification is marked as such: "Sam has only one device in this room, and it is adding another. If Sam did not ask for this, remove the device." The room notice says the same. Org policy can set `soleDeviceChange = "admin"` (section 5.2.1), so these adds wait for an interactive admin approval instead of the 72 h hold.
    - **Not me** signs `device.add.vetoed`. The add is cancelled, so B never joins. The member is flagged with a **device conflict**: no automatic approval happens for that member until an admin signs `device.conflict.resolved`, and the admins see "Sam's devices disagree about a new device. One of them may be stolen." The veto removes no device. The admin decides which device, if any, to remove.
+   - **Whose clock** (written in after I-11, required on 2026-10-30). The admin daemon times every hold on its **own clock, from when it first saw the request**, not from the request entry's `hts`. It records the first sighting of each pending request when the entry reaches its fold, keeps these times in `admin/<roomId>/holds.sealed` across restarts, and signs `device.add.approved {mode: "auto"}` only when both its own hold and the `hts` hold the fold checks (`room-log-v2.md` section 5) have passed. A host that back-dates a request's `hts` therefore cannot shorten the hold. A lost or unreadable file makes every pending request first seen at the next start, which only lengthens holds. In the embedded deployment host and admin daemon share one clock and the two times differ by milliseconds; a standalone host is where the rule matters. The time shown to the member's devices (`effectiveAfter` of `enroll.held`) is the `hts` end; the admin's view shows the later of the two.
    - **Young devices cannot auto-add.** A device that has been active for less than 24 hours cannot request an automatically approved add. Its requests wait for an admin. Otherwise a thief could add B, wait out the hold, and use B to add C, timing each hop to land after the person stops watching.
    - **`"admin"`:** every device add needs an interactive admin approval (section 5.3, `mode: "admin"`), with no hold. Org policy can force this value (section 5.2.1). An admin can also approve a held add early, interactively.
    - **Admin approval is always required** when the person has no active device in the room (re-admission after losing every device, `keys-rotation-recovery.md` section 6.1), and for `member.device.replaced`. These go through an invite and SAS with the admin.
@@ -329,6 +331,20 @@ LinkRecord = { linkId, tokenKey, memberId, createdBy: deviceId, createdAt, exp,
 
 The host tells A when a pending enrollment on its link ends: `link.closed { linkId, pendingId, reason }`, with `reason` as in `enroll.closed` plus `"abandoned"`.
 
+**Replies and edge cases** (written in after I-11; each request needs a reply for the sender's request timer, as in `enrollment-v2.md` section 5.2):
+
+- `device.link.create.ok { re, receipt }` carries the log receipt of `device.link.created`; `link.nonce.ok`, `link.confirm.ok` and `link.abort.ok` are `{ t, re }`. `link.abort.reason` is `"sas_mismatch"`, `"attempts"` (A's limit reached, or a changed re-push of a pinned `pendingId`) or `"cancelled"` (a `link.reveal` whose `Nm` does not open the pinned commitment, or whose `newKeySig` does not verify, seen by A). Each burns the link on A.
+- B's `enroll.request` for a link gets no reply until A's `link.nonce`; the host then sends `enroll.pending` with that request's `re`. A retry after B's 30 s request timeout resumes the same pending and waits again. `enroll.resume.ok` for a held pending carries `state: "held"` and the `enroll.held` frame.
+- `terms` of a link pending are the member's role and lanes at the moment of `link.nonce`.
+- The host verifies B's `newKeySig` at `sas.reveal`; a bad one closes the attempt as abandoned. Before it logs `device.added`, the host requires A's statement data to equal exactly what the pinned inputs give (keys, `linkRef`, transcript).
+- The host re-pushes `link.request` and `link.reveal` when A's session opens, so an A that was offline still sees them.
+- A pending link enrollment whose creator is no longer an active device is closed (`rejected`), and the creator's open links are marked revoked in the host's own state. No log entry records the latter, because the host may not sign `invite.revoked` (`room-log-v2.md` section 4.2).
+- A held add follows the fold after every append: approved admits B, vetoed closes `vetoed`, cancelled closes `rejected`, and the 48 h timeout of step 8 closes `timeout`.
+- A answers no request for a link more than 60 s past the link's `exp` on A's own clock; such a request does not count toward A's limits.
+- For a link, B checks `enroll.admitted` as in `enrollment-v2.md` section 5.7 with these differences: entry and statement type `device.add.approved`; its own `pendingId` and `deviceId` in the frame and in the data; `memberId` consistent; `ref` equal to the `bodyHash` of the held `device.added` entry; and `seq` after it. The held entry and the admission entry are pre-admission anchors (section 5.7 there).
+
+**Gaps found in I-11, not decided here** (README section 8, item 9): `invite.contested` names only `inviteRef`, so a second claimant of a link is refused with `invite_in_use` and nothing is logged; and `enroll.held.entry` is a signed entry without its body, so B cannot check the `memberId` of `device.added` before admission (the post-admission fold checks it).
+
 ```
 device.added.data = {
   memberId, device: DeviceEntry(B),
@@ -368,12 +384,16 @@ All rooms data lives under `$PASEO_HOME/plugin-data/rooms/`: owner-only on every
 | `keystore/kek.fallback` | only in fallback mode: the KEK (a DPAPI blob on Windows when available) | no (it is the KEK) | yes |
 | `member/rooms/<roomId>/keys.sealed` | device signing, DH and MLS keys for this room; for the creator, written at room creation together with the admin and host key files | yes | yes |
 | `member/rooms/<roomId>/state.sealed` | pinned `genesisHash`, authority state, roster, log heads, enrollment journal | yes | yes |
-| `member/rooms/<roomId>/mls.sealed` | encoded MLS group state | yes | yes |
+| `member/rooms/<roomId>/mls-<deviceId>.sealed` | encoded MLS group state of the room group, per device (the file name in I-13) | yes | yes |
 | `admin/<roomId>/admin-key.sealed` | admin key | yes | yes |
 | `admin/<roomId>/state.sealed` | the admin's outstanding signed statements (no receipt and no definite rejection yet), written before a statement is returned, so a restart still knows them (room-log-v2 section 2, forward base) | yes | yes |
+| `admin/<roomId>/holds.sealed` | when this admin daemon first saw each pending device request, on its own clock (section 6.3, "Whose clock") | yes | yes |
 | `host/<roomId>/keys.sealed` | host key, room endpoint key, lane endpoint keys, and the pinned `genesisHash` of the room | yes | yes |
 | `host/<roomId>/genesis.json` | the signed genesis, RJCS text; public | no (checked against the `genesisHash` pinned in `host/<roomId>/keys.sealed`) | yes |
-| `host/<roomId>/state.sealed` | invites (token keys), pending enrollments, grant allowlist | yes | yes |
+| `host/<roomId>/state.sealed` | invites (token keys), pending enrollments | yes | yes |
+| `host/<roomId>/grants.sealed` | grant allowlist and revocation list (`grants-v2.md` sections 7.3, 8) | yes | yes |
+| `host/<roomId>/lanes.sealed` | lane bindings: agent, workspace and label of each lane this host serves | yes | yes |
+| `host/<roomId>/mls.sealed` | delivery-service state: KeyPackage pools, KeyPackageRefs ever stored, Welcomes, acknowledgements (`mls-integration.md` section 6) | yes | yes |
 | `host/<roomId>/log/` | envelopes and bodies (`room-log-v2.md` section 8) | no (bodies are MLS ciphertext) | yes |
 
 The host pins the room's `genesisHash` inside its sealed key file rather than sealing the genesis itself: the genesis is public and is sent to every joiner, but the host must not accept a different one. On open, the host refuses the room when `genesis.json` does not verify or its hash differs from the pinned value (`room-log-v2.md` section 8.1).

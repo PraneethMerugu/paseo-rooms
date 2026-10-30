@@ -24,6 +24,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import nodePath from "node:path";
 import { z } from "zod";
+import { SignedEntry } from "../authority/entries";
 import { b64uBytes, entityId, LaneList, nonNegInt, Role } from "../authority/schema";
 import type { Kek } from "../keystore/keystore";
 import { InvitePayload } from "../host/invites";
@@ -38,6 +39,9 @@ export const MEMBER_STATE_FILE = "state.sealed";
 export const memberRoomDir = (dataDir: string, roomId: string) => nodePath.join(dataDir, "member", "rooms", roomId);
 export const memberStatePath = (dataDir: string, roomId: string) => nodePath.join(memberRoomDir(dataDir, roomId), MEMBER_STATE_FILE);
 export const memberStatePurpose = (roomId: string) => `member-state:${roomId}`;
+
+/** A signed entry the host showed this device before admission (round 9, item 3). */
+export type PreAdmissionAnchor = { source: "authority_chain" | "held" | "admission"; signed: SignedEntry };
 
 /** A fifth session for one enrollment deletes the keys and asks for a new invite (5.6). */
 export const MAX_SENT_H = 4;
@@ -87,6 +91,12 @@ const Enrollment = z.strictObject({
   newKeySig: b64uBytes(64).nullable().optional(),
   /** Device links: the `device.added` entry from `enroll.held`, and when it may take effect (null: an admin). */
   held: z.strictObject({ seq: nonNegInt(), hash: Hash32, bodyHash: Hash32, effectiveAfter: nonNegInt().nullable() }).nullable().optional(),
+  /**
+   * The signed entries of `enroll.held` and `enroll.admitted`, as received (round 9, item 3): with the
+   * authority chain in `pending` they are the pre-admission anchors the post-admission fold checks.
+   * Absent in journals written before round 9.
+   */
+  received: z.array(SignedEntry).max(2).optional(),
   /** RJCS text of the verified genesis, once known. */
   genesis: z.string().nullable(),
   registrations: z.record(z.string(), z.string()),
@@ -284,9 +294,9 @@ export class EnrollmentJournal {
   }
 
   /** Device links: `enroll.held` verified (both confirmations in, `device.added` logged). */
-  held(h: { seq: number; hash: string; bodyHash: string; effectiveAfter: number | null }): void {
+  held(h: { seq: number; hash: string; bodyHash: string; effectiveAfter: number | null }, entry?: SignedEntry): void {
     this.expect("pending", "confirmed", "held");
-    this.update({ state: "held", held: h });
+    this.update({ state: "held", held: h, ...(entry ? { received: [entry] } : {}) });
   }
 
   /** "Codes match": before `enroll.confirm`. */
@@ -296,9 +306,32 @@ export class EnrollmentJournal {
   }
 
   /** `enroll.admitted` verified: before any hosts API call. The nonce and token key are no longer needed. */
-  admitted(memberId: string, deviceId: string, admission: { seq: number; hash: string } | null = null): void {
+  admitted(memberId: string, deviceId: string, admission: { seq: number; hash: string } | null = null, entry?: SignedEntry): void {
     this.expect("pending", "confirmed", "held", "admitted");
-    this.update({ state: "admitted", memberId, deviceId, admission, nm: null, tokenKey: null });
+    const received = [...(this.st.enrollment.received ?? []).filter((x) => x.entry.seq !== entry?.entry.seq), ...(entry ? [entry] : [])];
+    this.update({ state: "admitted", memberId, deviceId, admission, nm: null, tokenKey: null, ...(received.length ? { received } : {}) });
+  }
+
+  /**
+   * Enrollment 5.7 (round 9, item 3): every signed entry this device received from the host before
+   * its first authenticated session, which the fetched log must hold at the same seq with the same
+   * hash. The authority chain of `enroll.pending`, then the `enroll.held` and `enroll.admitted`
+   * entries. Each was verified when received; entries that no longer parse are skipped.
+   */
+  preAdmissionAnchors(): PreAdmissionAnchor[] {
+    const e = this.st.enrollment;
+    const out: PreAdmissionAnchor[] = [];
+    try {
+      const pending = e.pending ? (rjcsParse(Buffer.from(e.pending, "utf8"), STATE_MAX_BYTES) as { authority?: { entries?: unknown[] } }) : null;
+      for (const x of pending?.authority?.entries ?? []) {
+        const p = SignedEntry.safeParse(x);
+        if (p.success) out.push({ source: "authority_chain", signed: p.data });
+      }
+    } catch {
+      // The pending content was verified before it was journaled; an unreadable copy adds nothing.
+    }
+    for (const x of e.received ?? []) out.push({ source: x.entry.type === "device.added" ? "held" : "admission", signed: x });
+    return out;
   }
 
   registration(laneId: string, registrationId: string): void {

@@ -97,6 +97,8 @@ export interface MlsDeliveryOptions {
   push?: (deviceId: string, frame: Record<string, unknown>) => boolean;
   /** Called after every log append made here (sessions, pushes, subscribers). */
   afterAppend?: () => void;
+  /** After a stored `current` publication (the admitting admin daemon's prompt Add, round 9 item 5). */
+  onPublished?: (deviceId: string) => void;
   stalledAfterMs?: number;
 }
 
@@ -248,6 +250,7 @@ export class MlsDelivery {
       return { ok: false, code: "persist_failed" };
     }
     for (const c of checked) this.refs.set(c.ref, access.deviceId);
+    if (pool === "current" && checked.length > 0) queueMicrotask(() => this.o.onPublished?.(access.deviceId));
     return { ok: true, frame: { t: "kp.publish.ok", stored: singles.length, lastResort: next.lastResort !== null } };
   }
 

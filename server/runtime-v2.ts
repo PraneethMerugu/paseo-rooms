@@ -47,6 +47,7 @@ import { AdminSigner, adminKeyPath } from "./admin/signer";
 import { verifyGenesis, type RoomGenesis } from "./authority/genesis";
 import type { StatementData, StatementType } from "./authority/statements";
 import { autoApprovalEndsAt } from "./authority/holds";
+import { AdminHoldClock } from "./admin/hold-clock";
 import { edKid, versionKey, type RoomState } from "./authority/state";
 import { DeviceLinker } from "./member/device-link";
 import { readLinkSection, writeLinkSection } from "./member/enrollment-journal";
@@ -88,9 +89,12 @@ import { rjcsParse } from "./proto/rjcs";
 import type { RelayAddress } from "./transport/relay-server";
 
 export const PROTOCOL_ENV = "PASEO_ROOMS_PROTOCOL";
-/** DEV-ONLY: short MLS timers (repair delay, witness, joiner check) so the offline e2e runs in seconds. */
+/**
+ * DEV-ONLY: short MLS timers (witness, joiner check, retries) so the offline e2e runs in seconds. The
+ * repair delay keeps its production value: joins go through the prompt Add (round 9, item 5).
+ */
 export const ENV_DEV_MLS_FAST = "PASEO_ROOMS_DEV_MLS_FAST";
-const DEV_MLS_TIMINGS: Partial<MlsTimings> = { repairDelayMs: 0, repairJitterMs: 0, witnessMaxDelayMs: 1000, epochConfirmMs: 5000, retryMs: 2000 };
+const DEV_MLS_TIMINGS: Partial<MlsTimings> = { witnessMaxDelayMs: 1000, epochConfirmMs: 5000, retryMs: 2000 };
 
 /** Read once at plugin start (contribute). */
 export function roomsProtocol(env: NodeJS.ProcessEnv = process.env): "v1" | "v2" {
@@ -120,7 +124,7 @@ export function relayAddress(relay: { host: string; port: number }, env: NodeJS.
 }
 
 
-type Owned = { host: RoomHost; signer: AdminSigner | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService; approver: ReturnType<typeof setInterval> | null; mls: MlsDelivery | null; mlsTick: ReturnType<typeof setInterval> | null; ownFeed: (() => void) | null };
+type Owned = { host: RoomHost; signer: AdminSigner | null; holds: AdminHoldClock | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService; approver: ReturnType<typeof setInterval> | null; mls: MlsDelivery | null; mlsTick: ReturnType<typeof setInterval> | null; ownFeed: (() => void) | null };
 type Joined = { client: RoomClient; memberId: string; deviceId: string };
 
 const SCHEDULE_FILE = "grant-schedule.json";
@@ -268,7 +272,7 @@ export class RoomsRuntimeV2 {
     let endpoint: RoomEndpoint | null = null;
     let ownFeed: (() => void) | null = null;
     const mls = this.mlsLib
-      ? new MlsDelivery({ dataDir: this.dataDir, kek: this.kek!, host, adapter: this.mlsLib, now: this.clock.now, push: (d, f) => endpoint?.pushToDevice(d, f) ?? false, afterAppend: () => endpoint?.afterAppend() })
+      ? new MlsDelivery({ dataDir: this.dataDir, kek: this.kek!, host, adapter: this.mlsLib, now: this.clock.now, push: (d, f) => endpoint?.pushToDevice(d, f) ?? false, afterAppend: () => endpoint?.afterAppend(), onPublished: (d) => this.mlsMembers.get(roomId)?.packagesPublished(d) })
       : null;
     endpoint = new RoomEndpoint({
       host,
@@ -281,6 +285,7 @@ export class RoomsRuntimeV2 {
       onAppended: () => {
         lanes?.sync();
         ownFeed?.();
+        this.observeHolds(roomId);
       },
     });
     grants.afterAppend = () => endpoint.afterAppend();
@@ -290,8 +295,10 @@ export class RoomsRuntimeV2 {
     (approver as { unref?: () => void } | null)?.unref?.();
     const mlsTick = mls ? setInterval(() => mls.tick(), 30_000) : null;
     (mlsTick as { unref?: () => void } | null)?.unref?.();
-    const owned: Owned = { host, signer, endpoint, grants, lanes, approver, mls, mlsTick, ownFeed: null };
+    const holds = signer ? new AdminHoldClock(this.dataDir, this.kek!, roomId, this.clock.now) : null;
+    const owned: Owned = { host, signer, holds, endpoint, grants, lanes, approver, mls, mlsTick, ownFeed: null };
     this.owned.set(roomId, owned);
+    this.observeHolds(roomId);
     endpoint.start();
     lanes.start();
     try {
@@ -355,6 +362,12 @@ export class RoomsRuntimeV2 {
         const before = fold.state;
         fold.append(r.signed, r.body);
         member.ingest(r.signed, before, fold.state);
+        // Prompt Add (MLS 4.4; round 9, item 5): devices this daemon's admin key just admitted.
+        const kid = o.signer?.kid;
+        if (kid && r.signed.entry.cls === "stmt") {
+          const added = newDeviceIds(before, fold.state);
+          if (added.length > 0 && statementProducerKid(r.body) === kid) member.promptAdd(added);
+        }
       }
     };
     feed();
@@ -427,12 +440,14 @@ export class RoomsRuntimeV2 {
    */
   autoApprove(roomId: string): void {
     const o = this.owned.get(roomId);
-    if (!o?.signer || o.host.isStopped || this.stopping) return;
+    if (!o?.signer || !o.holds || o.host.isStopped || this.stopping) return;
     const st = o.host.state;
+    this.observeHolds(roomId);
     const now = this.clock.now();
     for (const [ref, p] of Object.entries(st.pending)) {
       if (p.kind !== "add" || p.status !== "pending") continue;
-      const at = autoApprovalEndsAt(st, p);
+      // The hold on this daemon's own clock from when it first saw the request (identity 6.3).
+      const at = o.holds.endsAt(st, ref, p);
       if (at === null || now < at || (this.approveRetryAt.get(ref) ?? 0) > Date.now()) continue;
       try {
         const r = this.adminSubmit(roomId, "device.add.approved", { memberId: p.memberId, deviceId: p.deviceId, ref, mode: "auto" });
@@ -444,6 +459,17 @@ export class RoomsRuntimeV2 {
     }
   }
 
+  /** Records when this admin daemon first saw each pending request (its own clock; persisted). */
+  private observeHolds(roomId: string): void {
+    const o = this.owned.get(roomId);
+    if (!o?.holds || o.host.isStopped) return;
+    try {
+      o.holds.observe(o.host.state);
+    } catch (e) {
+      logError("admin_holds_save_failed", e, { roomId });
+    }
+  }
+
   status() {
     const ks = this.keystore;
     return {
@@ -452,7 +478,7 @@ export class RoomsRuntimeV2 {
       error: this.error,
       ...(this.clock.enabled ? { testClockOffsetMs: this.clock.offset } : {}),
       keystore: ks ? { state: ks.state, backend: ks.backend, fallback: ks.state === "ready" ? ks.fallback : false } : null,
-      owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes }) => ({
+      owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes, holds }) => ({
         roomId: host.roomId,
         serverId: endpoint.serverId,
         head: host.head,
@@ -466,7 +492,7 @@ export class RoomsRuntimeV2 {
         grantTtlS: grants.ttlS(),
         persistError: grants.persistError ?? (host.isStopped ? "room_stopped" : null),
         compromisedDevices: grants.compromisedDevices(),
-        deviceRequests: deviceRequestsView(host.state),
+        deviceRequests: deviceRequestsView(host.state, undefined, holds),
         conflicts: Object.keys(host.state.conflicts).sort(),
       })),
       mls: this.mlsView(),
@@ -1017,6 +1043,8 @@ export class RoomsRuntimeV2 {
       relay: keys.relay(v.genesis),
       timings: this.tuning.timings,
       onPush: (f) => this.onSessionPush(roomId, f),
+      // Enrollment 5.7 (round 9, item 3): what the host showed before admission must be in the log.
+      anchors: this.joining.get(roomId)?.journal.preAdmissionAnchors() ?? [],
       ...(mls && !this.owned.has(roomId) ? { onIngest: (s, b, a) => mls.ingest(s, b, a) } : {}),
     });
     this.joined.set(roomId, { client, memberId: keys.memberId, deviceId: keys.deviceId });
@@ -1114,12 +1142,12 @@ export class RoomsRuntimeV2 {
 }
 
 /** Pending device requests in a fold state (optionally one member's), newest first, ids and times only. */
-function deviceRequestsView(st: Readonly<RoomState>, memberId?: string) {
+function deviceRequestsView(st: Readonly<RoomState>, memberId?: string, holds?: AdminHoldClock | null) {
   return Object.entries(st.pending)
     .filter(([, p]) => !memberId || p.memberId === memberId)
     .sort(([, a], [, b]) => b.seq - a.seq)
     .slice(0, 64)
-    .map(([ref, p]) => ({ ref, kind: p.kind, memberId: p.memberId, deviceId: p.deviceId, requester: p.requester, seq: p.seq, hts: p.hts, sole: p.sole, young: p.young, status: p.status, effectiveAfter: autoApprovalEndsAt(st, p) }));
+    .map(([ref, p]) => ({ ref, kind: p.kind, memberId: p.memberId, deviceId: p.deviceId, requester: p.requester, seq: p.seq, hts: p.hts, sole: p.sole, young: p.young, status: p.status, effectiveAfter: holds ? holds.endsAt(st, ref, p) : autoApprovalEndsAt(st, p) }));
 }
 
 function inviteView(i: InviteView) {
@@ -1134,3 +1162,21 @@ function joinView(v: JoinView) {
   return { roomId: v.roomId, state: v.state, roomName: v.roomName, sas: v.sas, terms: v.terms, expiresAt: v.expiresAt, failure: v.failure, connection: v.connection, lastError: v.lastError };
 }
 
+/** Device ids in the roster of `after` that `before` did not have (admissions and approved adds). */
+function newDeviceIds(before: Readonly<RoomState>, after: Readonly<RoomState>): string[] {
+  const had = new Set<string>();
+  for (const m of Object.values(before.members)) for (const d of m.devices) had.add(d.deviceId);
+  const out: string[] = [];
+  for (const m of Object.values(after.members)) for (const d of m.devices) if (!had.has(d.deviceId)) out.push(d.deviceId);
+  return out;
+}
+
+/** The producer kid of a logged statement body, or null. */
+function statementProducerKid(body: Uint8Array): string | null {
+  try {
+    const kid = (rjcsParse(body) as { body?: { producer?: { kid?: unknown } } }).body?.producer?.kid;
+    return typeof kid === "string" ? kid : null;
+  } catch {
+    return null;
+  }
+}

@@ -910,6 +910,52 @@ test("MLS 13: a decryptable message with a wrong anchor gives epoch_anchor_misma
   }
 });
 
+test("MLS 13 (round 9, item 4): a joiner of a two-leaf group is confirmed by the one other leaf; no epoch_unconfirmed", async () => {
+  const h = await Harness.create();
+  try {
+    await h.settle();
+    const J = h.admit("J");
+    await h.settle();
+    assert.equal(J.member.inGroup, true);
+    assert.equal(J.store.record!.join?.needed, 1, "min(2, other leaves) with one other leaf");
+    assert.equal(J.store.record!.join?.status, "confirmed", JSON.stringify(J.member.alerts));
+    assert.equal(J.member.canSendReason(), null);
+    h.advance(10 * 60_000);
+    await J.member.maintain();
+    assert.deepEqual(J.member.alerts, []);
+    // With two or more other leaves, two confirmers are still needed.
+    const K = h.admit("K");
+    await h.settle();
+    assert.equal(K.store.record!.join?.needed, 2);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("prompt Add (round 9, item 5): the admitting admin daemon adds the device as soon as it publishes; the repair delay is the fallback", async () => {
+  const h = await Harness.create({ ...FAST, repairDelayMs: 60_000, repairJitterMs: 60_000 });
+  try {
+    await h.settle();
+    const C = h.dev("C");
+    const t0 = h.clock;
+    // The runtime calls promptAdd when its own admin key logged the admission (runtime-v2 feed).
+    const J = h.admit("J");
+    C.member.promptAdd([J.deviceId]);
+    await h.settle();
+    assert.equal(h.clock, t0, "no time passed");
+    assert.equal(J.member.inGroup, true, "added at once, before any repair delay");
+    // A device admitted without the prompt (another admin daemon, say) waits for the repair delay.
+    const K = h.admit("K");
+    await h.settle();
+    assert.equal(K.member.inGroup, false, "no add before the repair delay");
+    h.advance(60_000);
+    await h.settle();
+    assert.equal(K.member.inGroup, true, "the repair path adds it after the delay");
+  } finally {
+    h.cleanup();
+  }
+});
+
 // ------------------------------------------------------------------------------ removal (e2e shape)
 
 test("removal: the removed device's leaf is committed out at once and it cannot read the next message", async () => {

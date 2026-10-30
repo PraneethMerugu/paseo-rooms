@@ -287,11 +287,17 @@ test("enrollment end to end: SAS matches on both sides; member.admitted carries 
     assert.equal(m.journal.e.nm, null, "Nm and the token key are deleted after admission");
     assert.deepEqual(hostTypes(env), ["enrollment.pending"]);
     // The enrolling session became an active session (5.1); after the driver closed it a normal session opens.
-    const c = new RoomClient({ genesis: Buffer.from(m.journal.e.genesis!), device: { publicKey: b64uDecode(m.journal.e.deviceDh, 32), secretKey: m.journal.deviceKeys().dhSecret }, relay: relayOf(env), timings: FAST });
+    // 5.7 (round 9, item 3): the admission entry, as received, is a pre-admission anchor.
+    const anchors = m.journal.preAdmissionAnchors();
+    assert.deepEqual(anchors.map((a) => [a.source, a.signed.entry.type]), [["admission", "member.admitted"]]);
+    assert.equal(anchors[0].signed.hash, m.journal.e.admission!.hash);
+    const c = new RoomClient({ genesis: Buffer.from(m.journal.e.genesis!), device: { publicKey: b64uDecode(m.journal.e.deviceDh, 32), secretKey: m.journal.deviceKeys().dhSecret }, relay: relayOf(env), timings: FAST, anchors });
     env.closers.push(() => c.close());
     const hello = await c.connect();
     assert.equal(hello.memberId, d.member.memberId);
     assert.deepEqual(c.head, env.room.host.head);
+    assert.equal(c.uncheckedAnchors, 0);
+    assert.deepEqual(c.alerts, []);
   } finally {
     await env.cleanup();
   }
@@ -344,6 +350,7 @@ test("enroll.pending discloses only the genesis and the authority-key chain: no 
     const m2 = memberJoin(env, third.code, "third");
     await until("third member SAS", () => m2.view().sas);
     assert.equal(m2.journal.state, "pending", "the member accepted the minimal chain");
+    assert.deepEqual(m2.journal.preAdmissionAnchors().map((a) => [a.source, a.signed.entry.type]), [["authority_chain", "admin.added"]]);
     // Tampering and non-chain entries are refused.
     const dec = (b: string) => b64uDecode(b, Math.floor((b.length * 6) / 8));
     const tampered = { ...auth, bodies: [{ ...auth.bodies[0], body: b64u(Buffer.from(rjcsText({ ...rjcsParse(dec(auth.bodies[0].body)) as object, sig: b64u(randomBytes(64)) }))) }] };

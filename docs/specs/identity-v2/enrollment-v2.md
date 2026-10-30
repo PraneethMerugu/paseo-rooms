@@ -5,6 +5,7 @@
 - **Replaces:** `../rooms-control-protocol.md` (v1). v1 is removed, not kept alongside (`migration.md`).
 - **Formats:** RJCS, contexts and base64url rules are in `signatures-and-encoding.md`. Example values are in `vectors/vectors.json` (`invite`, `noise.enrollment`, `enrollment`, `deviceLink`, `records`).
 - **Revised** 2026-10-29 after the independent review (`README.md` section 10): resume pinning (5.6), abandoned-attempt limit, invite references in the log, key confirmation before supersede, explicit error fields, no per-invite grant lifetime. Revised again after the re-review (decisions round 4): the pinned `h` travels in `enroll.pending` and the member records every `h` it signed (5.6, R-4); device-link attempt limits on the confirming device (R-2); `unknown_base`.
+- **Revised** 2026-10-30 (decision round 9, `README.md` section 10.5): pre-admission anchors checked against the fetched log (5.2.1, 5.7); lane grants wait for the admission in the member's fold (8).
 
 ## 1. Goals
 
@@ -342,7 +343,7 @@ No other type is included. In particular `recovery.key.proposed` (no authority e
 
 **Residual disclosure.** Before the SAS, a holder of the invite learns, from the included entries: their `seq` values and the `base` and `fromSeq` positions inside them (a lower bound on the log's length at each key change), their `hts` (when key changes happened), their `epoch` (the MLS epoch count at each, a rough measure of membership churn), the admin and recovery public keys and the `memberId` of each admin named in a `KeyChange.subject`, and the field versions (`ver`) in `endpoint.rotated`. This is accepted. It reveals nothing about ordinary members, invites, lanes or content.
 
-**After admission** the chain is discarded. The member's first authenticated session fetches the complete log with `log.fetch` from seq 0 and runs the full fold of `room-log-v2.md` section 5. Only that fold decides the authority state the device acts on (section 5.7).
+**After admission** the member's first authenticated session fetches the complete log with `log.fetch` from seq 0 and runs the full fold of `room-log-v2.md` section 5. Only that fold decides the authority state the device acts on (section 5.7). The chain is kept until then for one more check (decision round 9, item 3): every chain entry must appear in the fetched log at its `seq` with the same `hash` (section 5.7). A chain the host forged or altered for this joiner thereby becomes equivocation evidence: two host-signed entries for one position. After that check the chain is discarded.
 
 ### 5.3 Host check order
 
@@ -436,7 +437,14 @@ On `enroll.admitted` (pushed, or inside `enroll.resume.ok`) the member checks, b
 
 Any failure ends the join with `bad_admission` and deletes the keys.
 
-The admin's signature on the statement and the host's signature on the entry are **not** checked on `enroll.admitted` itself. The admin key that signs may have been rotated in after the pending enrollment's chain was fixed (section 9), and the chain cannot show that it was not revoked (section 5.2.1). They are checked by the full fold instead: on its first authenticated session the member runs `log.fetch` from seq 0 and folds the whole chain (`room-log-v2.md` section 5). The entry carried by `enroll.admitted` must appear at its `seq` with the same `hash`; a different valid entry at that position is an equivocation and raises `fork` (`room-log-v2.md` section 6.6). A fold that rejects the admission entry raises `invalid_entry`. Both alerts stop the device from sending (`room-log-v2.md` section 6.6). From this fold on, the device uses only the folded authority state; the pre-admission chain is discarded.
+The admin's signature on the statement and the host's signature on the entry are **not** checked on `enroll.admitted` itself. The admin key that signs may have been rotated in after the pending enrollment's chain was fixed (section 9), and the chain cannot show that it was not revoked (section 5.2.1). They are checked by the full fold instead: on its first authenticated session the member runs `log.fetch` from seq 0 and folds the whole chain (`room-log-v2.md` section 5). A fold that rejects the admission entry raises `invalid_entry`. From this fold on, the device uses only the folded authority state.
+
+**Pre-admission anchors** (decision round 9, item 3). The member journals, with `admitted`, every signed entry the host showed it before its first authenticated session: the entries of the authority chain (section 5.2.1), the `device.added` entry of `enroll.held` for a device link (`identity-model.md` section 6.4), and the entry of `enroll.admitted`. During the post-admission fold each must appear in the fetched log at its `seq` with the same `hash`:
+
+- a different entry at that position raises `fork` (`room-log-v2.md` section 6.6). The anchor and the fetched entry are both signed by the host, so the pair is the equivocation proof when both verify under the host key the fold holds for that position; the alert names which anchor (`authority_chain`, `held` or `admission`);
+- an anchor beyond the host's head once the member has synced to that head raises `truncation`, with the anchor as proof: the host signed an entry it no longer serves.
+
+Both alerts stop the device from sending (`room-log-v2.md` section 6.6). The check runs once, on the first sync after admission; anchors are discarded after it.
 
 ## 6. Short authentication string
 
@@ -546,7 +554,7 @@ Stored in `member/rooms/<roomId>/state.sealed` under `enrollment`:
 M1 consumed the invite on the gateway and then failed `hosts.add` with no local record. v2 orders the work so that every step after admission is retryable:
 
 1. The journal reaches `admitted` (sealed write, fsync) **before** any call to Paseo's `hosts` API.
-2. For each lane in `terms.lanes`, the member requests a grant (`grants-v2.md` section 3) and calls `hosts.add` with `sourceKey = laneId`. Before adding, it lists hosts and updates an existing registration with the same `sourceKey` instead (idempotent).
+2. For each lane in `terms.lanes`, the member requests a grant (`grants-v2.md` section 3) and calls `hosts.add` with `sourceKey = laneId`. Both wait until the member's own post-admission fold (section 5.7) holds the admission entry at the `seq` and with the `hash` of `enroll.admitted`; if that fold raises `fork`, `truncation` or `invalid_entry`, no grant is requested and nothing is registered (README section 8, item 8b, written in after I-10). Before adding, it lists hosts and updates an existing registration with the same `sourceKey` instead (idempotent).
 3. It records each `registrationId` in the journal as it succeeds.
 4. On failure it retries with backoff (1 s, 2 s, 4 s … 60 s), logging `error.name` and `error.code`, never the grant. The room shows "Connected to the room; lane setup is retrying" meanwhile. Room chat does not depend on lane registration.
 5. When all lanes are registered the journal moves to `registered`.
