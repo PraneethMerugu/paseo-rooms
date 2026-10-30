@@ -39,6 +39,21 @@ export const JoinRequestV2View = z.object({
   memberId: z.string().nullable(),
 });
 
+export const LaneV2View = z.object({
+  laneId: z.string(),
+  serverId: z.string(),
+  status: z.enum(["open", "degraded", "closed"]),
+  label: z.string().nullable(),
+  agentId: z.string().nullable(),
+  endpoint: z.enum(["starting", "online", "offline", "closed"]).nullable(),
+  links: z.number().int(),
+  routes: z.number().int(),
+  showNames: z.boolean(),
+});
+
+/** Current grants by (device, lane): ids and times only, never tokens. */
+export const GrantV2View = z.object({ deviceId: z.string(), laneId: z.string(), gid: z.string(), iat: z.number().int(), exp: z.number().int() });
+
 export const OwnedRoomV2View = z.object({
   roomId: z.string(),
   serverId: z.string(),
@@ -48,6 +63,13 @@ export const OwnedRoomV2View = z.object({
   members: z.number().int(),
   invites: z.array(InviteV2View),
   joinRequests: z.array(JoinRequestV2View),
+  lanes: z.array(LaneV2View),
+  grants: z.array(GrantV2View),
+  grantTtlS: z.number().int(),
+  /** grants-v2 7.2: access was cut but a save failed; retried every 10 s. */
+  persistError: z.string().nullable(),
+  /** grants-v2 6.4: devices with two suspected thefts within 7 days. */
+  compromisedDevices: z.array(z.string()),
 });
 
 /** The member's side of a join (enrollment-v2.md 6.4, 7.3). */
@@ -72,6 +94,22 @@ export const JoinedRoomV2View = z.object({
   lastError: z.string().nullable(),
   endedReason: z.string().nullable(),
   alerts: z.array(z.object({ type: z.string(), seq: z.number().int() })),
+  registration: z.string().nullable(),
+  lanes: z.array(
+    z.object({
+      laneId: z.string(),
+      registrationId: z.string().nullable(),
+      hostStatus: z.string().nullable(),
+      gid: z.string().nullable(),
+      lifetimeMs: z.number(),
+      idleInMs: z.number(),
+      forcedInMs: z.number(),
+      rotations: z.number().int(),
+      lastRotation: z.object({ reason: z.string(), at: z.number() }).nullable(),
+      lastDecision: z.string().nullable(),
+      lastError: z.string().nullable(),
+    }),
+  ),
 });
 
 export const roomsV2Status = defineRpc({
@@ -101,6 +139,7 @@ export const roomsV2InviteCreate = defineRpc({
   name: "rooms.v2.invite.create",
   input: RoomIdIn.extend({
     role: z.enum(["guest", "watch", "comment", "steer", "approve", "maintain", "admin"]).optional(),
+    lanes: z.array(z.string().regex(/^lane_[0-9a-f]{32}$/)).max(64).optional(),
     expS: z.number().int().min(300).max(86400).optional(),
     note: z.string().max(80).optional(),
     roomName: z.string().min(1).max(80).optional(),
@@ -132,6 +171,29 @@ export const roomsV2MemberRemove = defineRpc({
   name: "rooms.v2.member.remove",
   input: RoomIdIn.extend({ memberId: z.string() }),
   output: z.object({ seq: z.number().int() }),
+});
+
+/** Lowers or changes a member's role: their grants at the old role stop working at once (S-9). */
+export const roomsV2MemberRole = defineRpc({
+  name: "rooms.v2.member.role",
+  input: RoomIdIn.extend({ memberId: z.string(), role: z.enum(["guest", "watch", "comment", "steer", "approve", "maintain", "admin"]) }),
+  output: z.object({ seq: z.number().int() }),
+});
+
+/** Creates a lane that shares an existing agent of this daemon (no new agent). */
+export const roomsV2LaneCreate = defineRpc({
+  name: "rooms.v2.lane.create",
+  input: RoomIdIn.extend({ agentId: z.string().min(1).max(200), label: z.string().min(1).max(80).optional() }),
+  output: z.object({ laneId: z.string(), serverId: z.string() }),
+});
+
+/** Owner only: the full text of errors viewers saw as generic text with a reference (grants-v2 13.1). */
+export const roomsV2LaneErrors = defineRpc({
+  name: "rooms.v2.lane.errors",
+  input: RoomIdIn.extend({ laneId: z.string().regex(/^lane_[0-9a-f]{32}$/) }),
+  output: z.object({
+    errors: z.array(z.object({ source: z.string(), message: z.string(), firstAt: z.string(), lastAt: z.string(), count: z.number().int(), ref: z.string().optional() })),
+  }),
 });
 
 // ------------------------------------------------------------------------------ member

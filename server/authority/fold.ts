@@ -189,9 +189,9 @@ export class RoomLogFold {
     this.run(signed, body, true);
   }
 
-  /** Every check of `append` without changing the fold. */
-  check(signed: unknown, body?: Uint8Array): void {
-    this.run(signed, body, false);
+  /** Every check of `append` without changing the fold. Returns the state the entry would produce. */
+  check(signed: unknown, body?: Uint8Array): Readonly<RoomState> {
+    return this.run(signed, body, false);
   }
 
   /**
@@ -199,17 +199,17 @@ export class RoomLogFold {
    * (a bug, or input that slipped past a schema) becomes `internal_error`, so a caller never has to
    * handle a second error type and a bad entry is rejected rather than crashing the fold.
    */
-  private run(value: unknown, body: Uint8Array | undefined, commit: boolean): void {
+  private run(value: unknown, body: Uint8Array | undefined, commit: boolean): Readonly<RoomState> {
     const seq = this.hashes.length;
     try {
-      this.runChecks(seq, value, body, commit);
+      return this.runChecks(seq, value, body, commit);
     } catch (err) {
       if (err instanceof FoldError) throw err;
       throw new FoldError(seq, "internal_error", err instanceof Error ? err.message : "unexpected failure");
     }
   }
 
-  private runChecks(seq: number, value: unknown, body: Uint8Array | undefined, commit: boolean): void {
+  private runChecks(seq: number, value: unknown, body: Uint8Array | undefined, commit: boolean): Readonly<RoomState> {
     let signed: SignedEntry;
     try {
       signed = verifyChainedEntry(value, { roomId: this.st.roomId, seq, prevHash: this.head.hash }, this.hostKeyAt);
@@ -223,11 +223,12 @@ export class RoomLogFold {
     if (entry.cls === "mls") {
       // seq 0 must be the creator's admission (section 4.3).
       if (seq === 0) throw new FoldError(seq, "genesis_admission_required", "seq 0 must be the creator's member.admitted");
+      const next = { ...this.st, epoch: entry.epoch };
       if (commit) {
         this.hashes.push(signed.hash);
-        this.st = { ...this.st, epoch: entry.epoch };
+        this.st = next;
       }
-      return;
+      return next;
     }
 
     if (body === undefined) throw new FoldError(seq, "missing_body", "statement entries need their body");
@@ -280,13 +281,14 @@ export class RoomLogFold {
     const rec: Rec = { entry, stmt: sb };
     const next = this.step(this.st, rec);
 
-    if (!commit) return;
+    if (!commit) return next;
     if (depth > 0) this.revocationDepths.push({ seq, depth });
     this.st = next;
     this.hashes.push(signed.hash);
     this.bodySeq.set(entry.bodyHash, seq);
     this.maxBase.set(sb.producer.kid, sb.base.seq);
     this.records.push(rec);
+    return next;
   }
 }
 

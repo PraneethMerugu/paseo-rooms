@@ -344,7 +344,7 @@ export class MemberEnrollment {
         d.confirmation.inviteRef === inviteRef(e.invite.inviteId) &&
         d.confirmation.transcript === e.transcript;
       if (!ok) throw new Refuse("bad_admission");
-      j.admitted(a.memberId, a.deviceId);
+      j.admitted(a.memberId, a.deviceId, { seq: a.entry.entry.seq, hash: a.entry.hash });
     } catch (err) {
       return this.fail(err instanceof Refuse ? err.reason : "bad_admission");
     }

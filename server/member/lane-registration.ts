@@ -11,6 +11,10 @@
 // - Failures retry with backoff 1 s, 2 s, 4 s ... 60 s. Only `error.name` and `error.code` are logged,
 //   never the connection URI or the grant.
 // - Armed from the journal at plugin start; only the hosts calls wait for a PaseoApi.
+// - Gate (I-10): no grant is requested and no host registered until `gate()` says the member's own
+//   post-admission fold over log.fetch accepted the admission entry (same seq and hash as in
+//   `enroll.admitted`). `waiting` retries with the backoff; `refused` (a different entry at that seq,
+//   or a fork, truncation or invalid entry alert) stops registration.
 import { log } from "../log";
 
 export const REGISTRATION_BACKOFF_MS: readonly number[] = [1000, 2000, 4000, 8000, 16000, 32000, 60000];
@@ -29,6 +33,8 @@ export interface LaneRegistrationDeps {
   pluginId: string;
   /** Null until the plugin has a PaseoApi. */
   hosts(): HostsApi | null;
+  /** Admission accepted by the member's own fold (I-10). Absent: no gate. */
+  gate?(): AdmissionGate;
   /** Connection URI with a fresh grant for one lane (I-10). Never logged. */
   connectionFor(laneId: string): Promise<string>;
   label(laneId: string): string;
@@ -40,13 +46,29 @@ export interface LaneRegistrationDeps {
   clearTimer?(t: unknown): void;
 }
 
+export type AdmissionGate = "accepted" | "waiting" | "refused";
+
+/** The fold's view of the admission entry: accepted once the verified chain holds it with this hash. */
+export function admissionGate(
+  fold: { entry(seq: number): { hash: string } | undefined; sendingStopped: boolean; alerts: readonly { type: string }[] } | null,
+  admission: { seq: number; hash: string } | null | undefined,
+  fallback: () => boolean,
+): AdmissionGate {
+  if (!fold) return "waiting";
+  if (fold.sendingStopped || fold.alerts.some((a) => a.type === "fork" || a.type === "truncation" || a.type === "invalid_entry")) return "refused";
+  if (!admission) return fallback() ? "accepted" : "waiting";
+  const e = fold.entry(admission.seq);
+  if (!e) return "waiting";
+  return e.hash === admission.hash ? "accepted" : "refused";
+}
+
 export class LaneRegistrar {
   private readonly registered: Map<string, string>;
   private attempt = 0;
   private timer: unknown = null;
   private running = false;
   private stopped = false;
-  status: "running" | "retrying" | "done" | "stopped" = "running";
+  status: "running" | "retrying" | "done" | "stopped" | "refused" = "running";
   lastError: string | null = null;
 
   constructor(
@@ -74,6 +96,15 @@ export class LaneRegistrar {
     this.running = true;
     this.timer = null;
     try {
+      const gate = this.d.gate?.() ?? "accepted";
+      if (gate === "refused") {
+        this.status = "refused";
+        this.lastError = "admission_refused";
+        this.stopped = true;
+        log("lane_registration_refused", { roomId: this.d.roomId, reason: "admission_not_in_fold" });
+        return;
+      }
+      if (gate === "waiting" && this.lanes.some((l) => !this.registered.has(l))) throw Object.assign(new Error("admission not yet in the fold"), { code: "admission_unverified" });
       for (const laneId of this.lanes) {
         if (this.registered.has(laneId)) continue;
         const hosts = this.d.hosts();

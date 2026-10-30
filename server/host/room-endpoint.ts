@@ -23,7 +23,14 @@
 // - P-16: repeated eviction of the control socket (a relay "Replaced by new connection" close) is
 //   logged as a host-produced `endpoint.evicted` statement.
 //
-// Not here (later milestones): grants (I-10), rate limits per active device (I-10),
+// - Grants (I-10, grants-v2.md 3, 6.2, 6.3): `grant.issue`, `grant.status` and `grant.report` on an
+//   active device's session, served by HostGrants when the room serves lanes (else `not_permitted`).
+//   `pushToDevice` delivers `grant.revoked` events (theft, role change) to the device's session.
+// - Revocation order (grants-v2 7.1): a RoomHost decide listener closes the sessions of devices the
+//   next state no longer has, and remembers them, before the log append; so access stays cut even if
+//   the append fails and the room stops.
+//
+// Not here (later milestones): per-device budgets of every operation (only grants are limited),
 // endpoint rotation and `moved` (I-12), MLS operations (I-13).
 import { x25519 } from "@noble/curves/ed25519.js";
 import { RoomLogFold } from "../authority/fold";
@@ -55,6 +62,8 @@ import {
   type RoomSessionTimings,
 } from "../transport/room-session";
 import { EnrollmentHost, type EnrollmentHostOptions, type EnrollSession } from "./enrollment";
+import { grantStatusFrame, isGrantId, isLaneIdV2, type HostGrants } from "./grants";
+import type { RoomState } from "../authority/fold";
 import { readHostKeys, type RoomHost, type SubmitResult } from "./room-host";
 import type { Kek } from "../keystore/keystore";
 
@@ -81,6 +90,10 @@ export interface RoomEndpointOptions {
   maxPreauthSessions?: number;
   /** Serve enrollment (pre-auth operations). Without it they get the generic `enroll_rejected`. */
   enrollment?: Omit<EnrollmentHostOptions, "host" | "afterAppend" | "endpointDh" | "now">;
+  /** Lane grants of this room (I-10). Without it the grant operations answer `not_permitted`. */
+  grants?: HostGrants;
+  /** Called at the end of every afterAppend (lane endpoints follow the log). */
+  onAppended?: () => void;
   now?: () => number;
 }
 
@@ -120,6 +133,11 @@ export class RoomEndpoint {
   private evictionReported = 0;
   readonly now: () => number;
   readonly enrollment: EnrollmentHost | null;
+  /** Device DH keys cut by a decision whose log append may not have happened (grants-v2 7.1, 7.2). */
+  private readonly cut = new Map<string, AccessEndedReason>();
+  /** The session whose own `stmt.submit` is being sequenced: it gets its receipt before it is cut. */
+  submitting: RoomConnection | null = null;
+  private readonly unhook: () => void;
 
   constructor(readonly o: RoomEndpointOptions) {
     this.serverId = o.host.state.auth.endpoint.serverId;
@@ -131,6 +149,37 @@ export class RoomEndpoint {
     this.enrollment = o.enrollment
       ? new EnrollmentHost({ ...o.enrollment, host: o.host, now: this.now, afterAppend: () => this.afterAppend(), endpointDh: () => o.host.state.auth.endpoint.dh.pub })
       : null;
+    this.unhook = o.host.onDecide((next, prev, type) => this.decide(next, prev, type));
+    if (o.grants) o.grants.notify = (deviceId, frame) => this.pushToDevice(deviceId, frame);
+  }
+
+  get grants(): HostGrants | null {
+    return this.o.grants ?? null;
+  }
+
+  /** Sends an event frame to a device's live session, if it has one. */
+  pushToDevice(deviceId: string, frame: Record<string, unknown>): boolean {
+    for (const c of this.live.values()) {
+      if (c.access.kind === "active" && c.access.deviceId === deviceId) {
+        c.send(frame as Frame);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 7.1 steps 1 and 2 for sessions: devices gone in `next` lose their sessions before the append. */
+  private decide(next: Readonly<RoomState>, prev: Readonly<RoomState>, type: string): void {
+    const after = devicesByDh(next.members);
+    const stillThere = new Set([...after.values()].map((d) => d.deviceId));
+    for (const [dh, d] of devicesByDh(prev.members)) {
+      if (after.has(dh) || stillThere.has(d.deviceId)) continue;
+      const reason: AccessEndedReason = type === "member.left" ? "left" : "removed";
+      this.cut.set(dh, reason);
+      const conn = this.live.get(dh);
+      if (conn && conn !== this.submitting) conn.fail("access_ended", undefined, { reason });
+    }
+    if (next.auth.closed && !prev.auth.closed) for (const conn of [...this.live.values()]) conn.fail("access_ended", undefined, { reason: "room_closed" });
   }
 
   get host(): RoomHost {
@@ -164,6 +213,7 @@ export class RoomEndpoint {
     this.status = "closed";
     for (const c of [...this.connections.values()]) c.close(why);
     this.enrollment?.stop();
+    this.unhook();
     this.control?.stop(1001, "room endpoint stopped");
     log("room_endpoint_stopped", { roomId: this.roomId, why });
   }
@@ -189,6 +239,8 @@ export class RoomEndpoint {
     const closed = this.o.host.state.auth.closed;
     const a = this.active.get(dh);
     if (closed) return a || this.ended.has(dh) ? { kind: "ended", reason: "room_closed" } : { kind: "unknown" };
+    const cut = this.cut.get(dh);
+    if (cut) return { kind: "ended", reason: cut };
     if (a) return a;
     const reason = this.ended.get(dh);
     return reason ? { kind: "ended", reason } : { kind: "unknown" };
@@ -215,6 +267,11 @@ export class RoomEndpoint {
       else conn.fail("not_authorized");
     }
     for (const conn of this.live.values()) conn.pump();
+    try {
+      this.o.onAppended?.();
+    } catch (e) {
+      logError("room_endpoint_on_appended_failed", e, { roomId: this.roomId });
+    }
   }
 
   /** Called by a connection once its key-confirmed static is an active device. */
@@ -445,6 +502,10 @@ export class RoomConnection implements EnrollSession {
           return this.send({ t: "roster.get.ok", re: frame.id, roster: this.endpoint.host.roster(), rosterHash: this.endpoint.host.rosterHash() } as unknown as Frame);
         case "stmt.submit":
           return this.onSubmit(frame, access);
+        case "grant.issue":
+        case "grant.status":
+        case "grant.report":
+          return this.onGrant(frame, access);
         default:
           if (LATER_OPS.has(t)) return this.fail("not_permitted", frame.id);
           return this.fail("bad_frame", frame.id);
@@ -527,13 +588,41 @@ export class RoomConnection implements EnrollSession {
     const own = producer?.kind === "device" && producer.kid === access.sigKid;
     const adminStmt = (producer?.kind === "admin" || producer?.kind === "recovery") && access.role === "admin";
     if (!own && !adminStmt) return this.fail("not_permitted", frame.id);
-    const res = this.endpoint.host.submit(stmt);
+    this.endpoint.submitting = this;
+    let res: SubmitResult;
+    try {
+      res = this.endpoint.host.submit(stmt);
+    } finally {
+      this.endpoint.submitting = null;
+    }
     if (!res.ok) {
       const head = res.head ? { seq: res.head.entry.seq, hash: res.head.hash } : { seq: -1, hash: this.endpoint.host.genesisHash };
       return this.fail(res.code, frame.id, res.code === "not_permitted" ? {} : { head });
     }
     this.send({ t: "stmt.submit.ok", re: frame.id, receipt: res.receipt } as unknown as Frame);
     this.endpoint.afterAppend();
+  }
+
+  /** Grants-v2 3, 6.2 and 6.3. Errors other than `internal` keep the session open. */
+  private onGrant(frame: Frame, access: Extract<DeviceAccess, { kind: "active" }>): void {
+    const grants = this.endpoint.grants;
+    if (!grants) return this.fail("not_permitted", frame.id);
+    const laneId = frame.laneId;
+    if (!isLaneIdV2(laneId)) return this.fail("bad_frame", frame.id);
+    const dev = { memberId: access.memberId, deviceId: access.deviceId };
+    if (frame.t === "grant.issue") {
+      const r = grants.issue(dev, laneId);
+      if (!r.ok) return this.fail(r.code, frame.id);
+      return this.send({ t: "grant.issue.ok", re: frame.id, grant: r.token, claims: r.claims, serverTime: r.serverTime } as unknown as Frame);
+    }
+    if (frame.t === "grant.status") {
+      const r = grants.status(access.deviceId, laneId);
+      if (!r.ok) return this.fail(r.code, frame.id);
+      return this.send(grantStatusFrame(frame.id!, r) as unknown as Frame);
+    }
+    if (frame.reason !== "unaccounted_link" || !isGrantId(frame.gid)) return this.fail("bad_frame", frame.id);
+    const done = grants.suspectedTheft({ deviceId: access.deviceId, laneId, gid: frame.gid, reportedBy: "member" });
+    return this.send({ t: "grant.report.ok", re: frame.id, unlisted: done } as unknown as Frame);
   }
 
   // ---- EnrollSession

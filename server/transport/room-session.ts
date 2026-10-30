@@ -66,15 +66,12 @@ export type AccessEndedReason = "removed" | "left" | "room_closed";
 /** Operations any initiator may call before it is known (section 4). Served from I-9 on. */
 export const PREAUTH_OPS: ReadonlySet<string> = new Set(["enroll.request", "sas.reveal", "enroll.confirm", "enroll.abort", "enroll.resume"]);
 
-/** Active-device operations served by this milestone (I-8). */
-export const SESSION_OPS: ReadonlySet<string> = new Set(["session.hello", "log.fetch", "log.subscribe", "roster.get", "stmt.submit"]);
+/** Active-device operations served (I-8; grants from I-10, when the room serves them). */
+export const SESSION_OPS: ReadonlySet<string> = new Set(["session.hello", "log.fetch", "log.subscribe", "roster.get", "stmt.submit", "grant.issue", "grant.status", "grant.report"]);
 
 /** Active-device operations of section 4 that later milestones serve; answered `not_permitted` until then. */
 export const LATER_OPS: ReadonlySet<string> = new Set([
   "authority.get",
-  "grant.issue",
-  "grant.status",
-  "grant.report",
   "device.link.create",
   "link.nonce",
   "link.confirm",

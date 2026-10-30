@@ -159,17 +159,20 @@ const workspaceFolders = (w: Record<string, unknown>): unknown[] => [w.projectRo
 
 export const GENERIC_ERROR = "The owner's daemon could not complete this request";
 export const GENERIC_AGENT_ERROR = "The agent reported an error";
+/** v2 viewer text (grants-v2 13.1), followed by the error reference. */
+export const GENERIC_ERROR_V2 = "The agent hit an error. The lane owner can see the details.";
 
-function keepForOwner(ctx: SanitizeContext, source: string, v: unknown): void {
-  if (typeof v === "string" && v) ctx.errors?.record(source, v);
+/** Keeps the full text for the owner. Returns the viewer text: M1's generic text, or v2's with its reference. */
+function keepForOwner(ctx: SanitizeContext, source: string, v: unknown, m1Text: string = GENERIC_AGENT_ERROR): string {
+  const ref = typeof v === "string" && v ? ctx.errors?.record(source, v) : undefined;
+  return ref ? `${GENERIC_ERROR_V2} Error reference: ${ref}.` : m1Text;
 }
 
 function genericError(source: string): Redactor {
   return (v, ctx) => {
     if (v === null) return null;
     if (v === undefined) return OMIT;
-    keepForOwner(ctx, source, v);
-    return GENERIC_ERROR;
+    return keepForOwner(ctx, source, v, GENERIC_ERROR);
   };
 }
 
@@ -177,9 +180,9 @@ function genericError(source: string): Redactor {
 function sanitizeStreamEvent(v: Record<string, unknown>, ctx: SanitizeContext): Out {
   if (v.type === "turn_failed") {
     const detail = [v.error, v.diagnostic].filter((x) => typeof x === "string" && x).join("\n\n");
-    keepForOwner(ctx, "agent.turn_failed", detail);
+    const text = keepForOwner(ctx, "agent.turn_failed", detail);
     const { diagnostic: _d, code, ...rest } = v;
-    return { ...rest, error: GENERIC_AGENT_ERROR, ...(typeof code === "string" && /^[a-z_]{1,40}$/.test(code) ? { code } : {}) };
+    return { ...rest, error: text, ...(typeof code === "string" && /^[a-z_]{1,40}$/.test(code) ? { code } : {}) };
   }
   if (v.type === "timeline" && isRecord(v.item)) {
     const item = sanitizeTimelineItem(v.item, ctx);
@@ -191,8 +194,7 @@ function sanitizeStreamEvent(v: Record<string, unknown>, ctx: SanitizeContext): 
 /** A timeline item of type "error" gets generic text; every other item is watch content and passes. */
 function sanitizeTimelineItem(item: Record<string, unknown>, ctx: SanitizeContext): Record<string, unknown> {
   if (item.type !== "error") return item;
-  keepForOwner(ctx, "agent.timeline_error", item.message);
-  return { ...item, message: GENERIC_AGENT_ERROR };
+  return { ...item, message: keepForOwner(ctx, "agent.timeline_error", item.message) };
 }
 
 /** Daemon directory generation -> opaque per-route generation. */
@@ -328,8 +330,7 @@ export const REDACTORS: Readonly<Record<string, Redactor>> = {
   },
   "out:agent_attention_required.notification": (v, ctx) => rewriteNotification(v, ctx),
   "out:rpc_error.error": (v, ctx, parent) => {
-    keepForOwner(ctx, `rpc_error:${typeof parent.requestType === "string" ? parent.requestType.slice(0, 96) : "unknown"}`, v);
-    return GENERIC_ERROR;
+    return keepForOwner(ctx, `rpc_error:${typeof parent.requestType === "string" ? parent.requestType.slice(0, 96) : "unknown"}`, v, GENERIC_ERROR);
   },
   "out:rpc_error.code": (v) => (typeof v === "string" && /^[a-z_]{1,40}$/.test(v) ? v : OMIT),
   "out:fetch_agent_timeline_response.agent": (v, ctx) => sanitizeAgentSnapshot(v, ctx),
@@ -345,8 +346,7 @@ export const REDACTORS: Readonly<Record<string, Redactor>> = {
   "AgentSnapshot.persistence": () => null,
   "AgentSnapshot.lastError": (v, ctx) => {
     if (typeof v !== "string" || !v) return OMIT;
-    keepForOwner(ctx, "agent.lastError", v);
-    return GENERIC_AGENT_ERROR;
+    return keepForOwner(ctx, "agent.lastError", v);
   },
   "AgentSnapshot.labels": (v) => {
     if (!isRecord(v)) return {};

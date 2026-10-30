@@ -63,6 +63,12 @@ const Enrollment = z.strictObject({
   expiresAt: nonNegInt().nullable(),
   memberId: entityId("member").nullable(),
   deviceId: entityId("device").nullable(),
+  /**
+   * The admission entry from `enroll.admitted` (I-10 gate): lane grants and registration wait until
+   * the post-admission fold over log.fetch holds this entry with this hash. Absent in journals
+   * written before I-10.
+   */
+  admission: z.strictObject({ seq: nonNegInt(), hash: Hash32 }).nullable().optional(),
   /** RJCS text of the verified genesis, once known. */
   genesis: z.string().nullable(),
   registrations: z.record(z.string(), z.string()),
@@ -217,9 +223,9 @@ export class EnrollmentJournal {
   }
 
   /** `enroll.admitted` verified: before any hosts API call. The nonce and token key are no longer needed. */
-  admitted(memberId: string, deviceId: string): void {
+  admitted(memberId: string, deviceId: string, admission: { seq: number; hash: string } | null = null): void {
     this.expect("pending", "confirmed", "held", "admitted");
-    this.update({ state: "admitted", memberId, deviceId, nm: null, tokenKey: null });
+    this.update({ state: "admitted", memberId, deviceId, admission, nm: null, tokenKey: null });
   }
 
   registration(laneId: string, registrationId: string): void {

@@ -34,7 +34,10 @@ import {
   roomsV2JoinPreview,
   roomsV2JoinReject,
   roomsV2JoinStart,
+  roomsV2LaneCreate,
+  roomsV2LaneErrors,
   roomsV2MemberRemove,
+  roomsV2MemberRole,
   roomsV2RoomConnect,
   roomsV2RoomCreate,
   roomsV2RoomDisconnect,
@@ -179,6 +182,10 @@ function contributeV2(server: PluginServerContext) {
     return { ok: true as const };
   });
   handle(roomsV2MemberRemove, (i) => rt.removeMember(i.roomId, i.memberId));
+  handle(roomsV2MemberRole, (i) => rt.changeRole(i.roomId, i.memberId, i.role));
+  // Owner: lanes (grants-v2; I-10).
+  handle(roomsV2LaneCreate, (i) => rt.createLane(i));
+  handle(roomsV2LaneErrors, async (i) => ({ errors: await rt.laneErrors(i.roomId, i.laneId) }));
   // Member: preview, join, compare, confirm (2.3, 6.4).
   handle(roomsV2JoinPreview, (i) => rt.previewJoin(i.code));
   handle(roomsV2JoinStart, (i) => rt.startJoin(i));

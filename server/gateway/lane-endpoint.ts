@@ -5,7 +5,14 @@
 //      spike): hello.auth.password must be a valid lane grant; only hosts.link.open, hosts.route.frame
 //      and hosts.route.close are served; every routed scope is a virtual session under the Room Profile
 //      with its own upstream session to the local daemon, capped at workspace.read;
-//   2. a rooms control channel (docs/specs/rooms-control-protocol.md): enroll, renew, status, leave.
+//   2. M1 only: a rooms control channel (docs/specs/rooms-control-protocol.md): enroll, renew, status,
+//      leave. The v2 runtime has no control switch: grants come over the room session
+//      (grants-v2.md section 3), and a `rooms.control.hello` is an unexpected first frame.
+//
+// Grant checks go through a LaneGrantAuthority: M1 wraps HostStore.checkGrantLive; v2
+// (server/host/lane-service.ts) runs grants-v2 section 4 against the room's authority state and the
+// `gid` allowlist, and adds the link policy of section 6.1 (one link per device and lane, theft
+// detection), a failure token bucket (section 11) and 32 routes per link.
 //
 // Grants are checked on the link hello, on every hosts.link.open and on every routed hello.
 // Revocation is PUSHED: HostStore changes call enforce() synchronously; each link also has a timer
@@ -13,7 +20,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import WebSocket from "ws";
 import { openDaemonSecureChannel, SecureChannelRejectedError, importPublicKey, importSecretKey, type SecureChannel } from "@getpaseo/relay/e2ee";
-import type { GrantClaims, Lane } from "../../shared/schemas";
+import type { Lane } from "../../shared/schemas";
 import { clip, log, logError, LogLimiter, short } from "../log";
 import type { HostStore } from "../host/host-store";
 import { DEFAULT_LIMITS, TokenBucket, type ResourceLimits } from "../limits";
@@ -59,8 +66,57 @@ export type EndpointStatus = "starting" | "online" | "offline" | "closed";
 
 export type AgentGoneReason = "agent_archived" | "agent_missing";
 
+/** The claim fields the lane endpoint uses (M1 `GrantClaims` and v2 `GrantClaimsV2` both have them). */
+export interface LinkClaims {
+  sub: string;
+  dev: string;
+  gid: string;
+  exp: number;
+}
+
+export type LaneGrantCheck = { ok: true; claims: LinkClaims } | { ok: false; reason: string; claims?: LinkClaims };
+
+/** How a lane endpoint checks grants and finds its keys (M1: HostStore; v2: grants-v2). */
+export interface LaneGrantAuthority {
+  /** Checks a grant presented on the link hello, on hosts.link.open and on every routed hello. */
+  check(token: string, laneId: string, opts?: { cheap?: boolean }): LaneGrantCheck;
+  keyPair(laneId: string): { publicKey: Uint8Array; secretKey: Uint8Array };
+  /** M1 only: serve the rooms control channel. */
+  controlChannel: boolean;
+  /**
+   * v2 link policy (grants-v2 6.1), called once the grant passed. Resolves "accept" or "reject";
+   * may close other links. Absent: M1's per-member link cap applies.
+   */
+  admitLink?(link: LinkSession): Promise<"accept" | "reject">;
+  /** v2: failed link attempts per minute on this endpoint (section 11); only failures consume it. */
+  failedAttemptsPerMinute?: number;
+}
+
+/** M1: HostStore-backed checks and the control channel. */
+export function hostStoreAuthority(host: HostStore): LaneGrantAuthority {
+  return {
+    check: (token, laneId) => {
+      const r = host.checkGrantLive(token, laneId);
+      return r.ok ? { ok: true, claims: r.claims! } : { ok: false, reason: r.reason, ...(r.claims ? { claims: r.claims } : {}) };
+    },
+    keyPair: (laneId) => {
+      const keys = host.laneKeys(laneId);
+      if (!keys) throw new Error("lane keys missing");
+      return { publicKey: importPublicKey(keys.publicKeyB64), secretKey: importSecretKey(keys.secretKeyB64) };
+    },
+    controlChannel: true,
+  };
+}
+
 export interface LaneEndpointDeps {
-  host: HostStore;
+  /** M1 host store (grants, keys, room settings, control channel). */
+  host?: HostStore;
+  /** v2: grant authority instead of `host`. */
+  authority?: LaneGrantAuthority;
+  /** v2: the lane's effective project-name policy (grants-v2 13.2), shared by its routes. */
+  projectNames?: ProjectNamePolicy;
+  /** v2: viewer errors carry an error reference (grants-v2 13.1). */
+  errorRefs?: boolean;
   paseoHome: string;
   limits?: ResourceLimits;
   /** Called once when the lane agent is archived or deleted; the gateway closes the lane (C-13). */
@@ -97,15 +153,24 @@ export class LaneEndpoint {
   /** Project name visibility, shared by every route of this lane (room setting, default hidden). */
   readonly projectNames: ProjectNamePolicy;
   /** Full text of errors viewers got as generic text. Owner-only (rooms.lane.errors); never forwarded. */
-  readonly errors = new LaneErrorLog();
+  readonly errors: LaneErrorLog;
+  readonly authority: LaneGrantAuthority;
+  /** v2: failed link attempts (grants-v2 section 11). Null in M1. */
+  readonly failures: TokenBucket | null;
 
   constructor(readonly lane: Lane, readonly deps: LaneEndpointDeps) {
     this.scope = { agentId: lane.agentId, workspaceId: lane.workspaceId };
     this.directory = new LaneDirectory(this);
     this.limits = deps.limits ?? DEFAULT_LIMITS;
-    this.projectNames = {
-      show: deps.host.roomSettings(lane.roomId).showProjectName,
-      label: neutralProjectLabel(deps.host.room(lane.roomId)?.name, lane.label),
+    this.errors = new LaneErrorLog(undefined, undefined, undefined, deps.errorRefs === true);
+    if (deps.authority) this.authority = deps.authority;
+    else if (deps.host) this.authority = hostStoreAuthority(deps.host);
+    else throw new Error("lane endpoint needs a host store or a grant authority");
+    const perMinute = this.authority.failedAttemptsPerMinute;
+    this.failures = perMinute ? new TokenBucket(perMinute / 60, perMinute) : null;
+    this.projectNames = deps.projectNames ?? {
+      show: deps.host!.roomSettings(lane.roomId).showProjectName,
+      label: neutralProjectLabel(deps.host!.room(lane.roomId)?.name, lane.label),
     };
   }
 
@@ -161,6 +226,11 @@ export class LaneEndpoint {
     return this.links.filter((l) => l.claims?.sub === memberId).length;
   }
 
+  /** Accepted links of one device (v2: at most one, grants-v2 6.1). */
+  linksOfDevice(dev: string): LinkSession[] {
+    return this.links.filter((l) => l.claims?.dev === dev);
+  }
+
   get hostname(): string {
     return `room-lane-${this.lane.id.slice(5, 11)}`;
   }
@@ -183,9 +253,7 @@ export class LaneEndpoint {
   }
 
   keyPair() {
-    const keys = this.deps.host.laneKeys(this.lane.id);
-    if (!keys) throw new Error("lane keys missing");
-    return { publicKey: importPublicKey(keys.publicKeyB64), secretKey: importSecretKey(keys.secretKeyB64) };
+    return this.authority.keyPair(this.lane.id);
   }
 
   async start(): Promise<void> {
@@ -422,7 +490,7 @@ export class LaneConnection {
         void this.link.onHello(msg);
         return;
       }
-      if (msg?.type === "rooms.control.hello") {
+      if (msg?.type === "rooms.control.hello" && this.endpoint.authority.controlChannel) {
         this.mode = "control";
         void handleControlChannel(this.endpoint, {
           first: msg,
@@ -461,6 +529,7 @@ export class LaneConnection {
       denyLog.log(`conn:${this.connectionId}`, "link_rate_limited", { conn: this.tag, sub: this.link.claims?.sub ?? null });
       return;
     }
+    this.link?.noteRx();
     if (msg?.type === "ping") return this.send({ type: "pong" });
     this.link?.onFrame(msg);
   }
@@ -485,7 +554,11 @@ export class LinkSession {
   accepted = false;
   closed = false;
   private grant: string | null = null; // bearer secret, memory only
-  claims: GrantClaims | null = null;
+  claims: LinkClaims | null = null;
+  /** When the hello was accepted (grants-v2 6.2 `since`), unix ms. */
+  acceptedAt = 0;
+  /** Last inbound frame on this link (liveness for grants-v2 6.1), unix ms. */
+  lastRxAt = 0;
   readonly channels = new Map<string, VirtualSession>();
   private expiryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly openedAt = Date.now();
@@ -503,6 +576,10 @@ export class LinkSession {
     this.conn.send({ type: "session", message });
   }
 
+  noteRx(): void {
+    this.lastRxAt = Date.now();
+  }
+
   async onHello(hello: any): Promise<void> {
     const auth = hello?.auth;
     let reason: "password_required" | "incorrect_password" | null = null;
@@ -510,14 +587,25 @@ export class LinkSession {
     if (!auth) reason = "password_required";
     else if (auth.kind !== "password" || typeof auth.password !== "string") reason = "incorrect_password";
     else {
-      const check = this.endpoint.deps.host.checkGrantLive(auth.password, this.endpoint.lane.id);
+      const ep = this.endpoint;
+      // v2 (section 11): an empty failure bucket leaves only the cheap path (current gid first).
+      const cheap = ep.failures ? !ep.failures.peek() : false;
+      const check = ep.authority.check(auth.password, ep.lane.id, { cheap });
       this.claims = check.claims ?? null;
       if (!check.ok) {
         reason = "incorrect_password";
         detail = check.reason;
+        ep.failures?.take();
       } else this.grant = auth.password;
     }
-    if (!reason && this.endpoint.linksOf(this.claims!.sub) >= this.endpoint.limits.maxLinksPerMember) {
+    if (!reason && this.endpoint.authority.admitLink) {
+      const verdict = await this.endpoint.authority.admitLink(this);
+      if (verdict !== "accept" || this.closed) {
+        this.grant = null;
+        if (!this.closed) setTimeout(() => this.conn.close("link_policy"), 100);
+        return;
+      }
+    } else if (!reason && this.endpoint.linksOf(this.claims!.sub) >= this.endpoint.limits.maxLinksPerMember) {
       // Not an auth failure: closing without hello.rejected keeps the member daemon from rotating.
       denyLog.log(`lane:${this.endpoint.lane.id}:links:${this.claims!.sub}`, "link_cap_reached", {
         conn: this.conn.tag,
@@ -543,6 +631,7 @@ export class LinkSession {
       return;
     }
     this.accepted = true;
+    this.acceptedAt = Date.now();
     this.armExpiry();
     log("link_hello_accepted", {
       conn: this.conn.tag,
@@ -573,7 +662,9 @@ export class LinkSession {
           return;
         }
         const sub = this.claims!.sub;
-        const slot = this.channels.size < this.endpoint.limits.maxRoutesPerLink ? this.endpoint.takeRouteSlot(sub) : null;
+        const ep = this.endpoint;
+        const room = this.channels.size < ep.limits.maxRoutesPerLink && ep.routes.length < ep.limits.maxRoutesPerLane;
+        const slot = room ? ep.takeRouteSlot(sub) : null;
         if (slot === null) {
           denyLog.log(`lane:${this.endpoint.lane.id}:routes:${sub}`, "route_cap_reached", { conn: this.conn.tag, sub, channels: this.channels.size });
           this.sendSession({ type: "rpc_error", payload: { requestId: m.requestId, requestType: m.type, code: "resource_limit", error: "Too many host channels" } });
@@ -614,7 +705,7 @@ export class LinkSession {
   recheck(trigger: string): boolean {
     if (this.closed) return false;
     if (!this.grant) return false;
-    const check = this.endpoint.deps.host.checkGrantLive(this.grant, this.endpoint.lane.id);
+    const check = this.endpoint.authority.check(this.grant, this.endpoint.lane.id);
     if (!check.ok) {
       this.cut(`${check.reason} (${trigger})`);
       return false;

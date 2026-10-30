@@ -12,6 +12,15 @@
 // signed through the AdminSigner's confirmation token; the RPC call is the confirmation in this
 // development runtime (the UI flow is I-14).
 //
+// Lanes and grants (I-10): the owner creates a lane for an agent of its daemon (`lane.created`), the
+// lane endpoint runs under grants v2 (server/host/grants.ts, lane-service.ts) and revocations are
+// enforced before they are persisted (grants-v2 7.1; `persist_failed` is returned and shown). The
+// member asks for grants over its room session only after its own fold accepted the admission entry
+// (the gate in lane-registration.ts), registers each lane as a connected host, and rotates grants on
+// the schedule of grants-v2 5 (server/member/grant-scheduler.ts), on `grant.revoked` pushes and on
+// authentication failures of its registration. Short grants for tests: PASEO_ROOMS_DEV_SHORT_GRANTS=1
+// on the host (PASEO_ROOMS_DEV_GRANT_TTL_S, default 60).
+//
 // Relay: the genesis records `PASEO_ROOMS_RELAY_ENDPOINT` (host:port; default relay.paseo.sh:443) with
 // tls true. Owner side: `PASEO_ROOMS_RELAY_TLS=false` is honoured for loopback hosts only. Member side
 // (P-20): TLS always, a DNS-name relay, and a relay outside `trustedRelays` only after the user's
@@ -33,6 +42,15 @@ import { endpointKeyFromHost, RoomEndpoint } from "./host/room-endpoint";
 import { genesisPath, RoomHost } from "./host/room-host";
 import { ENV_KEYSTORE, openKeyStore, type Kek, type KeyStoreStatus } from "./keystore/keystore";
 import { log, logError } from "./log";
+import { HostGrants } from "./host/grants";
+import { LaneService } from "./host/lane-service";
+import { PersistFailedError } from "./platform/durable";
+import { GrantScheduler, type RegistrationObservation, type StoredSchedule } from "./member/grant-scheduler";
+import { memberRoomDir } from "./member/enrollment-journal";
+import { admissionGate } from "./member/lane-registration";
+import { serializeRelayConnectionUri } from "@getpaseo/protocol/daemon-endpoints";
+import { RoomSessionError } from "./member/room-client";
+import type { Frame } from "./transport/records";
 import { MemberEnrollment, type JoinView } from "./member/enroll-client";
 import { EnrollmentJournal } from "./member/enrollment-journal";
 import { checkInvite, DEFAULT_TRUSTED_RELAYS, laneHostLabel, requireRelayTrust, type InvitePreview } from "./member/invite-check";
@@ -78,8 +96,20 @@ export function relayAddress(relay: { host: string; port: number }, env: NodeJS.
 }
 
 
-type Owned = { host: RoomHost; signer: AdminSigner | null; endpoint: RoomEndpoint };
+type Owned = { host: RoomHost; signer: AdminSigner | null; endpoint: RoomEndpoint; grants: HostGrants; lanes: LaneService };
 type Joined = { client: RoomClient; memberId: string; deviceId: string };
+
+const SCHEDULE_FILE = "grant-schedule.json";
+const AUTH_FAILURE_CODES = new Set(["authentication_failed", "auth_failed", "incorrect_password", "password_required"]);
+
+/** Thrown to RPC callers when access was cut but the change could not be saved (grants-v2 7.2). */
+export class PersistFailedRpcError extends Error {
+  readonly code = "persist_failed";
+  constructor(what: string) {
+    super(`persist_failed: ${what}. Access was cut, but the change could not be saved. It will be lost if the daemon restarts. Free disk space or fix permissions.`);
+    this.name = "PersistFailedRpcError";
+  }
+}
 
 const MemberKeysFile = (v: unknown) => v as { v: 2; typ: "member-keys"; roomId: string; genesisHash: string; memberId: string; deviceId: string; sig: { kid: string; seed: string }; dh: { kid: string; secret: string } };
 
@@ -98,6 +128,14 @@ export class RoomsRuntimeV2 {
   /** Member journals by room: running enrollments and failed joins kept for the UI. */
   readonly joining = new Map<string, MemberEnrollment>();
   private readonly registrars = new Map<string, LaneRegistrar>();
+  /** Member: grant schedulers by room, then lane. */
+  private readonly schedulers = new Map<string, Map<string, GrantScheduler>>();
+  /** Member: hosts.observe view of our lane registrations, by registrationId. */
+  private readonly registrations = new Map<string, RegistrationObservation & { code: string | null }>();
+  private readonly authRetryAt = new Map<string, number>();
+  private observing: { release(): Promise<void> } | null = null;
+  /** Notices sessions that ended (access_ended) and stops their lanes. */
+  private endedWatch: ReturnType<typeof setInterval> | null = null;
   private paseo: PaseoApi | null = null;
   private started: Promise<void> | null = null;
   private stopping = false;
@@ -114,7 +152,9 @@ export class RoomsRuntimeV2 {
 
   /** The PaseoApi of the latest RPC context: lane registration waits for it (section 8). */
   attach(paseo: PaseoApi | null | undefined): void {
-    if (paseo) this.paseo = paseo;
+    if (!paseo) return;
+    this.paseo = paseo;
+    if (!this.observing && !this.stopping) this.observeHosts(paseo);
   }
 
   start(): Promise<void> {
@@ -162,6 +202,10 @@ export class RoomsRuntimeV2 {
         logError("v2_journal_open_failed", e, { roomId });
       }
     }
+    this.endedWatch = setInterval(() => {
+      for (const [roomId, j] of this.joined) if (j.client.status === "ended" && this.schedulers.has(roomId)) this.stopLanes(roomId);
+    }, 1000);
+    (this.endedWatch as { unref?: () => void }).unref?.();
     this.state = "ready";
     log("v2_runtime_started", { owned: this.owned.size, joining: this.joining.size, keystore: status.backend });
   }
@@ -175,15 +219,22 @@ export class RoomsRuntimeV2 {
   private serve(host: RoomHost, signer: AdminSigner | null): void {
     const g = host.state.auth.endpoint.relay;
     const roomId = host.roomId;
+    const grants = new HostGrants({ dataDir: this.dataDir, kek: this.kek!, host, env: this.env });
+    let lanes: LaneService | null = null;
     const endpoint = new RoomEndpoint({
       host,
       endpointKey: endpointKeyFromHost(this.dataDir, this.kek!, host),
       relay: relayAddress(g, this.env),
       ...(this.tuning.timings ? { timings: this.tuning.timings } : {}),
       enrollment: { dataDir: this.dataDir, kek: this.kek!, admin: signer ? (type, data) => this.adminSubmit(roomId, type, data) : null },
+      grants,
+      onAppended: () => lanes?.sync(),
     });
-    this.owned.set(roomId, { host, signer, endpoint });
+    grants.afterAppend = () => endpoint.afterAppend();
+    lanes = new LaneService({ dataDir: this.dataDir, kek: this.kek!, host, grants, relay: relayAddress(g, this.env), paseoHome: this.paseoHome });
+    this.owned.set(roomId, { host, signer, endpoint, grants, lanes });
     endpoint.start();
+    lanes.start();
   }
 
   status() {
@@ -193,7 +244,7 @@ export class RoomsRuntimeV2 {
       state: this.state,
       error: this.error,
       keystore: ks ? { state: ks.state, backend: ks.backend, fallback: ks.state === "ready" ? ks.fallback : false } : null,
-      owned: [...this.owned.values()].map(({ host, endpoint }) => ({
+      owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes }) => ({
         roomId: host.roomId,
         serverId: endpoint.serverId,
         head: host.head,
@@ -202,6 +253,11 @@ export class RoomsRuntimeV2 {
         members: Object.keys(host.state.members).length,
         invites: (endpoint.enrollment?.invites() ?? []).map(inviteView),
         joinRequests: (endpoint.enrollment?.pendings() ?? []).map(pendingView),
+        lanes: lanes.lanes(),
+        grants: grants.view().current,
+        grantTtlS: grants.ttlS(),
+        persistError: grants.persistError ?? (host.isStopped ? "room_stopped" : null),
+        compromisedDevices: grants.compromisedDevices(),
       })),
       joining: [...this.joining.values()].map((e) => joinView(e.view())),
       joined: [...this.joined.entries()].map(([roomId, j]) => ({
@@ -213,6 +269,12 @@ export class RoomsRuntimeV2 {
         lastError: j.client.lastError,
         endedReason: j.client.endedReason,
         alerts: j.client.alerts.map((a) => ({ type: a.type, seq: a.seq })),
+        registration: this.registrars.get(roomId)?.status ?? null,
+        lanes: [...(this.schedulers.get(roomId)?.entries() ?? [])].map(([laneId, sc]) => {
+          const regId = this.joining.get(roomId)?.journal.e.registrations[laneId] ?? null;
+          const reg = regId ? this.registrations.get(regId) : undefined;
+          return { laneId, registrationId: regId, hostStatus: reg?.status ?? null, ...sc.view() };
+        }),
       })),
     };
   }
@@ -228,9 +290,9 @@ export class RoomsRuntimeV2 {
   // ------------------------------------------------------------------------------ owner: enrollment
 
   /** Creates an invite. The returned code is a bearer secret until used or expired (2.2). */
-  async createInvite(i: { roomId: string; role?: string; expS?: number; note?: string; roomName?: string }): Promise<{ code: string; inviteId: string; inviteRef: string; exp: number }> {
+  async createInvite(i: { roomId: string; role?: string; lanes?: string[]; expS?: number; note?: string; roomName?: string }): Promise<{ code: string; inviteId: string; inviteRef: string; exp: number }> {
     await this.ready();
-    return this.enrollmentOf(i.roomId).createInvite({ role: i.role, expS: i.expS, note: i.note, roomName: i.roomName });
+    return this.enrollmentOf(i.roomId).createInvite({ role: i.role, lanes: i.lanes ? [...new Set(i.lanes)].sort() : undefined, expS: i.expS, note: i.note, roomName: i.roomName });
   }
 
   async revokeInvite(roomId: string, inviteId: string): Promise<void> {
@@ -250,10 +312,69 @@ export class RoomsRuntimeV2 {
     this.enrollmentOf(roomId).reject(pendingId, reason);
   }
 
+  /**
+   * Removal (grants-v2 7.1): sessions and lane links are cut in the decide step, before the log
+   * append; a failed save of the grants file or of the log answers `persist_failed`.
+   */
   async removeMember(roomId: string, memberId: string): Promise<{ seq: number }> {
     await this.ready();
     if (!isId("member", memberId)) throw new Error("bad memberId");
-    return { seq: this.adminSubmit(roomId, "member.removed", { memberId, reason: "admin" }).receipt.entry.seq };
+    return this.reducing(roomId, () => ({ seq: this.adminSubmit(roomId, "member.removed", { memberId, reason: "admin" }).receipt.entry.seq }));
+  }
+
+  /** Lowers or changes a member's role (S-9: grants at the old role stop working at once). */
+  async changeRole(roomId: string, memberId: string, role: string): Promise<{ seq: number }> {
+    await this.ready();
+    if (!isId("member", memberId)) throw new Error("bad memberId");
+    const o = this.ownedRoom(roomId);
+    const ver = o.host.state.auth.versions[`role:${memberId}`] ?? -1;
+    return this.reducing(roomId, () => ({ seq: this.adminSubmit(roomId, "member.role.changed", { memberId, role, ver }).receipt.entry.seq }));
+  }
+
+  private reducing<T>(roomId: string, f: () => T): T {
+    const o = this.ownedRoom(roomId);
+    let out: T;
+    try {
+      out = f();
+    } catch (e) {
+      if (e instanceof PersistFailedError || o.host.isStopped) throw new PersistFailedRpcError("the room log could not be written");
+      throw e;
+    }
+    if (o.grants.persistError) throw new PersistFailedRpcError("the grant list could not be written");
+    return out;
+  }
+
+  // ------------------------------------------------------------------------------ owner: lanes
+
+  /** Creates a lane for an agent of this daemon (share; no new agent). The caller confirms `lane.created`. */
+  async createLane(i: { roomId: string; agentId: string; label?: string }): Promise<{ laneId: string; serverId: string }> {
+    const kek = await this.ready();
+    const o = this.ownedRoom(i.roomId);
+    if (!o.signer) throw new Error("No admin key for this room on this daemon");
+    if (!this.paseo) throw new Error("The Paseo API is not available yet");
+    const ref = await this.paseo.agents.ref(i.agentId).refresh();
+    const agent = ref?.agent;
+    if (!agent || agent.id !== i.agentId) throw new Error("Agent not found on this daemon");
+    if (agent.archivedAt) throw new Error("Agent is archived");
+    if (!agent.workspaceId) throw new Error("The agent has no workspace");
+    const owner = this.ownMemberId(kek, i.roomId);
+    return o.lanes.createLane({ agentId: agent.id, workspaceId: agent.workspaceId, label: i.label ?? "Live", owner, submit: (data) => void this.adminSubmit(i.roomId, "lane.created", data) });
+  }
+
+  /** Owner-only full error text of a lane (grants-v2 13.1); never crosses a lane endpoint. */
+  async laneErrors(roomId: string, laneId: string) {
+    await this.ready();
+    return this.ownedRoom(roomId).lanes.errors(laneId);
+  }
+
+  private ownMemberId(kek: Kek, roomId: string): string {
+    const plain = kek.readSealed(memberKeysPath(this.dataDir, roomId), memberKeysPurpose(roomId));
+    if (!plain) throw new Error("No device keys for that room on this daemon");
+    try {
+      return MemberKeysFile(rjcsParse(plain)).memberId;
+    } finally {
+      plain.fill(0);
+    }
   }
 
   /** Signs (the RPC call is the confirmation in the development runtime) and submits through the endpoint. */
@@ -341,27 +462,192 @@ export class RoomsRuntimeV2 {
   private afterAdmitted(j: EnrollmentJournal): void {
     if (this.stopping) return;
     const roomId = j.roomId;
-    if (j.state === "admitted" && !this.registrars.has(roomId)) {
+    const lanes = j.e.terms?.lanes ?? [];
+    if (!this.registrars.has(roomId)) {
+      // Gate (I-10): nothing below asks for a grant until our own fold accepted the admission entry.
+      const gate = () => {
+        const c = this.joined.get(roomId)?.client;
+        return admissionGate(c && c.status === "open" ? c : c?.sendingStopped ? c : null, j.e.admission, () => !!c?.state.members[j.e.memberId!]?.devices.some((d) => d.deviceId === j.e.deviceId));
+      };
       const r = new LaneRegistrar(
         {
           roomId,
           pluginId: PLUGIN_ID,
           hosts: () => (this.paseo?.hosts as unknown as HostsApi | undefined) ?? null,
-          // Lane grants are I-10 (grants-v2.md section 3).
-          connectionFor: async () => {
-            throw Object.assign(new Error("lane grants are not available yet"), { code: "grants_unavailable" });
+          gate,
+          connectionFor: async (laneId) => {
+            const g = await this.issueConnection(roomId, laneId, gate);
+            this.schedulerFor(roomId, laneId).armNew(g);
+            return g.connection;
           },
           label: (laneId) => laneHostLabel({ verifiedName: null, roomId }, laneId),
           record: (laneId, registrationId) => j.registration(laneId, registrationId),
           done: () => j.registered(),
+          ...(this.tuning.retryMs ? { setTimer: (f: () => void, ms: number) => setTimeout(f, Math.min(ms, this.tuning.retryMs![0] ?? ms)) } : {}),
         },
-        j.e.terms?.lanes ?? [],
+        lanes,
         j.e.registrations,
       );
       this.registrars.set(roomId, r);
-      r.start();
+      // Registered lanes from before a restart: re-arm their schedules (C-12).
+      const stored = this.readSchedules(roomId);
+      for (const laneId of lanes) {
+        const sc = this.schedulerFor(roomId, laneId);
+        const st = stored[laneId];
+        if (st && j.e.registrations[laneId]) sc.restore(st);
+      }
     }
-    void this.connect(roomId).catch((e) => logError("v2_connect_after_join_failed", e, { roomId }));
+    void this.connect(roomId)
+      .then(() => this.registrars.get(roomId)?.run())
+      .catch((e) => logError("v2_connect_after_join_failed", e, { roomId }));
+  }
+
+  /** `grant.issue` over the room session, then the connection URI for Paseo's hosts API. Never logged. */
+  private async issueConnection(roomId: string, laneId: string, gate?: () => string): Promise<{ connection: string; gid: string; iat: number; exp: number }> {
+    if (gate && gate() !== "accepted") throw Object.assign(new Error("admission not yet in the fold"), { code: "admission_unverified" });
+    const c = this.joined.get(roomId)?.client;
+    if (!c || c.status !== "open") throw Object.assign(new Error("no room session"), { code: "no_session" });
+    const offer = c.state.auth.lanes[laneId]?.offer;
+    if (!offer) throw Object.assign(new Error("lane not in the verified log"), { code: "unknown_lane" });
+    let reply: Frame;
+    try {
+      reply = await c.request({ t: "grant.issue", laneId });
+    } catch (e) {
+      throw Object.assign(new Error("grant.issue failed"), { code: e instanceof RoomSessionError ? e.code : "error" });
+    }
+    const token = typeof reply.grant === "string" ? reply.grant : "";
+    const claims = reply.claims as { gid?: unknown; iat?: unknown; exp?: unknown; laneId?: unknown } | undefined;
+    if (!token.startsWith("prg2.") || !claims || claims.laneId !== laneId || typeof claims.gid !== "string" || typeof claims.iat !== "number" || typeof claims.exp !== "number") {
+      throw Object.assign(new Error("bad grant.issue reply"), { code: "bad_reply" });
+    }
+    const relay = memberRelayAddress(offer.relay, this.env);
+    const connection = serializeRelayConnectionUri({
+      offer: { v: 2, serverId: offer.serverId, daemonPublicKeyB64: b64uDecode(offer.dh.pub, 32).toString("base64"), relay: { endpoint: relay.endpoint, useTls: relay.useTls }, minimumSecurityMode: "protected" },
+      password: token,
+    } as Parameters<typeof serializeRelayConnectionUri>[0]);
+    return { connection, gid: claims.gid, iat: claims.iat, exp: claims.exp };
+  }
+
+  private schedulerFor(roomId: string, laneId: string): GrantScheduler {
+    let byLane = this.schedulers.get(roomId);
+    if (!byLane) this.schedulers.set(roomId, (byLane = new Map()));
+    let sc = byLane.get(laneId);
+    if (sc) return sc;
+    sc = new GrantScheduler({
+      roomId,
+      laneId,
+      mono: () => performance.now(),
+      wall: () => Date.now(),
+      rotate: async () => this.rotateGrant(roomId, laneId),
+      status: async () => {
+        const c = this.joined.get(roomId)?.client;
+        if (!c || c.status !== "open") throw Object.assign(new Error("no room session"), { code: "no_session" });
+        const r = await c.request({ t: "grant.status", laneId });
+        return { gid: (r.gid as string | null) ?? null, links: Array.isArray(r.links) ? (r.links as { since: number; routes: number }[]).slice(0, 4) : [], serverTime: Number(r.serverTime) };
+      },
+      registration: () => {
+        const id = this.joining.get(roomId)?.journal.e.registrations[laneId];
+        return (id && this.registrations.get(id)) || { status: "unknown", onlineSince: null, offlineSince: null };
+      },
+      report: async (gid) => {
+        const c = this.joined.get(roomId)?.client;
+        if (c?.status === "open") await c.request({ t: "grant.report", laneId, gid, reason: "unaccounted_link" });
+      },
+      save: (st) => this.saveSchedule(roomId, laneId, st),
+    });
+    byLane.set(laneId, sc);
+    return sc;
+  }
+
+  /** A new grant registered with Paseo through hosts.update (the registration exists already). */
+  private async rotateGrant(roomId: string, laneId: string): Promise<{ gid: string; iat: number; exp: number }> {
+    const j = this.joining.get(roomId)?.journal;
+    const registrationId = j?.e.registrations[laneId];
+    const hosts = this.paseo?.hosts as unknown as HostsApi | undefined;
+    if (!registrationId) throw Object.assign(new Error("lane not registered yet"), { code: "not_registered" });
+    if (!hosts) throw Object.assign(new Error("no Paseo API yet"), { code: "no_api" });
+    const g = await this.issueConnection(roomId, laneId);
+    const metadata = { "rooms.roomId": roomId, "rooms.laneId": laneId, "rooms.role": "lane" };
+    await hosts.update(registrationId, { connection: g.connection, label: laneHostLabel({ verifiedName: null, roomId }, laneId), metadata, enabled: true });
+    return { gid: g.gid, iat: g.iat, exp: g.exp };
+  }
+
+  private schedulePath(roomId: string): string {
+    return nodePath.join(memberRoomDir(this.dataDir, roomId), SCHEDULE_FILE);
+  }
+
+  private readSchedules(roomId: string): Record<string, StoredSchedule> {
+    try {
+      const v = JSON.parse(fs.readFileSync(this.schedulePath(roomId), "utf8")) as Record<string, StoredSchedule>;
+      return v && typeof v === "object" ? v : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** Grant timing only (gid, lifetime, receive time): never the grant itself, which lives in Paseo's hosts.json. */
+  private saveSchedule(roomId: string, laneId: string, st: StoredSchedule): void {
+    try {
+      writePrivateFile(this.schedulePath(roomId), JSON.stringify({ ...this.readSchedules(roomId), [laneId]: st }));
+    } catch (e) {
+      log("grant_schedule_save_failed", { roomId, code: (e as { code?: string }).code ?? "error" });
+    }
+  }
+
+  /** hosts.observe: our registrations' status for the idle rule, and auth failures for rotation. */
+  private observeHosts(paseo: PaseoApi): void {
+    try {
+      const sub = (paseo.hosts as unknown as { observe(): { release(): Promise<void>; subscribe(h: unknown): void; ready: Promise<unknown> } }).observe();
+      this.observing = sub;
+      const apply = (dir: unknown) => {
+        const hosts = (dir as { hosts?: unknown[] } | undefined)?.hosts;
+        if (Array.isArray(hosts)) this.onHosts(hosts as { registrationId: string; status?: string; error?: { code?: string } | null }[]);
+      };
+      sub.subscribe({
+        snapshot: (snap: any) => apply(snap?.hosts ? snap : snap?.directory ?? snap?.value),
+        update: (m: any) => m?.type === "hosts.changed" && apply(m.payload?.directory),
+        error: (e: unknown) => logError("hosts_observe_error", e),
+      });
+      void sub.ready.then((snap: any) => apply(snap?.hosts ? snap : snap?.directory ?? snap?.value)).catch((e) => logError("hosts_observe_failed", e));
+    } catch (e) {
+      logError("hosts_observe_unavailable", e);
+    }
+  }
+
+  private onHosts(hosts: { registrationId: string; status?: string; error?: { code?: string } | null }[]): void {
+    const now = Date.now();
+    for (const h of hosts) {
+      const lane = this.laneOfRegistration(h.registrationId);
+      if (!lane) continue;
+      const status = (["online", "offline", "connecting", "error"].includes(h.status ?? "") ? h.status : "unknown") as RegistrationObservation["status"];
+      const prev = this.registrations.get(h.registrationId);
+      const next = {
+        status,
+        onlineSince: status === "online" ? (prev ? (prev.status === "online" ? prev.onlineSince : now) : null) : null,
+        offlineSince: status === "online" ? null : prev && prev.status !== "online" ? prev.offlineSince : prev ? now : null,
+        code: h.error?.code ?? null,
+      };
+      this.registrations.set(h.registrationId, next);
+      if (prev?.status !== status) log("lane_host_status", { roomId: lane.roomId, laneId: lane.laneId, status, error: next.code });
+      if (status === "error" && next.code && AUTH_FAILURE_CODES.has(next.code) && this.joined.get(lane.roomId)?.client.status === "open") {
+        const key = `${lane.roomId} ${lane.laneId}`;
+        if ((this.authRetryAt.get(key) ?? 0) > now) continue;
+        this.authRetryAt.set(key, now + 15_000);
+        void this.schedulers.get(lane.roomId)?.get(lane.laneId)?.rotate("auth_failed");
+      }
+    }
+  }
+
+  private laneOfRegistration(registrationId: string): { roomId: string; laneId: string } | null {
+    for (const [roomId, e] of this.joining) for (const [laneId, id] of Object.entries(e.journal.e.registrations)) if (id === registrationId) return { roomId, laneId };
+    return null;
+  }
+
+  /** Session pushes: `grant.revoked` (theft, role change) asks for a new grant through the session. */
+  private onSessionPush(roomId: string, frame: Frame): void {
+    if (frame.t !== "grant.revoked" || typeof frame.laneId !== "string") return;
+    log("grant_revoked_push", { roomId, laneId: frame.laneId, reason: String(frame.reason ?? "").slice(0, 32) });
+    void this.schedulers.get(roomId)?.get(frame.laneId)?.rotate(`revoked_${String(frame.reason ?? "unknown").slice(0, 24)}`);
   }
 
   private trustedRelays(): string[] {
@@ -389,7 +675,7 @@ export class RoomsRuntimeV2 {
     this.joined.get(roomId)?.client.close();
     const keys = this.deviceFor(kek, roomId);
     const v = verifyGenesis(keys.genesis);
-    const client = new RoomClient({ genesis: keys.genesis, device: keys.device, relay: keys.relay(v.genesis), timings: this.tuning.timings });
+    const client = new RoomClient({ genesis: keys.genesis, device: keys.device, relay: keys.relay(v.genesis), timings: this.tuning.timings, onPush: (f) => this.onSessionPush(roomId, f) });
     this.joined.set(roomId, { client, memberId: keys.memberId, deviceId: keys.deviceId });
     try {
       await client.connect();
@@ -398,7 +684,18 @@ export class RoomsRuntimeV2 {
     } catch (e) {
       log("v2_connect_failed", { roomId, code: (e as { code?: string }).code ?? "error" });
     }
+    if (client.status === "ended" && this.schedulers.has(roomId)) this.stopLanes(roomId);
     return { status: client.status, lastError: client.lastError };
+  }
+
+  /** Access ended: stop rotating and remove our lane registrations (their grants no longer work). */
+  private stopLanes(roomId: string): void {
+    for (const sc of this.schedulers.get(roomId)?.values() ?? []) sc.stop();
+    this.schedulers.delete(roomId);
+    this.registrars.get(roomId)?.stop();
+    const regs = this.joining.get(roomId)?.journal.e.registrations ?? {};
+    const hosts = this.paseo?.hosts as unknown as { remove?(id: string): Promise<unknown> } | undefined;
+    for (const id of Object.values(regs)) void hosts?.remove?.(id).catch((e) => logError("lane_host_remove_failed", e, { roomId }));
   }
 
   private deviceFor(kek: Kek, roomId: string): { genesis: RoomGenesis | Uint8Array; device: { publicKey: Uint8Array; secretKey: Uint8Array }; memberId: string; deviceId: string; relay(g: RoomGenesis): RelayAddress } {
@@ -447,10 +744,15 @@ export class RoomsRuntimeV2 {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    if (this.endedWatch) clearInterval(this.endedWatch);
     for (const r of this.registrars.values()) r.stop();
+    for (const m of this.schedulers.values()) for (const sc of m.values()) sc.stop();
+    void this.observing?.release().catch(() => undefined);
     for (const e of this.joining.values()) e.close();
     for (const j of this.joined.values()) j.client.close();
     for (const o of this.owned.values()) {
+      await o.lanes.stop();
+      o.grants.stop();
       o.endpoint.stop();
       o.host.close();
     }

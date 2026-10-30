@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Identity v2 end-to-end test (implementation plan I-8, I-9): room endpoint transport, sessions and SAS
-# enrollment between two disposable Paseo 0.13.2 test daemons running the plugin with
-# PASEO_ROOMS_PROTOCOL=v2. The driver restarts both daemons once, mid-enrollment.
+# Identity v2 end-to-end test (implementation plan I-8, I-9, I-10): room endpoint transport, sessions,
+# SAS enrollment and lane grants v2 between two disposable Paseo 0.13.2 test daemons running the plugin
+# with PASEO_ROOMS_PROTOCOL=v2. The driver restarts both daemons once, mid-enrollment, views the lane
+# through the member, waits for an idle and a forced grant rotation (short grants: 40 s), revokes, and
+# scans both homes for invite codes (prc2.) and grants (prg2.).
 #
 #   owner  : plugin/.test-homes/v2-owner   127.0.0.1:6921  (room host, room endpoint)
 #   member : plugin/.test-homes/v2-member  127.0.0.1:6922  (member device)
@@ -9,7 +11,8 @@
 #            or the live relay relay.paseo.sh:443 with --live-relay (network; needs the user's go-ahead)
 #
 # Never touches ~/.paseo or the main daemon: every CLI call passes --home and PASEO_HOME explicitly.
-# Creates no agents and makes no model or API calls. Keys use the protected fallback file
+# Creates ONE agent on the owner for the lane (Claude Haiku, created without a prompt: no model call),
+# archived at the end; no other agents, no model or API calls. Keys use the protected fallback file
 # (PASEO_ROOMS_KEYSTORE=fallback-file), so the user's keyring is never read or written. The daemons'
 # own relay registration stays off in both modes; only the plugin's room endpoint uses the relay.
 #
@@ -41,6 +44,7 @@ RELAY_PORT=6923
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 LOGDIR=$E2E_DIR/logs/$RUN_ID          # one directory per run; earlier runs are kept
 RELAY_PID=""
+SCRATCH=$HOMES/v2-scratch            # the lane agent's working directory
 
 # ------------------------------------------------------------------ safety gates (before anything runs)
 MAIN_HOME=$(realpath -m "$HOME/.paseo")
@@ -73,6 +77,8 @@ mkdir -p "$LOGDIR"
 export PASEO_DICTATION_ENABLED=false PASEO_VOICE_MODE_ENABLED=false
 # Plugin settings for the test daemons (inherited by the daemons and their plugin processes).
 export PASEO_ROOMS_PROTOCOL=v2 PASEO_ROOMS_KEYSTORE=fallback-file
+# Development short grants (grants-v2 section 5): honoured by the host only; never set outside tests.
+export PASEO_ROOMS_DEV_SHORT_GRANTS=1 PASEO_ROOMS_DEV_GRANT_TTL_S=40
 unset PASEO_ROOMS_KEK_FILE
 if [ "$LIVE" = 1 ]; then
   unset PASEO_ROOMS_RELAY_ENDPOINT PASEO_ROOMS_RELAY_TLS PASEO_ROOMS_DEV_INSECURE_RELAY   # default: relay.paseo.sh:443 over TLS
@@ -118,7 +124,7 @@ cleanup() {
     kill "$RELAY_PID" 2>/dev/null || true
     wait "$RELAY_PID" 2>/dev/null || true
   fi
-  if [ -z "${KEEP_HOMES:-}" ]; then rm -rf "$OWNER" "$MEMBER"; echo "deleted v2 test homes"; fi
+  if [ -z "${KEEP_HOMES:-}" ]; then rm -rf "$OWNER" "$MEMBER" "$SCRATCH"; echo "deleted v2 test homes"; fi
   if pgrep -f "$HOMES/v2-" >/dev/null; then echo "WARNING: processes still reference the v2 test homes"; code=1; else echo "no test processes left"; fi
   local busy=""
   for port in $(seq 6920 6929); do port_open "$port" && busy="$busy $port"; done
@@ -128,8 +134,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-rm -rf "$OWNER" "$MEMBER"
-mkdir -p "$HOMES"; chmod 700 "$HOMES"
+rm -rf "$OWNER" "$MEMBER" "$SCRATCH"
+mkdir -p "$HOMES" "$SCRATCH"; chmod 700 "$HOMES" "$SCRATCH"
 
 if [ "$LIVE" != 1 ]; then
   "${TSX[@]}" "$E2E_DIR/fake-relay-main.ts" "$RELAY_PORT" > "$LOGDIR/fake-relay.log" 2>&1 &
@@ -143,6 +149,6 @@ write_config "$MEMBER" "$MEMBER_PORT"
 for h in "$OWNER" "$MEMBER"; do pa "$h" daemon start --timeout 120 | tail -1; done
 for h in "$OWNER" "$MEMBER"; do pa "$h" plugin install "$PLUGIN_DIR" --json | tail -3; done
 
-E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_PASEO_BIN=$P \
+E2E_SCRATCH=$SCRATCH E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_PASEO_BIN=$P \
   "${TSX[@]}" "$E2E_DIR/e2e.ts" 2>&1 | tee "$LOGDIR/e2e.log"
 test "${PIPESTATUS[0]}" -eq 0

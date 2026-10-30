@@ -15,6 +15,8 @@ export interface ResourceLimits {
   maxRoutesPerLink: number;
   /** Routed sessions per member across all of that member's links on the lane. */
   maxRoutesPerMember: number;
+  /** Routed sessions on one lane endpoint, all links (grants-v2 section 11: 256). */
+  maxRoutesPerLane: number;
   /** Largest relay frame accepted from a member daemon, in bytes (ws maxPayload). */
   maxInboundFrameBytes: number;
   /** Largest routed viewer message (the JSON string inside hosts.route.frame), in characters. */
@@ -42,6 +44,7 @@ export const LIMIT_BOUNDS: Record<keyof ResourceLimits, Bound> = {
   maxLinksPerMember: { min: 1, max: 16, default: 2 },
   maxRoutesPerLink: { min: 1, max: 128, default: 16 },
   maxRoutesPerMember: { min: 1, max: 256, default: 32 },
+  maxRoutesPerLane: { min: 1, max: 1024, default: 256 },
   maxInboundFrameBytes: { min: 64 * 1024, max: 16 * 1024 * 1024, default: 1024 * 1024 },
   maxRouteMessageChars: { min: 16 * 1024, max: 4 * 1024 * 1024, default: 256 * 1024 },
   maxUpstreamFrameBytes: { min: 1024 * 1024, max: 100 * 1024 * 1024, default: 32 * 1024 * 1024 },
@@ -91,6 +94,12 @@ export class TokenBucket {
   ) {
     this.tokens = burst;
     this.at = now();
+  }
+
+  /** True when a token is available, without taking it. */
+  peek(): boolean {
+    const t = this.now();
+    return Math.min(this.burst, this.tokens + ((t - this.at) / 1000) * this.ratePerSecond) >= 1;
   }
 
   take(): boolean {

@@ -18,7 +18,7 @@
 //   the host-local access log.
 //
 // Not here (later milestones): sessions, log.fetch and subscribe (I-8), invites and enrollment (I-9),
-// grants (I-10), host key rotation (the host refuses a host.key.rotated naming a key it does not hold;
+// host key rotation (the host refuses a host.key.rotated naming a key it does not hold;
 // I-12), the adjacent rekey approval plus commit write (I-13), revocation enforce-first ordering
 // (grants-v2 7.1; nothing to enforce before grants and sessions exist).
 import * as fs from "node:fs";
@@ -35,7 +35,7 @@ import { appendLine, PersistFailedError, writePrivateFile } from "../platform/du
 import { defaultProtection, type FileProtection } from "../platform/file-protection";
 import { LogLockLostError, LogWriterLock, type LogLockOptions } from "../platform/log-lock";
 import { b64u, b64uDecode } from "../proto/b64u";
-import { CTX_LOG_ENTRY, stmtContext } from "../proto/contexts";
+import { CTX_LANE_GRANT, CTX_LOG_ENTRY, stmtContext } from "../proto/contexts";
 import { isServerId } from "../proto/ids";
 import { ed25519PrivateKeyFromSeed, kid as kidOf, rawPublicKey } from "../proto/keys";
 import { rjcs, rjcsParse, rjcsText, RJCS_MAX_BYTES } from "../proto/rjcs";
@@ -199,6 +199,13 @@ export class RoomHostError extends Error {
   }
 }
 
+/**
+ * Steps 1 and 2 of grants-v2 7.1 (decide, enforce): called with the state the entry will produce,
+ * after the fold accepted it and before anything touches disk. Must not do log I/O; errors are logged
+ * and never stop the append.
+ */
+export type DecideListener = (next: Readonly<RoomState>, prev: Readonly<RoomState>, type: StatementType) => void;
+
 export type SubmitRejection = "stale_base" | "unknown_base" | "not_permitted";
 export type SubmitResult =
   | { ok: true; receipt: SignedEntry }
@@ -232,6 +239,8 @@ export class RoomHost {
   private readonly signers: Map<string, HostSigner>;
   private stopped: string | null = null;
   private lastHts = 0;
+  /** Revocation ordering (grants-v2 7.1): called after the fold check, before the log append. */
+  private readonly decideListeners: DecideListener[] = [];
 
   private constructor(
     private readonly opts: OpenRoomHostOptions,
@@ -420,6 +429,27 @@ export class RoomHost {
     ];
   }
 
+  /** Registers a decide-and-enforce listener (grants-v2 7.1); returns the unregister function. */
+  onDecide(fn: DecideListener): () => void {
+    this.decideListeners.push(fn);
+    return () => {
+      const i = this.decideListeners.indexOf(fn);
+      if (i >= 0) this.decideListeners.splice(i, 1);
+    };
+  }
+
+  /**
+   * Signs a lane grant (grants-v2 2) with the current host key, under the "lane-grant" context only.
+   * Refused while that key is uncertified or revoked: such a key never issues grants.
+   */
+  signGrant(payload: Uint8Array): { kid: string; sig: Buffer } {
+    this.assertRunning();
+    const cur = this.fold.state.auth.hostKeys.find((h) => h.toSeq === null);
+    if (!cur || cur.uncertified || cur.revoked) throw new RoomHostError("host_key_missing", "The current host key may not issue grants");
+    const signer = this.currentSigner();
+    return { kid: signer.kid, sig: signer.sign(CTX_LANE_GRANT, payload) };
+  }
+
   /** Clean shutdown: stops the heartbeat and deletes the lock. */
   close(): void {
     this.lock.release();
@@ -462,12 +492,22 @@ export class RoomHost {
       hostKid: signer.kid,
     };
     const signed: SignedEntry = { entry, hash: entryHash(entry), hsig: b64u(signer.sign(CTX_LOG_ENTRY, rjcs(entry))) };
+    let next: Readonly<RoomState>;
     try {
-      this.fold.check(signed, body);
+      next = this.fold.check(signed, body);
     } catch (err) {
       if (!(err instanceof FoldError)) throw err;
       const code: SubmitRejection = STALE_REASONS.has(err.reason) ? "stale_base" : UNKNOWN_BASE_REASONS.has(err.reason) ? "unknown_base" : "not_permitted";
       return this.reject(code, err.reason, err.message);
+    }
+    // Decide and enforce before the log write (grants-v2 7.1): access is cut even if the append fails.
+    const prev = this.fold.state;
+    for (const fn of [...this.decideListeners]) {
+      try {
+        fn(next, prev, sb.type);
+      } catch (err) {
+        log("room_host_decide_failed", { roomId: this.roomId, type: sb.type, error: String((err as Error)?.message ?? err).slice(0, 200) });
+      }
     }
     try {
       this.store.append(signed, body);

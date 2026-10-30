@@ -18,6 +18,7 @@ const PROOF_TIMEOUT_MS = 15_000;
 export async function handleControlChannel(endpoint: LaneEndpoint, io: ControlIo): Promise<void> {
   const host = endpoint.deps.host;
   const lane = endpoint.lane;
+  if (!host) throw new Error("the control channel is served only by M1 lane endpoints");
   const fail = (code: ControlErrorCode, message: string, op: ControlOp | null) => {
     log("control_error", { laneId: lane.id, op, code });
     io.send({ type: "rooms.control.error", v: 1, code, message });
