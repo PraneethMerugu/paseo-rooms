@@ -71,11 +71,69 @@ Known rough edges:
 
 ## Identity v2 screens (I-14)
 
-The v2 screens appear only when the daemon runs the v2 runtime (`PASEO_ROOMS_PROTOCOL=v2`); `rooms.bootstrap` then reports `protocol: "v2"`. Without the switch the M1 screens above are shown, unchanged. `up.sh` and `demo-setup.ts` set up M1 only; a v2 kit (`up-v2.sh`) is not written yet. To look at the v2 screens, start two disposable daemons as `test/e2e-v2/run.sh` does (homes under `plugin/.test-homes/v2-*`, ports 6920-6929, `PASEO_ROOMS_PROTOCOL=v2`, `PASEO_ROOMS_KEYSTORE=fallback-file`, and either the fake relay with `PASEO_ROOMS_RELAY_ENDPOINT=127.0.0.1:6923 PASEO_ROOMS_RELAY_TLS=false PASEO_ROOMS_DEV_INSECURE_RELAY=1` or the live relay), add them as hosts, and walk through the list below by hand.
+The v2 screens appear only when the daemon runs the v2 runtime (`PASEO_ROOMS_PROTOCOL=v2`); `rooms.bootstrap` then reports `protocol: "v2"`. Without the switch the M1 screens above are shown, unchanged. `up.sh` and `demo-setup.ts` set up M1 only; use the v2 kit below for the v2 screens.
+
+### Identity v2 kit (`up-v2.sh`)
+
+Three disposable daemons with `PASEO_ROOMS_PROTOCOL=v2`. The two kits use different ports and homes and can run at the same time.
+
+| Daemon | Address | Role |
+|---|---|---|
+| v2-owner | `127.0.0.1:6912` | owns "UI check room v2" and "SAS demo room", hosts the lane |
+| v2-member | `127.0.0.1:6913` | member device A ("demo-member laptop") |
+| v2-member2 | `127.0.0.1:6914` | the same member's second device B ("demo-member phone") |
+| fake relay | `127.0.0.1:6915` | only with `--offline` |
+
+```bash
+cd plugin/ui-check
+./up-v2.sh             # live relay relay.paseo.sh:443 for the room endpoint (about 45 s)
+./up-v2.sh --offline   # fake relay on 127.0.0.1:6915, no network
+./down-v2.sh           # archive the agent, stop everything, delete .homes-v2
+```
+
+**Cost: zero model calls.** `up-v2.sh` creates one Claude Haiku agent for the lane without a prompt, so no turn runs. Step 5 of the script checks this and fails otherwise: the agent's timeline is empty (`paseo logs`), its `LastUsage` is null (`paseo inspect`), and no daemon log has a finished turn ("Sending push notification"). The test runs on 2026-11-01 also showed no `claude` process under any test daemon.
+
+**Network.** Live mode: only the room endpoint and the member connections to `relay.paseo.sh:443` (checked with `ss` on 2026-11-01: every non-loopback connection of the test daemons went to the relay's address). Offline mode: loopback only. The daemons' own relay registration is off in both modes.
+
+**Safety.** Same gates as `up.sh` and `test/e2e-v2/run.sh`: homes must resolve under `ui-check/.homes-v2` (0700, git-ignored) and never to `~/.paseo`; ports outside 6912-6919, and 6767, are refused; every CLI call passes `--home` and `PASEO_HOME`; dictation and voice off; keys in the protected fallback file (`PASEO_ROOMS_KEYSTORE=fallback-file`), never the keyring; no development timers, short grants or test clock. Loopback listen, no password.
+
+**What `up-v2.sh` sets up** (`demo-setup-v2.ts`, all through the plugin RPCs the app uses):
+
+1. "UI check room v2" with a recovery key. The recovery code is discarded in memory: it is not shown, printed or saved.
+2. Lane "Demo lane" on the Haiku agent.
+3. demo-member admitted by the real enrollment flow: invite, join, SAS on both sides, "Codes match", Admit. TEST-ONLY: the script reads both six-digit codes from the status RPC and checks they are equal before pressing the buttons, as people would by voice.
+4. The member's lane grant and routed host, and three MLS chat messages between the owner's device and device A.
+5. Device link from A to B (link SAS compared the same way, both confirm). B is **held**: A was enrolled seconds ago (younger than 24 h), so the hold has no end time and an admin must approve.
+6. One open, unused invite in room 1 (code discarded).
+7. "SAS demo room" (recovery key skipped) with a **pending join** from device A, SAS shown on both sides. Before it, one attempt was started and cancelled (one abandoned attempt). Device B then tried the same invite while it was claimed: the host refused it and marked the request **contested**. This is the real host behaviour, not injected state.
+8. A scan of every file under `.homes-v2` for the invite codes, link code, their tokens and the recovery code. The script fails if one is found.
+
+The pending join times out **15 minutes** after setup (it then counts as a second abandoned attempt). To get a fresh owner-side SAS screen from the UI: on v2-owner, "SAS demo room" → **Lanes and invites** → **Create invite** → confirm → **Copy code**. On v2-member, press **Dismiss** on the old "SAS demo room" card if one is shown, paste the code under the join box, **Check code**, (offline only: **Trust this relay**), enter a name, **Join**. Both sides then show the six digits.
+
+**Add the three hosts:** in the app, **Settings → Add host → Direct connection**, once per daemon: Host `127.0.0.1`, Port `6912`, `6913`, `6914`, Use SSL off. No password. Do not use "Pair device".
+
+**What to look at** (sidebar row **Rooms** on each host):
+
+- **v2-owner (6912)**: badge "identity v2 (development)"; the fallback keystore notice; About.
+  - Room 1 card, **Members** tab: you and "demo-member laptop" (connected); the held device request for "demo-member phone" (sole device, admin must approve) with **Approve**.
+  - **Lanes and invites**: "Demo lane" online with one link; the open invite "spare invite (unused)" with **Revoke invite**; **Create invite**.
+  - **Keys**: host key, admin key, a recovery key present; rotate and revoke buttons (each opens the admin confirmation dialog; cancel to keep the demo).
+  - "SAS demo room" card: join request with the note, the self-reported name, the six digits, the abandoned-attempts line ("1 earlier attempt(s) on this invite were abandoned."), the red **contested** text ("Another device also tried to use this invite …") and border, the countdown, **Admit** / **Codes do not match** / **Cancel**.
+  - **Create room** opens the create dialog and, with "Create a recovery key", the recovery code dialog (adds a room; no model call).
+- **v2-member (6913)**: "Rooms you joined": "UI check room v2" connected, the held-device box for the phone ("… will join your membership in this room when an admin approves it", sole-device line) with **Not me**, **Link another device**, **Replace this device's keys**. The joining card for "SAS demo room" with the six digits, **Codes match**, **Codes do not match**, **Cancel**. The host list also shows the routed lane host "Demo lane" with the one agent.
+- **v2-member2 (6914)**: the held join of "UI check room v2" ("Your other device confirmed …"), and the failed join of "SAS demo room" (invite in use) with **Dismiss**.
+
+The chat messages have no screen yet (chat UI is milestone M2); only the counts in the MLS state exist.
+
+Actions that change the demo, worth trying last: **Not me** on v2-member (veto; conflict notices on both sides, **Resolve conflict** on the owner), **Approve** on v2-owner (B becomes an active device), **Admit** after "Codes match" on v2-member (A joins "SAS demo room"), removals and key rotations. Rerun `./down-v2.sh` and `./up-v2.sh` to reset.
+
+**Tear down:** remove the three hosts (and any routed "Demo lane" host) from the app, then run `./down-v2.sh`. It archives the agent, stops the daemons and the fake relay, kills leftovers, deletes `.homes-v2`, and reports whether ports 6912-6919 are free. It is safe to run repeatedly.
+
+### v2 checklist
 
 Nothing here was seen in a real app. The code passed `npm run typecheck:client` (no Node or DOM types) and the RPC contract tests only.
 
-Do each item on a wide window and a narrow window (compact layout), in a light and a dark theme.
+Do each item on a wide window and a narrow window (compact layout), in a light and a dark theme (**Settings → Appearance**). With the v2 kit running, the join request card, member join, device link hold, "Was this you?", owner tabs, admin dialogs, Create room and About are ready to look at. "Fix permissions", `stale_base`, "Agents from closed rooms" and the alert boxes need the extra steps given in their items (for "Fix permissions", stop one daemon with `PASEO_HOME=<home> /opt/Paseo/resources/bin/paseo daemon stop --home <home>`, with `<home>` under `ui-check/.homes-v2`, and start it the same way).
 
 - [ ] Only under v2: the header badge "identity v2 (development)"; a daemon without the switch shows the M1 screen.
 - [ ] Fallback keystore notice (the test daemons use the file keystore): persistent warning box at the top, readable in both themes.
@@ -108,10 +166,13 @@ Record what you see in `ui-notes.md` under "Observed in the app".
 
 ## Secrets
 
-`.homes` holds each daemon's local credential, the member's grant (in `hosts.json`) and the plugin keys. It is 0700, git-ignored and deleted by `down.sh`. The scripts print no credential, invite code or grant.
+`.homes` and `.homes-v2` hold each daemon's local credential, the member's grant (in `hosts.json`) and the plugin keys. Both are 0700, git-ignored and deleted by `down.sh` and `down-v2.sh`. The scripts print no credential, invite code, link code, grant or recovery code; `demo-setup-v2.ts` also checks that no code or token it handled is in any file under `.homes-v2`.
 
 ## Files
 
 - `up.sh`, `down.sh`: start and stop the kit.
 - `demo-setup.ts`: room, lane, invite and enrollment through plugin RPCs (run by `up.sh` with the Node bundled in Paseo).
+- `up-v2.sh`, `down-v2.sh`: start and stop the v2 kit (`--offline` for the fake relay).
+- `demo-setup-v2.ts`: v2 demo state through the plugin RPCs (run by `up-v2.sh`).
+- `fake-relay-v2.ts`: the unit-test fake relay on a port in 6912-6919 (offline mode).
 - `ui-notes.md`: client audit result and UI issues to confirm.
