@@ -1,43 +1,40 @@
-# paseo-rooms (Milestone 1)
+# paseo-rooms (identity v2)
 
-Paseo plugin `rooms` (package `paseo-rooms`). One plugin with three roles:
+Paseo plugin `rooms` (package `paseo-rooms`). One plugin, one runtime (`server/runtime-v2.ts`), with these roles on any daemon:
 
-- **gateway** on the owner's daemon: rooms, lanes, one relay endpoint per lane, the Room Profile filter, fork creation and the room agent tool guard;
-- **embedded host** inside the gateway: membership, Ed25519 grants, revocation, invites and the signed room log;
-- **member** on each member's daemon: device key, enrollment, connected-host registration and grant rotation.
+- **room host and admin** on the owner's daemon: the room's signed log, its room endpoint on the relay (Noise IK sessions), SAS enrollment, device links and holds, grants v2, key rotation and recovery, the MLS delivery service;
+- **lane endpoints** on the owner's daemon: one relay endpoint per shared agent, the Room Profile filter and the field sanitizer, capped upstream sessions, pushed revocation;
+- **member** on each member's daemon: per-room device keys, its own fold of the room log, the room session, grant requests and rotation, the connected-host registration of each lane, the MLS group.
 
-Design source: `../research/rooms-architecture.md`. Status, evidence and deviations: `M1-RESULTS.md`.
+Identity v2 replaced the Milestone 1 (M1) identity layer at the cut-over (implementation plan I-15, 2026-11-01). M1 is kept in git at tag `m1-baseline`; its results are in `M1-RESULTS.md`. On first start the plugin archives M1 data it finds and closes M1 rooms (`server/migration/v1.ts`, `docs/specs/identity-v2/migration.md`).
 
-## Layout and map to the architecture doc
+Design: `docs/specs/identity-v2/` (start with its `README.md`), `docs/specs/room-profile-v1.md`, and `../research/rooms-architecture.md`. Plan, follow-ups and open decisions: `docs/IMPLEMENTATION-PLAN-identity-v2.md`.
 
-| Path | Runtime | What | Architecture doc |
-|---|---|---|---|
-| `shared/schemas.ts` | both | Versioned zod schemas: Room, Lane, Member, GrantClaims, RoomEvent, InvitePayload, limits | 3, 8.1 |
-| `shared/control.ts` | both | Rooms control protocol frames, transcript, canonical JSON | 8.2 |
-| `shared/rpc.ts` | both | Plugin RPC contracts (owner and member) | |
-| `profile/classification.csv` | data | Room Profile classification table (one row per protocol type) | 6.1, 10 |
-| `profile/fields.csv` | data | Reviewed field table: every field of every forwarded message and gateway-built object (keep, drop, redact, nested, gateway) | 6.1, 10 |
-| `server/room-profile/generated.ts` | server | Generated from both CSVs and `@getpaseo/protocol` (`npm run gen:profile`) | 6.1 |
-| `server/room-profile/filter.ts` | server | Exact-id bindings, outbound filter, `server_info` rewrite, owner-uid isolation guard | 6.1 |
-| `server/room-profile/sanitize.ts` | server | Field-level rebuild of every forwarded message (paths, git, PR, scripts, prompts, serverId redacted) | 6.1 |
-| `server/limits.ts` | server | Resource limits (connections, links, routes, frame sizes, queues), optional `limits.json` | |
-| `shared/policy.ts` | both | Fork provider allowlist | 10 |
-| `server/gateway/lane-endpoint.ts` | server | Lane relay endpoint: host-link destination side, virtual sessions, capped upstream, pushed revocation | 6.1, 8.2 |
-| `server/gateway/control-server.ts` | server | Gateway side of the control protocol | 8.2 |
-| `server/gateway/gateway.ts` | server | Rooms and lanes, fork with curated context, owner views | 5, 6.4, 7.2 |
-| `server/gateway/agent-guard.ts` | server | `before("agent.create")` guard and inert MCP server for room agents | 10 (confused deputy) |
-| `server/gateway/tripwire.ts` | server | Checks the room agent's final stored config after every plugin hook | 10 |
-| `server/gateway/local-daemon.ts` | server | Loopback upstream with `hello.sessionPermissions` | 8.2 (defence in depth) |
-| `server/host/host-store.ts` | server | Embedded host: members, grants, invites, revocation, change push | 5, 8.1 |
-| `server/host/event-log.ts` | server | Hash-chained, host-signed room log | 3, 8.3 |
-| `server/platform/` | server | Identity v2 file layer (I-2): daemon-identical home resolution, owner-only `FileProtection` (POSIX modes; win32 DACL via `icacls`/PowerShell, untested on Windows), durable writes, room log writer lock. `server/paths.ts` wraps it for M1 | 10 (cross-platform) |
-| `server/member/member.ts` | server | Member role: join, `hosts.add/update/remove`, `hosts.observe`, rotation | 8.2 native app path |
-| `server/member/control-client.ts` | server | Member side of the control protocol | 8.2 |
-| `client/` | app | Rooms screen, Open room screen, sidebar item, composer pills | 5 (Rooms UI) |
-| `docs/specs/` | docs | Control protocol, Room Profile v1, data model and storage | 8.5 ("every protocol gets a written spec") |
-| `tools/` | dev | Profile generator and the one-time CSV seed script | |
-| `test/unit/` | dev | Unit and conformance tests (node:test) | |
-| `test/e2e/` | dev | Two-daemon end-to-end test | |
+## Layout
+
+| Path | Runtime | What |
+|---|---|---|
+| `index.server.ts`, `server/runtime-v2.ts` | server | RPC registration, the agent guard, the resume tripwire and the agent.archived hook; the runtime (start, owned and joined rooms) |
+| `shared/rpc-v2.ts`, `shared/rpc.ts` | both | Plugin RPC contracts: the room calls (`rooms.v2.*`), and bootstrap, Fix permissions, lane agents, migration |
+| `server/proto/`, `server/noise/`, `server/transport/` | server | Encoding (RJCS), keys and ids, invite and link codes; vendored Noise IK; records and the relay connection shared by room and lane endpoints |
+| `server/authority/` | server | The fold of the room log: statements, entries, roster, holds, lineages, admin revocation re-folds |
+| `server/admin/` | server | Genesis, the admin signer, one-time confirmations of admin actions, the hold clock, recovery |
+| `server/host/` | server | Room host and log store, room endpoint, enrollment, grants v2, lane service, MLS delivery |
+| `server/member/` | server | Enrollment client and journal, device link, room client, grant scheduler, lane registration, rotation |
+| `server/mls/` | server | ts-mls adapter, authentication service, roster rule, member state |
+| `server/keystore/` | server | Keyring (`@napi-rs/keyring`) or protected fallback file; sealed files |
+| `server/platform/` | server | Home resolution, owner-only `FileProtection` (POSIX modes; win32 DACL, untested on Windows), durable writes, log writer lock, the TEST-ONLY clock and test-home guard |
+| `server/migration/v1.ts` | server | Migration from M1: detect, archive by rename, `migration.json`, removal of v1 host registrations, "Delete keys" |
+| `server/gateway/lane-endpoint.ts` | server | Lane relay endpoint: host-link destination side, virtual sessions, capped upstream, pushed revocation |
+| `server/gateway/agent-guard.ts`, `tripwire.ts` | server | `before("agent.create")` guard with the inert MCP shadow for room agents; stored-config tripwire |
+| `server/gateway/local-daemon.ts`, `lane-errors.ts` | server | Loopback upstream with `hello.sessionPermissions`; owner-only lane error log |
+| `server/room-profile/`, `profile/*.csv` | server, data | Room Profile classification and field tables, generated module, filter and sanitizer |
+| `server/limits.ts`, `server/log.ts`, `shared/policy.ts` | both | Resource limits (`limits.json`), redacting logger, provider allowlist |
+| `client/` | app | Rooms screen, share ("Open room…") screen, dialogs, sidebar item, composer pills |
+| `tools/` | dev | Profile generator |
+| `test/unit/`, `test/e2e-v2/` | dev | Unit and conformance tests; end-to-end tests with disposable daemons |
+| `test/m1-evidence/` | dev | Logs of the last M1 e2e runs (git-ignored raw evidence) |
+| `ui-check/` | dev | Disposable daemons with demo state for a manual check in the real app |
 
 `tools/` and `test/` are not imported by either entry, so Paseo does not bundle them, and they are excluded from the npm `files` list.
 
@@ -48,44 +45,37 @@ Requirements: Paseo 0.13.2 (`/opt/Paseo`), npm. Scripts run on the Node 24 bundl
 ```bash
 cd plugin
 npm install
-npm run typecheck        # tsc --noEmit over entries, client, server, shared, tools and tests
-npm run gen:profile      # regenerate server/room-profile/generated.ts after editing the CSV or bumping @getpaseo/protocol
-npm test                 # unit and conformance tests
-npm run test:e2e         # two disposable daemons; see below
+npm run typecheck          # tsc --noEmit over entries, client, server, shared, tools and tests
+npm run typecheck:client   # the client alone, without Node or DOM types (X-12)
+npm run gen:profile        # regenerate server/room-profile/generated.ts after editing the CSVs
+npm test                   # unit and conformance tests
+npm run test:e2e           # offline end-to-end test; see below
 ```
 
-Runtime dependencies (`@getpaseo/relay`, `@getpaseo/protocol`, `ws`) are bundled into the server entry by Paseo's plugin compiler. `PASEO_ROOMS_RELAY_ENDPOINT` (and `PASEO_ROOMS_RELAY_TLS=false`) override the relay for new lanes; the default is `relay.paseo.sh:443` with TLS.
+Relay: the genesis of a new room records `PASEO_ROOMS_RELAY_ENDPOINT` (default `relay.paseo.sh:443`, TLS). Keystore: the system keyring, or `PASEO_ROOMS_KEYSTORE=fallback-file` for a protected file. Development switches (`PASEO_ROOMS_DEV_*`: short grants, plain loopback relay, fast MLS timers) are honoured only on a marked e2e test home (`server/platform/test-clock.ts`) and ignored elsewhere.
 
 ## Tests
 
-**Unit and conformance** (`npm test`, about 2 s):
+**Unit and conformance** (`npm test`, 343 tests, about 10 s): the v2 vectors and encoding, Noise, records, keystore, file layer, fold core and authority, room host, room endpoint, enrollment, grants and lane service, device links, rotation, MLS, RPC contracts and the migration from M1 (`v2-*.test.ts`); the Room Profile and field tables, viewer policy, lane endpoint limits, relay connection, agent guard and tripwire.
 
-- `room-profile.test.ts`: every protocol type classified (the gate fails on a missing type); generated module up to date; allowed set equals implemented bindings; default-deny fuzz over all 215 inbound and 234 outbound types with foreign ids; exact-id binding; `server_info` flags.
-- `host-grants.test.ts`: grant signing and verification; one-time invites; expiry; invite burning; synchronous revocation push; renewal revokes the superseded grant; lane binding; transcript binding.
-- `event-log.test.ts`: hash chain and signature verification; tampering, reordering, gaps and re-signing detected.
-- `secrets-and-guard.test.ts`: log redaction; 0600/0700 modes; invite codes; the room agent guard and the inert MCP server.
-- `field-policy.test.ts`: field conformance gate (fails on any unreviewed or stale field); upstream hello built from scratch; leakage tests with realistic agent and workspace descriptors; sanitised messages still parse with the protocol schema; prompting types denied on owner-uid lanes.
-- `lane-endpoint.test.ts`: resource caps (connections, links, routes, pending queue, tracked requests, frame size, rate limit) against a fake loopback daemon; route-slot clientIds; archived lane agent; tripwire at lane start.
-- `durability.test.ts`: revocation enforced before persisting and after a failed write; grant allowlist and pruning margin; torn room log recovery; log clipping; member timers armed at start; archived agent closes its lanes.
-- `v2-file-layer.test.ts`: start-time permission check (symlink, mode, foreign owner, chmod that does not take effect) and explicit fix; durable-write fault injection (temp cleanup, win32 rename retry, directory fsync reporting); BOM; simulated win32 SDDL checks; log lock takeover and ownership loss with a faked clock.
-- `tripwire.test.ts`: stored-config tripwire, resume check, provider allowlist.
+**End to end, offline** (`bash test/e2e-v2/run.sh`, about 2.5 minutes): three disposable daemons on 6921, 6922 and 6924 and a fake relay on 6923, homes under `plugin/.test-homes/v2-*` (0700, git-ignored, deleted afterwards). Enrollment with SAS and a restart mid-pending, lane grants with rotation, a device link with the 72 h hold on the TEST-ONLY clock, MLS, host key rotation, device rekey, removal, the denials of out-of-scope operations, the one-time invite, a full file-mode check, secret scans, an independent fold of the owner's room log, and archiving the shared agent closing its lane. Two agents are created without a prompt: no model call. `--live-relay` uses relay.paseo.sh (network; run only with the user's go-ahead).
 
-**End to end** (`npm run test:e2e`, about 2 minutes including daemon start):
+**Migration from M1** (`bash test/e2e-v2/migration-run.sh`, about 40 s): an M1 build from a temporary worktree of tag `m1-baseline`, two daemons on 6925 and 6926 and a fake relay on 6927. Creates an M1 room and membership, upgrades both plugins, checks the archive, `migration.json`, the removed host registration and the absent v1 lane endpoint, then runs a new v2 room end to end. No model call.
 
-- Creates `plugin/.test-homes/{owner-c,member-a}` (0700, git-ignored) and writes each `config.json` before the first start: listen `127.0.0.1:6891` / `6892`, `daemon.relay.enabled: false`, `pluginsEnabled: true`, `features.dictation.enabled` and `features.voiceMode.enabled: false` (no speech model download). It also exports `PASEO_DICTATION_ENABLED=false` and `PASEO_VOICE_MODE_ENABLED=false`.
-- Every CLI call uses `--home`; `~/.paseo` and the main daemon are never touched.
-- Installs this directory as plugin `rooms` on both daemons, creates one parent agent on C (Claude `claude-haiku-4-5`, trivial prompt; uses your Claude login), then runs `test/e2e/e2e.ts`: room and fork lane via RPC, share-live lane, invite, enrollment from A, routed lane through A as the app opens it, exactly one agent, live turn, 12 denials, revocation cut timing, member-side revocation handling, expiry cut and rotation recovery, idle rotation, leave, room log verification, file modes, process-level MCP check and a secret scan.
-- Cleanup always runs: archives the agents (archiving the parent also archives its fork), removes the plugin, stops both daemons and deletes the homes (`KEEP_HOMES=1` keeps them). Logs go to `test/e2e/logs/`.
-- Network: npm (install), the Paseo relay (lanes), and the Claude provider for two short turns.
+Every test daemon: config written before the first start (loopback listen, daemon relay registration off, speech off), every CLI call with `--home`, never `~/.paseo` or the main daemon, keys in the fallback file (never the user's keyring), ports 6920 to 6929 checked free at the end. The Haiku call budget is tracked in `test/e2e-v2/HAIKU-BUDGET.md`.
+
+`test/reliability/` was written for M1 and is stale until rewritten against the v2 RPCs (its README says so).
 
 ## Security model and limits
 
-- **Watch only, by construction.** Lanes run as the owner's OS user: a fork lane is an ordinary agent of the owner's daemon and a share lane is the owner's agent itself. The inert `paseo` MCP shadow is hygiene, not isolation: an agent with a shell can still reach the `paseo` CLI, `~/.paseo` and the daemon port. So member input must never prompt or drive a lane. Every prompting, steering and approval message type is denied before the Room Profile table is consulted, and a lane endpoint refuses to start if the table ever allows one. Steering requires sandboxed lanes (a future runner node kind), not a table change.
-- **A grant admits every client of the member's daemon.** The lane is a connected host on the member's daemon, so the member's app, any paired device with access to that daemon, and the member's own agents (through Paseo's routed-host tools) can all read the lane. A prompt-injected agent on the member's machine can read and exfiltrate what the member can watch. This is by design in M1 (the grant never enters the app), but treat lane content as visible to everything on the member's daemon.
-- **Fork lanes only for verified providers.** `shared/policy.ts` lists providers whose room agents were shown to run without Paseo's MCP (currently `claude`, verified by the e2e process check). Other providers, custom provider ids and profiles are refused.
-- **Other plugins are trusted.** Paseo 0.13.2 runs `before` hooks in plugin-id order, so a plugin whose id sorts after `rooms` can re-add MCP servers to a room agent. The gateway creates room agents without a prompt, checks the final stored config (`server/gateway/tripwire.ts`), and archives the agent and refuses the lane if the shadow is gone or anything else was added. The same check runs when a lane starts and before a lane agent is resumed. `agent.session_open` hooks can change only env on 0.13.2.
-- **Resource limits.** Defaults in `server/limits.ts`: 32 relay connections per lane, 2 links per member, 16 routes per link and 32 per member, 1 MiB inbound frames, 256 KiB routed messages, bounded queues and request maps, 50 frames/s per link, timeline pages of at most 1000 rows. Override in `<PASEO_HOME>/plugin-data/rooms/limits.json` (same keys, read at plugin start; values are clamped to safe bounds).
+- **Watch only, by construction.** A lane is the owner's own agent, running as the owner's OS user. Member input must never prompt or drive it: every prompting, steering and approval message type is denied before the Room Profile table is consulted, and a lane endpoint refuses to start if the table ever allows one. Steering needs sandboxed lanes, not a table change.
+- **A grant admits every client of the member's daemon.** The lane is a connected host on the member's daemon, so the member's app, paired devices and the member's own agents (through Paseo's routed-host tools) can read the lane. Treat lane content as visible to everything on the member's daemon.
+- **Joins are confirmed by people.** An invite is one-time and expires (30 minutes by default); the owner admits a join only after both sides compared the six-digit SAS. A device link waits 24 or 72 hours unless an admin approves it, and any of the member's devices can veto it.
+- **Grants** last at most 12 hours, are bound to a device and a lane, and are revoked before the revocation is saved (a failed save is reported and retried).
+- **Room agents created by Rooms** get the inert `paseo` MCP shadow (`agent-guard.ts`) and the stored-config tripwire before a resume. Identity v2 shares existing agents and creates none; the guard and tripwire still protect the fork agents M1 left on a daemon.
+- **Other plugins are trusted.** Paseo 0.13.2 runs `before` hooks in plugin-id order, and every server plugin runs with owner permissions.
+- **Resource limits.** Defaults in `server/limits.ts`, with the grants-v2 section 11 limits for lanes (32 routes per link, 256 per lane, 30 failed links per minute). Override in `<PASEO_HOME>/plugin-data/rooms/limits.json` (clamped to safe bounds).
 
 ## Installing on a real daemon (not done by the tests)
 
-Installing requires `pluginsEnabled: true` on the target daemon and trusts this code with owner permissions. Use `paseo plugin install /absolute/path/to/plugin` on the owner's and each member's daemon, then `paseo plugin ls` to check it is `running`. The UI was not exercised in a real app yet; see `M1-RESULTS.md` for the manual checklist.
+Installing requires `pluginsEnabled: true` on the target daemon and trusts this code with owner permissions. Use `paseo plugin install /absolute/path/to/plugin` on the owner's and each member's daemon, then `paseo plugin ls` to check it is `running`. The UI was not exercised in a real app yet; see `ui-check/README.md` for the manual checklist.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Tear down the v2 UI check: archive the lane agent, stop the three v2 test daemons and the fake relay,
-# delete .homes-v2. Safe to run repeatedly and after a failed up-v2.sh. Never touches ~/.paseo or the
+# delete .test-homes. Safe to run repeatedly and after a failed up-v2.sh. Never touches ~/.paseo or the
 # main daemon (6767).
 set -uo pipefail
 UI_DIR=$(cd "$(dirname "$0")" && pwd)
 P=/opt/Paseo/resources/bin/paseo
-HOMES=$UI_DIR/.homes-v2
+HOMES=$UI_DIR/.test-homes
 OWNER=$HOMES/v2-owner
 MEMBER=$HOMES/v2-member
 MEMBER2=$HOMES/v2-member2

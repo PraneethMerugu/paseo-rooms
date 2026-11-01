@@ -1,28 +1,25 @@
 // Lane endpoint: one relay endpoint per lane, protected (Noise NK) only.
 //
-// Each relay connection carries exactly one of:
-//   1. a Paseo host link from a member daemon (connected-hosts DESTINATION side, as in the routed-lane
-//      spike): hello.auth.password must be a valid lane grant; only hosts.link.open, hosts.route.frame
-//      and hosts.route.close are served; every routed scope is a virtual session under the Room Profile
-//      with its own upstream session to the local daemon, capped at workspace.read;
-//   2. M1 only: a rooms control channel (docs/specs/rooms-control-protocol.md): enroll, renew, status,
-//      leave. The v2 runtime has no control switch: grants come over the room session
-//      (grants-v2.md section 3), and a `rooms.control.hello` is an unexpected first frame.
+// Each relay connection carries one Paseo host link from a member daemon (connected-hosts DESTINATION
+// side, as in the routed-lane spike): hello.auth.password must be a valid lane grant; only
+// hosts.link.open, hosts.route.frame and hosts.route.close are served; every routed scope is a virtual
+// session under the Room Profile with its own upstream session to the local daemon, capped at
+// workspace.read.
+// Grants come over the room session (grants-v2.md section 3). The M1 control channel was removed at the
+// identity v2 cut-over (I-15): any first frame other than `hello` closes the connection.
 //
-// Grant checks go through a LaneGrantAuthority: M1 wraps HostStore.checkGrantLive; v2
-// (server/host/lane-service.ts) runs grants-v2 section 4 against the room's authority state and the
-// `gid` allowlist, and adds the link policy of section 6.1 (one link per device and lane, theft
-// detection), a failure token bucket (section 11) and 32 routes per link.
+// Grant checks go through a LaneGrantAuthority: server/host/lane-service.ts runs grants-v2 section 4
+// against the room's authority state and the `gid` allowlist, and adds the link policy of section 6.1
+// (one link per device and lane, theft detection), a failure token bucket (section 11) and 32 routes
+// per link. Without `admitLink` (unit tests) a per-member link cap applies.
 //
 // Grants are checked on the link hello, on every hosts.link.open and on every routed hello.
-// Revocation is PUSHED: HostStore changes call enforce() synchronously; each link also has a timer
+// Revocation is PUSHED: the grant service calls enforce() synchronously; each link also has a timer
 // at its grant's exp. No polling.
 import { createHash, randomBytes } from "node:crypto";
 import WebSocket from "ws";
-import { openDaemonSecureChannel, SecureChannelRejectedError, importPublicKey, importSecretKey, type SecureChannel } from "@getpaseo/relay/e2ee";
-import type { Lane } from "../../shared/schemas";
+import { openDaemonSecureChannel, SecureChannelRejectedError, type SecureChannel } from "@getpaseo/relay/e2ee";
 import { clip, log, logError, LogLimiter, short } from "../log";
-import type { HostStore } from "../host/host-store";
 import { DEFAULT_LIMITS, TokenBucket, type ResourceLimits } from "../limits";
 import {
   accessDenied,
@@ -50,8 +47,21 @@ import {
 } from "../room-profile/sanitize";
 import { LaneErrorLog } from "./lane-errors";
 import { buildUpstreamHello, openDaemonSocket, RawDaemon } from "./local-daemon";
-import { handleControlChannel } from "./control-server";
-import { MAX_CONNECTION_ID_CHARS, parseRelayNotice, RelayConnection, RelayControlSocket, relayServerUrl } from "../transport/relay-server";
+import { MAX_CONNECTION_ID_CHARS, parseRelayNotice, RelayConnection, RelayControlSocket, relayServerUrl, type RelayAddress } from "../transport/relay-server";
+
+/** What a lane endpoint needs to know about its lane (the owner-local binding plus the offer). */
+export interface EndpointLane {
+  id: string;
+  roomId: string;
+  label: string;
+  /** "fork": a room agent created by Rooms, re-checked by the isolation tripwire before start. */
+  origin: { kind: "share" | "fork" };
+  agentId: string;
+  workspaceId: string;
+  /** Relay identity of the lane endpoint (public). */
+  serverId: string;
+  relay: RelayAddress;
+}
 
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const FIRST_FRAME_TIMEOUT_MS = 15_000;
@@ -76,56 +86,36 @@ export interface LinkClaims {
 
 export type LaneGrantCheck = { ok: true; claims: LinkClaims } | { ok: false; reason: string; claims?: LinkClaims };
 
-/** How a lane endpoint checks grants and finds its keys (M1: HostStore; v2: grants-v2). */
+/** How a lane endpoint checks grants and finds its keys (grants-v2; server/host/lane-service.ts). */
 export interface LaneGrantAuthority {
   /** Checks a grant presented on the link hello, on hosts.link.open and on every routed hello. */
   check(token: string, laneId: string, opts?: { cheap?: boolean }): LaneGrantCheck;
   keyPair(laneId: string): { publicKey: Uint8Array; secretKey: Uint8Array };
-  /** M1 only: serve the rooms control channel. */
-  controlChannel: boolean;
   /**
-   * v2 link policy (grants-v2 6.1), called once the grant passed. Resolves "accept" or "reject";
-   * may close other links. Absent: M1's per-member link cap applies.
+   * Link policy (grants-v2 6.1), called once the grant passed. Resolves "accept" or "reject"; may
+   * close other links. Absent (unit tests): the per-member link cap applies.
    */
   admitLink?(link: LinkSession): Promise<"accept" | "reject">;
   /** v2: failed link attempts per minute on this endpoint (section 11); only failures consume it. */
   failedAttemptsPerMinute?: number;
 }
 
-/** M1: HostStore-backed checks and the control channel. */
-export function hostStoreAuthority(host: HostStore): LaneGrantAuthority {
-  return {
-    check: (token, laneId) => {
-      const r = host.checkGrantLive(token, laneId);
-      return r.ok ? { ok: true, claims: r.claims! } : { ok: false, reason: r.reason, ...(r.claims ? { claims: r.claims } : {}) };
-    },
-    keyPair: (laneId) => {
-      const keys = host.laneKeys(laneId);
-      if (!keys) throw new Error("lane keys missing");
-      return { publicKey: importPublicKey(keys.publicKeyB64), secretKey: importSecretKey(keys.secretKeyB64) };
-    },
-    controlChannel: true,
-  };
-}
-
 export interface LaneEndpointDeps {
-  /** M1 host store (grants, keys, room settings, control channel). */
-  host?: HostStore;
-  /** v2: grant authority instead of `host`. */
-  authority?: LaneGrantAuthority;
-  /** v2: the lane's effective project-name policy (grants-v2 13.2), shared by its routes. */
+  /** Grant checks and lane keys. */
+  authority: LaneGrantAuthority;
+  /** The lane's effective project-name policy (grants-v2 13.2), shared by its routes. Default: hidden. */
   projectNames?: ProjectNamePolicy;
-  /** v2: viewer errors carry an error reference (grants-v2 13.1). */
+  /** Viewer errors carry an error reference (grants-v2 13.1). */
   errorRefs?: boolean;
   paseoHome: string;
   limits?: ResourceLimits;
-  /** Called once when the lane agent is archived or deleted; the gateway closes the lane (C-13). */
+  /** Called once when the lane agent is archived or deleted; the lane service closes the lane (C-13). */
   onAgentGone?(laneId: string, reason: AgentGoneReason): void;
   /**
    * Isolation tripwire for fork lanes (C-iso2): verifies the room agent's final stored config.
    * A failure keeps the lane offline and is logged; it is not retried.
    */
-  verifyRoomAgent?(lane: Lane): { ok: boolean; problems: string[] };
+  verifyRoomAgent?(lane: EndpointLane): { ok: boolean; problems: string[] };
 }
 
 /** Shared deny/limit log limiter (C-5): bounded per source key. */
@@ -158,20 +148,15 @@ export class LaneEndpoint {
   /** v2: failed link attempts (grants-v2 section 11). Null in M1. */
   readonly failures: TokenBucket | null;
 
-  constructor(readonly lane: Lane, readonly deps: LaneEndpointDeps) {
+  constructor(readonly lane: EndpointLane, readonly deps: LaneEndpointDeps) {
     this.scope = { agentId: lane.agentId, workspaceId: lane.workspaceId };
     this.directory = new LaneDirectory(this);
     this.limits = deps.limits ?? DEFAULT_LIMITS;
     this.errors = new LaneErrorLog(undefined, undefined, undefined, deps.errorRefs === true);
-    if (deps.authority) this.authority = deps.authority;
-    else if (deps.host) this.authority = hostStoreAuthority(deps.host);
-    else throw new Error("lane endpoint needs a host store or a grant authority");
+    this.authority = deps.authority;
     const perMinute = this.authority.failedAttemptsPerMinute;
     this.failures = perMinute ? new TokenBucket(perMinute / 60, perMinute) : null;
-    this.projectNames = deps.projectNames ?? {
-      show: deps.host!.roomSettings(lane.roomId).showProjectName,
-      label: neutralProjectLabel(deps.host!.room(lane.roomId)?.name, lane.label),
-    };
+    this.projectNames = deps.projectNames ?? { show: false, label: neutralProjectLabel(undefined, lane.label) };
   }
 
   sanitizeContext(): SanitizeContext {
@@ -404,14 +389,13 @@ export class LaneEndpoint {
 // -------------------------------------------------------------------------------------------------
 /**
  * One relay data socket (server/transport/relay-server.ts RelayConnection) after the Noise NK
- * handshake. Becomes a host link or a control channel.
+ * handshake. Becomes a host link.
  */
 export class LaneConnection {
   private relay: RelayConnection | null = null;
   channel: SecureChannel | null = null;
   link: LinkSession | null = null;
-  private mode: "pending" | "link" | "control" = "pending";
-  private controlInbox: ((data: string) => void) | null = null;
+  private mode: "pending" | "link" = "pending";
   private closed = false;
   private firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -490,39 +474,7 @@ export class LaneConnection {
         void this.link.onHello(msg);
         return;
       }
-      if (msg?.type === "rooms.control.hello" && this.endpoint.authority.controlChannel) {
-        this.mode = "control";
-        void handleControlChannel(this.endpoint, {
-          first: msg,
-          send: (frame) => this.send(frame),
-          next: (timeoutMs) =>
-            new Promise<unknown>((resolve) => {
-              const t = setTimeout(() => {
-                this.controlInbox = null;
-                resolve(null);
-              }, timeoutMs);
-              this.controlInbox = (d) => {
-                clearTimeout(t);
-                this.controlInbox = null;
-                try {
-                  resolve(JSON.parse(d));
-                } catch {
-                  resolve(null);
-                }
-              };
-            }),
-          close: (why) => setTimeout(() => this.close(why), 200),
-        }).catch((e) => {
-          logError("control_failed", e, { conn: this.tag });
-          this.close("control_failed");
-        });
-        return;
-      }
       this.close("unexpected_first_frame");
-      return;
-    }
-    if (this.mode === "control") {
-      this.controlInbox?.(data);
       return;
     }
     if (this.link && !this.link.rate.take()) {

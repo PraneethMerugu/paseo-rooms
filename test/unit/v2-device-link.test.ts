@@ -375,7 +375,7 @@ async function linkEnv() {
     const home = join(homes, `v2-${name}`);
     mkdirSync(home, { recursive: true, mode: 0o700 });
     if (clock) writeFileSync(join(home, TEST_HOME_MARKER), TEST_HOME_MARKER_TEXT, { mode: 0o600 });
-    return new RoomsRuntimeV2({ PASEO_HOME: home, ...base, ...(clock ? { [TEST_CLOCK_ENV]: "1" } : {}) });
+    return new RoomsRuntimeV2({ PASEO_HOME: home, ...base, ...(clock ? { [TEST_CLOCK_ENV]: "1" } : {}) }, undefined, { allowDevSwitches: true });
   };
   const owner = mk("owner", true);
   const phone = mk("phone", false);

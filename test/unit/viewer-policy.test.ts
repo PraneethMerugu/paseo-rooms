@@ -1,23 +1,20 @@
 // HARDENING-PLAN decisions round 2: viewer errors and project display names.
 //  - Viewers get generic error text; the full text goes to the owner-only LaneErrorLog, read through
-//    the local RPC rooms.lane.errors and never through the lane endpoint.
-//  - Project names are hidden from viewers by default (neutral label, hashed folder names); the owner
-//    opts in per room, the setting persists, applies to open routes and is logged as room.policy.changed.
+//    the local RPC rooms.v2.lane.errors and never through the lane endpoint.
+//  - Project names are hidden from viewers by default (neutral label, hashed folder names); with the
+//    owner's opt-in (identity v2: policy projectNames "lane-owner" and the lane's lane.names.changed,
+//    tested in v2-grants) the shared policy object flips open routes.
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import * as messages from "@getpaseo/protocol/messages";
-import { generateEd25519, signEd25519 } from "../../server/crypto";
 import { LaneEndpoint, LinkSession, LaneConnection } from "../../server/gateway/lane-endpoint";
 import { LaneErrorLog } from "../../server/gateway/lane-errors";
-import { Gateway } from "../../server/gateway/gateway";
-import { HostStore } from "../../server/host/host-store";
-import { decodeInviteCode } from "../../server/invite-code";
 import { ALLOWED_SESSION_EVENTS, decideInbound, filterOutbound } from "../../server/room-profile/filter";
 import { GENERIC_AGENT_ERROR, GENERIC_ERROR, neutralProjectLabel, newSanitizeContext, sanitizeAgentListEntry, sanitizeWorkspace } from "../../server/room-profile/sanitize";
-import { OwnedRoomView } from "../../shared/rpc";
 import { agentSnapshot, LANE, leaks, projectPlacement, workspaceDescriptor } from "./fixtures";
 import { startFakeDaemon, waitFor, type FakeDaemon } from "./fake-daemon";
 import { tempDir } from "./helpers";
+import { TestAuthority, testLane } from "./lane-harness";
 
 const SCOPE = { agentId: LANE.agentId, workspaceId: LANE.workspaceId };
 const LABEL = "Lab · Live";
@@ -96,59 +93,18 @@ test("project names: the neutral label is the room and lane name, bounded", () =
   assert.ok(neutralProjectLabel("x".repeat(80), "y".repeat(80)).length <= 120);
 });
 
-test("project names: the room setting persists, is logged as room.policy.changed and reaches lane endpoints", () => {
-  const tmp = tempDir();
-  try {
-    const host = new HostStore(tmp.dir, { endpoint: "relay.example:443", useTls: true });
-    const room = host.createRoom("Lab");
-    const lane = host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "agent-1" }, agentId: "agent-1", workspaceId: "wks_1" });
-    assert.deepEqual(host.roomSettings(room.id), { showProjectName: false }, "hidden by default");
-    const ep = new LaneEndpoint(lane, { host, paseoHome: tmp.dir });
-    assert.deepEqual(ep.projectNames, { show: false, label: "Lab · Live" });
-    const seen: unknown[] = [];
-    host.onChange((ch) => {
-      seen.push(ch);
-      if (ch.kind === "room_settings_changed") ep.setProjectNamesVisible(ch.settings.showProjectName);
-    });
-    host.setShowProjectName(room.id, true);
-    assert.equal(ep.projectNames.show, true, "applied to the live endpoint");
-    assert.equal(ep.sanitizeContext().projectNames, ep.projectNames, "routes share the endpoint's policy object");
-    host.setShowProjectName(room.id, true); // no-op: no second event
-    host.setShowProjectName(room.id, false);
-    assert.equal(ep.projectNames.show, false);
-    assert.equal(seen.filter((c: any) => c.kind === "room_settings_changed").length, 2);
-    const events = host.events(room.id).filter((e) => e.type === "room.policy.changed");
-    assert.deepEqual(events.map((e) => [e.actor, e.data]), [
-      ["owner", { setting: "showProjectName", value: true }],
-      ["owner", { setting: "showProjectName", value: false }],
-    ]);
-    assert.equal(host.verifyLog(room.id).ok, true);
-    host.setShowProjectName(room.id, true);
-    const reloaded = new HostStore(tmp.dir, { endpoint: "relay.example:443", useTls: true });
-    assert.deepEqual(reloaded.roomSettings(room.id), { showProjectName: true }, "persisted");
-    assert.equal(new LaneEndpoint(lane, { host: reloaded, paseoHome: tmp.dir }).projectNames.show, true, "new endpoints start with the setting");
-    assert.throws(() => host.setShowProjectName("room_ffffffffffffffff", true), /Room not found/);
-    host.dispose();
-    reloaded.dispose();
-  } finally {
-    tmp.cleanup();
-  }
-});
-
-test("owner overview carries the room settings (RPC output schema)", async () => {
-  const tmp = tempDir();
-  try {
-    const gw = new Gateway(tmp.dir, tmp.dir, { endpoint: "relay.example:443", useTls: true });
-    const room = gw.host.createRoom("Lab");
-    const view = await gw.overview(null);
-    assert.equal(OwnedRoomView.safeParse(view[0]).success, true);
-    assert.deepEqual(view[0].settings, { showProjectName: false });
-    gw.setShowProjectName(room.id, true);
-    assert.deepEqual((await gw.overview(null))[0].settings, { showProjectName: true });
-    gw.host.dispose();
-  } finally {
-    tmp.cleanup();
-  }
+test("project names: the endpoint's policy object is shared by its routes and flips with setProjectNamesVisible", () => {
+  const lane = testLane({ label: "Live" });
+  const ep = new LaneEndpoint(lane, { authority: new TestAuthority(), paseoHome: "/nonexistent" });
+  assert.deepEqual(ep.projectNames, { show: false, label: "Live" }, "hidden by default");
+  assert.equal(ep.sanitizeContext().projectNames, ep.projectNames, "routes share the endpoint's policy object");
+  assert.equal(ep.setProjectNamesVisible(true), 0, "no open route to push to");
+  assert.equal(ep.projectNames.show, true);
+  assert.equal(ep.setProjectNamesVisible(true), 0, "no-op");
+  ep.setProjectNamesVisible(false);
+  assert.equal(ep.projectNames.show, false);
+  const shown = new LaneEndpoint(lane, { authority: new TestAuthority(), paseoHome: "/nonexistent", projectNames: { show: true, label: "Lab · Live" } });
+  assert.equal(shown.projectNames.show, true, "new endpoints start with the lane's effective policy");
 });
 
 // ------------------------------------------------------------------ errors
@@ -222,8 +178,8 @@ test("errors: the lane log deduplicates repeats, is bounded and clips long text"
   assert.equal(log.list().length, 3);
 });
 
-test("errors: plugin RPCs (rooms.lane.errors) are not reachable through a lane", () => {
-  const d = decideInbound({ type: "plugin.rpc.invoke.request", requestId: "r", pluginId: "rooms", method: "rooms.lane.errors", input: { laneId: LANE.laneId } }, SCOPE);
+test("errors: plugin RPCs (rooms.v2.lane.errors) are not reachable through a lane", () => {
+  const d = decideInbound({ type: "plugin.rpc.invoke.request", requestId: "r", pluginId: "rooms", method: "rooms.v2.lane.errors", input: { laneId: LANE.laneId } }, SCOPE);
   assert.equal(d.action, "deny");
 });
 
@@ -239,22 +195,6 @@ after(async () => {
   LaneConnection.prototype.start = realStart;
   await fake.close();
 });
-
-function enroll(host: HostStore, laneId: string) {
-  const { code } = host.createInvite({ laneId, ttlSeconds: 600, grantTtlSeconds: 3600 });
-  const invite = decodeInviteCode(code);
-  const device = generateEd25519();
-  const transcript = (tokenHash: string) =>
-    HostStore.transcript({ op: "enroll", laneId, laneServerId: invite.offer.serverId, hostKeyId: host.hostKey.keyId, nonce: "n".repeat(43), devicePublicKey: device.publicKey, tokenHash, daemonServerId: null, label: "Ada" });
-  return host.enroll({
-    laneId,
-    token: invite.token,
-    devicePublicKey: device.publicKey,
-    label: "Ada",
-    daemonServerId: null,
-    verifySignature: (h) => host.verifyDeviceSignature(device.publicKey, transcript(h), signEd25519(device, transcript(h))),
-  });
-}
 
 async function openViewer(ep: LaneEndpoint, token: string) {
   const conn = new LaneConnection(ep, "c1");
@@ -294,14 +234,11 @@ test("route: a viewer never receives full errors or the hidden project name; the
         payload: { requestId: m.requestId, entries: [workspaceDescriptor({ id: "wks_1" })], emptyProjects: [], pageInfo: { nextCursor: null, prevCursor: null, hasMore: false } },
       });
   };
-  const gw = new Gateway(tmp.dir, fake.home, { endpoint: "relay.example:443", useTls: true });
+  const host = new TestAuthority();
+  const lane = testLane({ label: "Live" });
+  const ep = new LaneEndpoint(lane, { authority: host, paseoHome: fake.home, projectNames: { show: false, label: "Lab · Live" } });
   try {
-    const room = gw.host.createRoom("Lab");
-    const lane = gw.host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "agent-1" }, agentId: "agent-1", workspaceId: "wks_1" });
-    const ep = new LaneEndpoint(lane, { host: gw.host, paseoHome: fake.home });
-    gw.endpoints.set(lane.id, ep);
-    (gw as any).unsubscribe = gw.host.onChange((c) => (gw as any).onHostChange(c));
-    const { token } = enroll(gw.host, lane.id);
+    const { token } = host.enroll(lane.id);
     const v = await openViewer(ep, token);
     v.frame({ type: "session", message: { type: "fetch_agent_request", requestId: "boom", agentId: "agent-1" } });
     v.frame({ type: "session", message: { type: "fetch_agent_request", requestId: "ok", agentId: "agent-1" } });
@@ -311,14 +248,13 @@ test("route: a viewer never receives full errors or the hidden project name; the
     assert.equal(v.viewer().find((m) => m.type === "rpc_error").payload.error, GENERIC_ERROR);
     const res = v.viewer().find((m) => m.type === "fetch_agent_response");
     assert.equal(res.payload.project.projectName, "Lab · Live");
-    // The owner's RPC data (rooms.lane.errors -> Gateway.laneErrors) has the full text.
-    const errs = gw.laneErrors(lane.id);
+    // The owner's RPC data (rooms.v2.lane.errors -> LaneService.errors -> the endpoint's log) has the full text.
+    const errs = ep.errors.list();
     assert.ok(errs.some((e) => e.source === "rpc_error:fetch_agent_request" && e.message.includes("daemon exploded at /home/owner/secret-project")));
     assert.ok(errs.some((e) => e.source === "agent.lastError" && e.message.includes("EACCES")));
-    assert.throws(() => gw.laneErrors("lane_ffffffffffffffff"), /Lane not found/);
     // Owner opts in: the open route gets fresh upserts with the real name, without reconnecting.
     const before = v.viewer().length;
-    gw.setShowProjectName(room.id, true);
+    ep.setProjectNamesVisible(true);
     await waitFor(() => v.viewer().slice(before).some((m) => m.type === "workspace_update"), 3000, "pushed upserts");
     const pushed = v.viewer().slice(before);
     const upd = pushed.find((m) => m.type === "agent_update");
@@ -331,8 +267,7 @@ test("route: a viewer never receives full errors or the hidden project name; the
     assert.deepEqual(leaks(pushed), []);
   } finally {
     fake.onSession = () => undefined;
-    await gw.stop();
-    gw.host.dispose();
+    await ep.stop();
     tmp.cleanup();
   }
 });

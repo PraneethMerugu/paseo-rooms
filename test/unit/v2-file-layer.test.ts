@@ -11,8 +11,7 @@ import { appendLine, fsyncDir, PersistFailedError, readJsonFile, RENAME_RETRY_MS
 import { checkSddl, foldWin32Path, parseSddl, posixProtection, ProtectionError, win32Protection, type PosixDeps, type Win32Deps } from "../../server/platform/file-protection";
 import { canonicalHome, expandHomeDir, HomeResolutionError, resolvePaseoHome } from "../../server/platform/home";
 import { HEARTBEAT_MS, LOCK_FILE, LogLockHeldError, LogLockLostError, LogWriterLock, STALE_MS } from "../../server/platform/log-lock";
-import { logPath } from "../../server/paths";
-import { RoomsRuntime } from "../../server/runtime";
+import { RoomsRuntimeV2 } from "../../server/runtime-v2";
 import { tempDir } from "./helpers";
 
 const realPosix = (): PosixDeps => ({
@@ -53,7 +52,7 @@ test("X-8: home resolution copies the daemon's expandHomeDir", () => {
 });
 
 test("X-7: log paths are relative, with the platform separator", () => {
-  assert.equal(logPath("/a/b", "/a/b/c/d.json"), join("c", "d.json"));
+  assert.equal(nodePath.relative("/a/b", "/a/b/c/d.json"), join("c", "d.json"));
   assert.equal(nodePath.win32.relative("C:\\Users\\o\\data", "C:\\Users\\o\\data\\rooms\\x.jsonl"), "rooms\\x.jsonl");
 });
 
@@ -378,32 +377,27 @@ test("R-6: a waiter that sees the stale lock's mtime move during the 30 s wait d
 
 // -------------------------------------------------------------------------------- runtime and guard
 
-test("X-2: RoomsRuntime loads no keys when the start check fails, and starts after an explicit fix", async () => {
+test("X-2: the runtime loads no keys when the start check fails, and starts after an explicit fix", async () => {
   const tmp = tempDir();
-  const saved = process.env.PASEO_HOME;
-  process.env.PASEO_HOME = tmp.dir;
   try {
     const data = join(tmp.dir, "plugin-data", "rooms");
-    mkdirSync(join(data, "gateway"), { recursive: true, mode: 0o700 });
+    mkdirSync(data, { recursive: true, mode: 0o700 });
     chmodSync(join(tmp.dir, "plugin-data"), 0o700);
     chmodSync(data, 0o700);
-    chmodSync(join(data, "gateway"), 0o700);
     writeFileSync(join(data, "limits.json"), "{}", { mode: 0o644 });
     chmodSync(join(data, "limits.json"), 0o644);
-    const rt = new RoomsRuntime();
-    assert.equal(rt.ready, false);
-    assert.throws(() => rt.gateway, (e: unknown) => e instanceof ProtectionError && e.problems[0].path === "limits.json");
-    assert.equal(existsSync(join(data, "gateway", "host-key.json")), false, "no key created or read");
+    const rt = new RoomsRuntimeV2({ PASEO_HOME: tmp.dir, PASEO_ROOMS_KEYSTORE: "fallback-file" });
+    await rt.start();
+    const st = rt.status();
+    assert.equal(st.state, "error");
+    assert.equal(st.permissionProblems?.[0]?.path, "limits.json");
+    assert.equal(existsSync(join(data, "keystore")), false, "no keystore opened or created");
     assert.equal(mode(join(data, "limits.json")), 0o644, "no silent repair");
-    rt.start(); // no throw while not ready
-    assert.deepEqual(rt.fixPermissions(), { ok: true, problems: [] });
-    assert.equal(rt.ready, true);
+    assert.deepEqual(await rt.fixPermissions(), { ok: true, problems: [] });
+    assert.equal(rt.status().state, "ready");
     assert.equal(mode(join(data, "limits.json")), 0o600);
-    assert.ok(existsSync(join(data, "gateway", "host-key.json")));
     await rt.stop();
   } finally {
-    if (saved === undefined) delete process.env.PASEO_HOME;
-    else process.env.PASEO_HOME = saved;
     tmp.cleanup();
   }
 });

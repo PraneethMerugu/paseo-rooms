@@ -6,6 +6,8 @@ Fuzzing, credential forgery and replay, concurrency races, and stress or resourc
 
 **Status:** written and typechecked. **Not run yet.** Running needs explicit approval: `run.sh` refuses to start without `--i-reviewed-this`.
 
+**Stale since the identity v2 cut-over (I-15, 2026-11-01):** these modules drive the M1 RPCs (`rooms.create`, `rooms.join`, `rooms.overview`, ...), which no longer exist. They still typecheck because they call RPCs by name, but every module would fail at its first RPC. They need a rewrite against the `rooms.v2.*` RPCs (implementation plan, "after I-9") before anyone runs them.
+
 ## How to run
 
 ```bash
@@ -153,7 +155,7 @@ A trap runs on exit, including on failure and Ctrl-C. It does the following:
 1. If the owner test daemon is down, it starts it, then archives every agent listed in `agents.txt`. Archiving the parent also archives its fork.
 2. It saves the plugin and daemon logs.
 3. It removes the plugin and stops both test daemons.
-4. It runs the e2e secret scan (`test/e2e/secret-scan.ts`) over the homes and logs. The scan uses the invite codes, invite tokens and grant signatures the modules tracked.
+4. It runs the e2e secret scan (`test/reliability/secret-scan.ts`, moved from the removed M1 e2e) over the homes and logs. The scan uses the invite codes, invite tokens and grant signatures the modules tracked.
 5. It checks that both ports are closed.
 6. It deletes the homes, unless `KEEP_HOMES=1` is set.
 7. It reports any process still referencing the homes.

@@ -29,6 +29,14 @@ export const TEST_CLOCK_MAX_OFFSET_MS = 7 * 24 * 60 * 60 * 1000;
 /** Why the override is off, or null when it is allowed. */
 export function testClockRefusal(env: NodeJS.ProcessEnv, paseoHome: string, deps: { homedir?: () => string; uid?: number } = {}): string | null {
   if (env[TEST_CLOCK_ENV] !== "1") return "switch_off";
+  return testHomeRefusal(paseoHome, deps);
+}
+
+/**
+ * Conditions 2 to 4 above: why `paseoHome` is not a marked e2e test home, or null when it is. Also
+ * gates the development switches PASEO_ROOMS_DEV_* (I-15): they are honoured only on such a home.
+ */
+export function testHomeRefusal(paseoHome: string, deps: { homedir?: () => string; uid?: number } = {}): string | null {
   let real: string;
   try {
     real = realpathSync(paseoHome);
@@ -79,4 +87,22 @@ export class TestClock {
     this.offsetMs += ms;
     return this.offsetMs;
   }
+}
+
+/** Prefix of the development switches (short grants, plain loopback relay, fast MLS timers). */
+export const DEV_ENV_PREFIX = "PASEO_ROOMS_DEV_";
+
+/**
+ * The environment the runtime uses: every PASEO_ROOMS_DEV_* switch is removed unless the home is a
+ * marked e2e test home (testHomeRefusal) or the caller is a unit test that allows them explicitly.
+ * Returns the environment and the names of the switches that were dropped (for one log line).
+ */
+export function gateDevSwitches(env: NodeJS.ProcessEnv, paseoHome: string, opts: { allow?: boolean; deps?: { homedir?: () => string; uid?: number } } = {}): { env: NodeJS.ProcessEnv; dropped: string[]; refusal: string | null } {
+  const names = Object.keys(env).filter((k) => k.startsWith(DEV_ENV_PREFIX) && env[k] !== undefined);
+  if (names.length === 0) return { env, dropped: [], refusal: null };
+  const refusal = opts.allow === true ? null : testHomeRefusal(paseoHome, opts.deps);
+  if (refusal === null) return { env, dropped: [], refusal };
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const k of names) delete out[k];
+  return { env: out, dropped: names, refusal };
 }

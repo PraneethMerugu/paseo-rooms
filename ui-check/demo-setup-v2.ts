@@ -13,7 +13,7 @@
 // TEST-ONLY: the six-digit SAS that people compare by voice is read here from both screens' status
 // and checked equal before "Codes match" and "Admit" are pressed programmatically.
 // Never prints or writes invite codes, link codes, grants, tokens or the recovery code. At the end it
-// scans every file under .homes-v2 for the codes and tokens it held, and fails if one is found.
+// scans every file under .test-homes for the codes and tokens it held, and fails if one is found.
 import { appendFileSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -245,7 +245,7 @@ async function main() {
   walk(HOMES);
   secrets.length = 0;
   if (found.length) throw new Error(`a code or token was found in files: ${found.join(", ")}`);
-  say("scan: no invite code, link code, token or recovery code in any file under .homes-v2");
+  say("scan: no invite code, link code, token or recovery code in any file under .test-homes");
 
   await o.close?.();
   await m.close?.();

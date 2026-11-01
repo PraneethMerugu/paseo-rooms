@@ -1,5 +1,5 @@
 // Lane grants v2 on the room host (implementation plan I-10; grants-v2.md sections 2 to 9 and 11).
-// Replaces server/grants.ts and HostStore.checkGrantLive for the v2 runtime only.
+// Replaced server/grants.ts and the M1 HostStore.checkGrantLive (both deleted at the I-15 cut-over).
 //
 // - Tokens: `prg2.` + b64u(RJCS(GrantClaims)) + "." + b64u(Sign(hostKey, "lane-grant", RJCS(claims))).
 //   No optional fields; at most 1024 characters. A token is a bearer secret: it is never logged and

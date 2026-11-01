@@ -1,10 +1,9 @@
-// Secret hygiene (redaction, file modes, invite codes) and the room agent tool guard.
+// Secret hygiene (redaction) and the room agent tool guard. The M1 host file and invite code test was
+// removed with the M1 host at the cut-over (I-15); v2 file modes are tested in v2-file-layer and
+// v2-room-host, v2 invite codes in v2-enrollment.
 import assert from "node:assert/strict";
-import { join } from "node:path";
 import { test } from "node:test";
 import { ensureInertMcp, isInertMcp, restrictRoomAgentConfig } from "../../server/gateway/agent-guard";
-import { HostStore } from "../../server/host/host-store";
-import { decodeInviteCode } from "../../server/invite-code";
 import { __testing } from "../../server/log";
 import { defaultProtection } from "../../server/platform/file-protection";
 import { tempDir } from "./helpers";
@@ -14,30 +13,6 @@ test("logger redacts secret fields and token-shaped values", () => {
     __testing.redact({ token: "abc", grant: "x", nested: { password: "p", note: "relay://h/x?password=SECRET&ssl=true" }, msg: "got prg1.aaa.bbb and prc1.zzz" }),
   );
   for (const s of ["abc", "SECRET", "prg1.aaa.bbb", "prc1.zzz", '"p"']) assert.ok(!out.includes(s), s);
-});
-
-test("host files are 0600 in 0700 directories; invite code round-trips", () => {
-  const tmp = tempDir();
-  try {
-    const host = new HostStore(tmp.dir);
-    const room = host.createRoom("Lab");
-    const lane = host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "a" }, agentId: "a", workspaceId: "w" });
-    const { code, invite } = host.createInvite({ laneId: lane.id, ttlSeconds: 600, grantTtlSeconds: 3600 });
-    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway")), { ok: true });
-    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway", "host-key.json")), { ok: true });
-    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway", "state.json")), { ok: true });
-    assert.deepEqual(defaultProtection().verify(join(tmp.dir, "gateway", "rooms", room.id, "events.jsonl")), { ok: true });
-    const payload = decodeInviteCode(code);
-    assert.equal(payload.laneId, lane.id);
-    assert.equal(payload.offer.serverId, lane.serverId);
-    assert.equal(payload.host.keyId, host.hostKey.keyId);
-    assert.ok(!JSON.stringify(host.invites).includes(payload.token), "only the token hash is stored");
-    assert.equal(invite.tokenHash.length, 64);
-    assert.throws(() => decodeInviteCode("prc1.!!!"));
-    assert.throws(() => decodeInviteCode("hello"));
-  } finally {
-    tmp.cleanup();
-  }
 });
 
 test("room agent guard shadows Paseo's MCP with an inert non-HTTP server and drops preapprovals", () => {

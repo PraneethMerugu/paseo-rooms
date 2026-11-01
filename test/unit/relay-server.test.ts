@@ -6,10 +6,9 @@ import { test } from "node:test";
 import WebSocket from "ws";
 import { openClientSecureChannel, type Transport } from "@getpaseo/relay/e2ee";
 import { LaneEndpoint } from "../../server/gateway/lane-endpoint";
-import { HostStore } from "../../server/host/host-store";
 import { parseRelayNotice, relayClientUrl, relayServerUrl } from "../../server/transport/relay-server";
 import { startFakeRelay, until } from "./fake-relay";
-import { tempDir } from "./helpers";
+import { TestAuthority, testLane } from "./lane-harness";
 
 test("relay URLs and notices keep the M1 shapes", () => {
   const relay = { endpoint: "relay.example:443", useTls: true };
@@ -24,12 +23,10 @@ test("relay URLs and notices keep the M1 shapes", () => {
 
 test("lane endpoint over the extracted relay connection: NK handshake through the fake relay", async () => {
   const relay = await startFakeRelay();
-  const tmp = tempDir();
-  const host = new HostStore(tmp.dir, { endpoint: relay.endpoint, useTls: false });
+  const host = new TestAuthority();
   try {
-    const room = host.createRoom("Lab");
-    const lane = host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "agent-1" }, agentId: "agent-1", workspaceId: "wks_1" });
-    const ep = new LaneEndpoint(lane, { host, paseoHome: tmp.dir });
+    const lane = testLane({ relay: { endpoint: relay.endpoint, useTls: false } });
+    const ep = new LaneEndpoint(lane, { authority: host, paseoHome: "/nonexistent" });
     assert.equal(ep.relayUrl("c1"), `ws://${relay.endpoint}/ws?serverId=${lane.serverId}&role=server&v=2&connectionId=c1`);
 
     // A member daemon connects as a client; the relay names the connection; the endpoint is told.
@@ -39,21 +36,19 @@ test("lane endpoint over the extracted relay connection: NK handshake through th
     const transport: Transport = { send: (d) => void ws.send(d), close: (c, r) => ws.close(c, r), onmessage: null, onclose: null, onerror: null };
     ws.on("message", (d, isBinary) => transport.onmessage?.({ data: isBinary ? new Uint8Array(d as Buffer).slice().buffer : (d as Buffer).toString("utf8"), isBinary }));
     ws.on("close", (c, r) => transport.onclose?.(c, r.toString()));
-    const channelP = openClientSecureChannel(transport, { daemonPublicKeyB64: host.laneKeys(lane.id)!.publicKeyB64, minimumMode: "protected" });
+    const channelP = openClientSecureChannel(transport, { daemonPublicKeyB64: host.publicKeyB64, minimumMode: "protected" });
     ep.onRelayControl({ type: "connected", connectionId });
     const channel = await channelP;
     const conn = ep.connections.get(connectionId)!;
     await until("server side channel", () => conn.channel);
 
-    // An unexpected first frame closes the connection, as in M1.
+    // An unexpected first frame (including the removed M1 `rooms.control.hello`) closes the connection.
     const closed = new Promise<void>((r) => ws.once("close", () => r()));
     await channel.send(JSON.stringify({ type: "nonsense" }));
     await closed;
     await until("connection removed", () => !ep.connections.has(connectionId));
     await ep.stop();
   } finally {
-    host.dispose();
     await relay.close();
-    tmp.cleanup();
   }
 });

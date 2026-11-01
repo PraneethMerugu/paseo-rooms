@@ -24,7 +24,7 @@ import { join, posix, win32 } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { isForkVerifiedProvider } from "../../shared/policy";
 import { log } from "../log";
-import { writePrivateFile } from "../paths";
+import { writePrivateFile } from "../platform/durable";
 
 export const ROOM_LANE_ENV = "PASEO_ROOMS_LANE";
 

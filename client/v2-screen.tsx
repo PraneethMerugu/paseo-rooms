@@ -1,5 +1,5 @@
-// Rooms screen for the identity v2 runtime (I-14). Shown only when `rooms.bootstrap` reports
-// protocol "v2"; the M1 screen stays the default. Talks to the daemon only through rooms.v2.* RPCs.
+// Rooms screen (identity v2; I-14, the only screen since the I-15 cut-over). Talks to the daemon
+// through rooms.v2.* RPCs, plus the migration notices of migration.md 2.3 to 2.5 (rooms.migration.*).
 import type { PluginTheme } from "@getpaseo/plugin";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useAgent, useRpc } from "@getpaseo/plugin/client";
@@ -7,7 +7,7 @@ import { Modal, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Text, View } from "react-native";
-import { roomsPermissionsFix } from "../shared/rpc";
+import { roomsMigrationDeleteKeys, roomsMigrationDismiss, roomsPermissionsFix } from "../shared/rpc";
 import { roomsV2LaneCreate, roomsV2RoomCreate, roomsV2Status } from "../shared/rpc-v2";
 import { Badge, Button, commandCenterHint, errorText, Section, Segmented, useStyles, type Styles } from "./ui";
 import { RecoveryCodeModal, useAdminConfirm, type RecoveryOffer } from "./v2-dialogs";
@@ -24,7 +24,11 @@ export function RoomsV2Screen({ theme, layout, navigation }: PluginScreenProps) 
   const styles = useStyles(theme, layout.compact);
   const q = useStatusV2();
   const s = q.data;
-  const closedAgents = (s?.owned ?? []).flatMap((r) => r.lanes.filter((l) => l.agentId && (r.keys.closed || l.status === "closed")).map((l) => ({ roomId: r.roomId, laneId: l.laneId, agentId: l.agentId!, label: l.label })));
+  const closedAgents = [
+    ...(s?.owned ?? []).flatMap((r) => r.lanes.filter((l) => l.agentId && (r.keys.closed || l.status === "closed")).map((l) => ({ roomId: r.roomId, laneId: l.laneId, agentId: l.agentId!, label: l.label, old: false }))),
+    // Migration 2.2 step 3: lane agents of the previous version (M1), left on this daemon.
+    ...(s?.migration?.lanes ?? []).map((l) => ({ roomId: l.roomId, laneId: l.laneId, agentId: l.agentId, label: l.label as string | null, old: true })),
+  ].filter((a, i, all) => all.findIndex((b) => b.agentId === a.agentId) === i);
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <View style={{ gap: 4 }}>
@@ -32,12 +36,12 @@ export function RoomsV2Screen({ theme, layout, navigation }: PluginScreenProps) 
           <Text accessibilityRole="header" style={styles.h1}>
             Rooms
           </Text>
-          <Badge theme={theme} label="identity v2 (development)" tone="warn" />
         </View>
         <Text style={styles.muted}>Share an agent read-only with people who run Paseo. Joins are confirmed by comparing a six-digit code by voice.</Text>
       </View>
       {q.isError ? <Text style={styles.danger}>Could not load rooms: {errorText(q.error)}</Text> : null}
       {s ? <RuntimeNotices s={s} theme={theme} styles={styles} /> : null}
+      {s?.migration ? <MigrationNotices m={s.migration} theme={theme} styles={styles} /> : null}
 
       <Section styles={styles} title="Rooms you own" trailing={s?.state === "ready" ? <CreateRoomButton theme={theme} styles={styles} /> : null}>
         {s && s.owned.length === 0 ? <Text style={styles.muted}>No rooms yet. Create one, then share an agent: open the agent, {commandCenterHint(layout.compact)} and choose "Open room…".</Text> : null}
@@ -58,7 +62,7 @@ export function RoomsV2Screen({ theme, layout, navigation }: PluginScreenProps) 
           {closedAgents.map((a) => (
             <View key={`${a.roomId}-${a.laneId}`} style={styles.between}>
               <Text style={styles.body}>
-                {a.label ?? `Lane ${shortId(a.laneId)}`} · room {shortId(a.roomId)}
+                {a.label ?? `Lane ${shortId(a.laneId)}`} · {a.old ? "previous version" : `room ${shortId(a.roomId)}`}
               </Text>
               <Button theme={theme} label="Open agent" onPress={() => navigation?.openAgent({ agentId: a.agentId })} />
             </View>
@@ -133,6 +137,86 @@ function RuntimeNotices({ s, theme, styles }: { s: Status; theme: PluginTheme; s
   );
 }
 
+/**
+ * Migration from M1 (migration.md 2.3 step 4, 2.4, 2.5): the one-time upgrade notice, and the archive
+ * of v1 keys with "Delete keys", which needs the user's confirmation and keeps the room logs.
+ */
+function MigrationNotices({ m, theme, styles }: { m: NonNullable<Status["migration"]>; theme: PluginTheme; styles: Styles }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const dismiss = useRpc(roomsMigrationDismiss);
+  const deleteKeys = useRpc(roomsMigrationDeleteKeys);
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const c = theme.colors;
+  const box = [styles.codeBox, { borderLeftWidth: 3, borderLeftColor: c.statusWarning, gap: 6 }];
+  const refresh = () => void qc.invalidateQueries({ queryKey: STATUS_V2_KEY });
+  return (
+    <>
+      {m.notice ? (
+        <View style={box}>
+          <Text style={styles.h2}>Rooms was upgraded</Text>
+          <Text style={styles.body}>Rooms from the previous version were closed during the upgrade. Create a new room and send new invites. Invite codes starting with prc1. no longer work.</Text>
+          {m.hosts !== "none" ? (
+            <Text style={styles.small}>
+              {m.hosts === "done" ? "The lanes you had joined were removed from this daemon's hosts." : "Removing the lanes you had joined from this daemon's hosts…"} Paseo may still list old entries for them until it refreshes.
+            </Text>
+          ) : null}
+          {m.gateway === "pending" || m.member === "pending" ? <Text style={styles.small}>Some files of the previous version could not be moved yet. Rooms tries again at the next start.</Text> : null}
+          <View style={styles.row}>
+            <Button theme={theme} label="OK" onPress={() => void dismiss({}).then(refresh).catch((e) => toast.error(errorText(e)))} />
+          </View>
+        </View>
+      ) : null}
+      {m.keyFiles.length ? (
+        <View style={box}>
+          <Text style={styles.body}>Keys from the previous version of Rooms are stored unprotected in plugin-data/rooms/{m.archive}. They no longer work. Delete them?</Text>
+          <Text style={styles.small}>The room logs of the previous version stay in that folder.</Text>
+          <View style={styles.row}>
+            <Button theme={theme} variant="primary" label="Delete keys" onPress={() => setConfirm(true)} />
+          </View>
+        </View>
+      ) : null}
+      {confirm ? (
+        <Modal title="Delete old keys" open onOpenChange={(o) => (busy ? undefined : setConfirm(o))}>
+          <Modal.Content>
+            <View style={{ gap: 10 }}>
+              <Text style={styles.body}>This deletes {m.keyFiles.length} file(s) with keys of the previous version. It cannot be undone. The room logs are kept.</Text>
+              {m.keyFiles.slice(0, 6).map((f) => (
+                <Text key={f} style={styles.mono}>
+                  {f}
+                </Text>
+              ))}
+              <View style={styles.row}>
+                <Button
+                  theme={theme}
+                  variant="primary"
+                  label="Delete"
+                  busy={busy}
+                  onPress={() => {
+                    setBusy(true);
+                    void deleteKeys({ confirm: true })
+                      .then((r) => {
+                        toast.show(`Deleted ${r.removed.length} file(s)`, { variant: "success" });
+                        setConfirm(false);
+                      })
+                      .catch((e) => toast.error(errorText(e)))
+                      .finally(() => {
+                        setBusy(false);
+                        refresh();
+                      });
+                  }}
+                />
+                <Button theme={theme} label="Cancel" disabled={busy} onPress={() => setConfirm(false)} />
+              </View>
+            </View>
+          </Modal.Content>
+        </Modal>
+      ) : null}
+    </>
+  );
+}
+
 /** Identity-model 5.4: the create dialog preselects the recovery key and says what skipping costs. */
 function CreateRoomButton({ theme, styles }: { theme: PluginTheme; styles: Styles }) {
   const qc = useQueryClient();
@@ -200,7 +284,7 @@ function About({ s, theme, styles }: { s: Status; theme: PluginTheme; styles: St
     <Section styles={styles} title="About" trailing={<Button theme={theme} label={open ? "Hide" : "Show"} onPress={() => setOpen((v) => !v)} />}>
       {open ? (
         <View style={[styles.codeBox, { gap: 6 }]}>
-          <Text style={styles.small}>Protocol: identity v2 development runtime. Room keys stay on this daemon; this app holds none.</Text>
+          <Text style={styles.small}>Protocol: Rooms identity v2. Room keys stay on this daemon; this app holds none.</Text>
           <Text style={styles.small}>
             Key storage: {s.keystore?.backend ?? "not open"}
             {s.keystore?.fallback ? " (unprotected file)" : ""}. Daemon OS: {s.platform ?? "unknown"}.
@@ -233,7 +317,7 @@ export function OpenRoomV2Screen({ theme, layout, params }: PluginScreenProps) {
       <Text accessibilityRole="header" style={styles.h1}>
         Share in a room
       </Text>
-      <Text style={styles.muted}>Agent: {title ?? shortId(agentId)}. Members see it read-only, live. Forking is not available in identity v2 yet.</Text>
+      <Text style={styles.muted}>Agent: {title ?? shortId(agentId)}. Members see it read-only, live. Rooms shares this agent as it is; it does not fork it.</Text>
       {already ? <Text style={styles.body}>This agent is already shared in a room.</Text> : null}
       {rooms.length === 0 ? <Text style={styles.body}>You own no open room. Create one on the Rooms screen first.</Text> : null}
       {rooms.length > 1 ? (

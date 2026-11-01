@@ -1,5 +1,5 @@
-// Plugin RPC contracts of the identity v2 development runtime (PASEO_ROOMS_PROTOCOL=v2, decision D-2).
-// Registered only when the switch is set; they never ship. Enrollment (I-9): the owner creates invites
+// Plugin RPC contracts of the Rooms runtime (identity v2; the only runtime since the I-15 cut-over).
+// Enrollment (I-9): the owner creates invites
 // and admits join requests after the SAS comparison; the member previews, joins, compares and
 // confirms. Interactive admin actions (identity-model 5.3) take a one-time `confirmToken` that
 // `rooms.v2.admin.prepare` returns together with a description of what will be signed; a token whose
@@ -324,6 +324,24 @@ export const roomsV2Status = defineRpc({
     permissionProblems: z.array(z.object({ path: z.string(), code: z.string(), detail: z.string() })).optional(),
     /** The daemon's OS (`process.platform`): the About panel states the weaker durability on win32 (grants-v2 7.3). */
     platform: z.string().optional(),
+    /**
+     * Migration from M1 (migration.md section 2), null when this home never held M1 data: the archive
+     * directory (relative), whether the one-time notice is still unread, the v1 key files still in the
+     * archive, and the v1 lane agents left on this daemon ("Agents from closed rooms").
+     */
+    migration: z
+      .object({
+        archive: z.string(),
+        notice: z.boolean(),
+        gateway: z.enum(["none", "pending", "archived"]),
+        member: z.enum(["none", "pending", "archived"]),
+        hosts: z.enum(["none", "pending", "done"]),
+        hostsRemoved: z.number().int(),
+        keyFiles: z.array(z.string()),
+        lanes: z.array(z.object({ laneId: z.string(), roomId: z.string(), agentId: z.string(), label: z.string(), origin: z.enum(["share", "fork"]) })),
+      })
+      .nullable()
+      .optional(),
     owned: z.array(OwnedRoomV2View),
     joining: z.array(JoiningV2View),
     joined: z.array(JoinedRoomV2View),

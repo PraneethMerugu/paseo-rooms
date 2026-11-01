@@ -4,7 +4,7 @@
 // cannot disable a limit. The file is read once when the plugin starts.
 import { join } from "node:path";
 import { log } from "./log";
-import { readJsonFile } from "./paths";
+import { readJsonFile } from "./platform/durable";
 
 export interface ResourceLimits {
   /** Relay data connections per lane endpoint, including pre-authentication and control channels. */

@@ -1,5 +1,7 @@
 # Data model, tokens and storage (v1)
 
+- **Superseded (2026-11-01):** by `identity-v2/` (implementation plan I-15; `identity-v2/migration.md` section 5). The code this document describes was deleted at the identity v2 cut-over and is kept in git at tag `m1-baseline`. Kept for reference only.
+
 Schemas are zod in `shared/schemas.ts` and `shared/control.ts`. Every persisted record has `v: 1`.
 
 ## 1. Entities (M1 subset of rooms-architecture.md section 3)

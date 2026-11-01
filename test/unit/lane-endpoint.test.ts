@@ -3,13 +3,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { after, before, test } from "node:test";
-import { generateEd25519, signEd25519 } from "../../server/crypto";
 import { LaneEndpoint, LinkSession, LaneConnection } from "../../server/gateway/lane-endpoint";
-import { HostStore } from "../../server/host/host-store";
-import { decodeInviteCode } from "../../server/invite-code";
 import { DEFAULT_LIMITS, resolveLimits, LIMIT_BOUNDS, type ResourceLimits } from "../../server/limits";
 import { startFakeDaemon, waitFor, type FakeDaemon } from "./fake-daemon";
 import { tempDir } from "./helpers";
+import { TestAuthority, testLane } from "./lane-harness";
 
 let fake: FakeDaemon;
 const realStart = LaneConnection.prototype.start;
@@ -24,27 +22,14 @@ after(async () => {
 
 function setup(limits: Partial<ResourceLimits> = {}) {
   const tmp = tempDir();
-  const host = new HostStore(tmp.dir, { endpoint: "relay.example:443", useTls: true });
-  const room = host.createRoom("Lab");
-  const lane = host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "agent-1" }, agentId: "agent-1", workspaceId: "wks_1" });
-  const ep = new LaneEndpoint(lane, { host, paseoHome: fake.home, limits: resolveLimits({ ...DEFAULT_LIMITS, ...limits }) });
+  const host = new TestAuthority();
+  const lane = testLane();
+  const ep = new LaneEndpoint(lane, { authority: host, paseoHome: fake.home, limits: resolveLimits({ ...DEFAULT_LIMITS, ...limits }) });
   return { tmp, host, lane, ep };
 }
 
-function enroll(host: HostStore, laneId: string) {
-  const { code } = host.createInvite({ laneId, ttlSeconds: 600, grantTtlSeconds: 3600 });
-  const invite = decodeInviteCode(code);
-  const device = generateEd25519();
-  const transcript = (tokenHash: string) =>
-    HostStore.transcript({ op: "enroll", laneId, laneServerId: invite.offer.serverId, hostKeyId: host.hostKey.keyId, nonce: "n".repeat(43), devicePublicKey: device.publicKey, tokenHash, daemonServerId: null, label: "Ada" });
-  return host.enroll({
-    laneId,
-    token: invite.token,
-    devicePublicKey: device.publicKey,
-    label: "Ada",
-    daemonServerId: null,
-    verifySignature: (h) => host.verifyDeviceSignature(device.publicKey, transcript(h), signEd25519(device, transcript(h))),
-  });
+function enroll(host: TestAuthority, laneId: string) {
+  return host.enroll(laneId);
 }
 
 async function link(ep: LaneEndpoint, id: string, grant: string) {
@@ -205,23 +190,22 @@ test("B3 + C-5: oversized frames close the connection; per-link rate limit drops
   }
 });
 
-test("C-13: an archived lane agent stops the retries and hands the lane to the gateway", async () => {
+test("C-13: an archived lane agent stops the retries and hands the lane to the lane service", async () => {
   const tmp = tempDir();
   try {
-    const host = new HostStore(tmp.dir, { endpoint: "relay.example:443", useTls: true });
-    const room = host.createRoom("Lab");
-    const lane = host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "agent-arch" }, agentId: "agent-arch", workspaceId: "wks_1" });
+    const host = new TestAuthority();
+    const lane = testLane({ agentId: "agent-arch" });
     fake.onSession = (m, reply) => {
       if (m.type === "fetch_agent_request") reply({ type: "fetch_agent_response", payload: { requestId: m.requestId, agent: m.agentId === "agent-arch" ? { id: "agent-arch", archivedAt: "2026-10-28T00:00:00Z" } : null, project: null, error: null } });
     };
     const gone: string[] = [];
-    const ep = new LaneEndpoint(lane, { host, paseoHome: fake.home, onAgentGone: (id, reason) => void gone.push(`${id}:${reason}`) });
+    const ep = new LaneEndpoint(lane, { authority: host, paseoHome: fake.home, onAgentGone: (id, reason) => void gone.push(`${id}:${reason}`) });
     await ep.start();
     assert.deepEqual(gone, [`${lane.id}:agent_archived`]);
     assert.equal((ep as any).reconnectTimer, null, "no retry timer");
     // A missing agent is not closed on the first sighting (could be a daemon still loading).
-    const lane2 = host.createLane({ roomId: room.id, label: "Live", origin: { kind: "share", agentId: "agent-missing" }, agentId: "agent-missing", workspaceId: "wks_1" });
-    const ep2 = new LaneEndpoint(lane2, { host, paseoHome: fake.home, onAgentGone: (id, reason) => void gone.push(`${id}:${reason}`) });
+    const lane2 = testLane({ roomId: lane.roomId, agentId: "agent-missing" });
+    const ep2 = new LaneEndpoint(lane2, { authority: host, paseoHome: fake.home, onAgentGone: (id, reason) => void gone.push(`${id}:${reason}`) });
     await ep2.start();
     assert.equal(gone.length, 1);
     assert.equal(ep2.status, "offline");
@@ -236,11 +220,10 @@ test("C-13: an archived lane agent stops the retries and hands the lane to the g
 test("C-iso2: a fork lane whose room agent fails the tripwire never starts", async () => {
   const tmp = tempDir();
   try {
-    const host = new HostStore(tmp.dir, { endpoint: "relay.example:443", useTls: true });
-    const room = host.createRoom("Lab");
-    const lane = host.createLane({ roomId: room.id, label: "Fork", origin: { kind: "fork", parentAgentId: "p", contextItems: 0, contextChars: 0 }, agentId: "agent-f", workspaceId: "wks_1" });
+    const host = new TestAuthority();
+    const lane = testLane({ label: "Fork", origin: { kind: "fork" }, agentId: "agent-f" });
     const before = fake.hellos.length;
-    const ep = new LaneEndpoint(lane, { host, paseoHome: fake.home, verifyRoomAgent: () => ({ ok: false, problems: ["unexpected MCP servers: zz-tools"] }) });
+    const ep = new LaneEndpoint(lane, { authority: host, paseoHome: fake.home, verifyRoomAgent: () => ({ ok: false, problems: ["unexpected MCP servers: zz-tools"] }) });
     await ep.start();
     assert.equal(ep.blockedReason, "room_agent_tripwire");
     assert.equal(ep.status, "offline");

@@ -118,7 +118,7 @@ cleanup() {
     cp "$h/daemon.log" "$LOGDIR/daemon-$(basename "$h").log" 2>/dev/null || true
   done
   if [ -f "$SECRETS_FILE" ]; then
-    "${TSX[@]}" "$PLUGIN_DIR/test/e2e/secret-scan.ts" "$SECRETS_FILE" "$HOMES" "$LOGDIR" | tee "$LOGDIR/secret-scan.json" || code=1
+    "${TSX[@]}" "$PLUGIN_DIR/test/reliability/secret-scan.ts" "$SECRETS_FILE" "$HOMES" "$LOGDIR" | tee "$LOGDIR/secret-scan.json" || code=1
     rm -f "$SECRETS_FILE"
   fi
   for port in "$OWNER_PORT" "$MEMBER_PORT"; do

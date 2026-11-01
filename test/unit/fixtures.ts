@@ -142,3 +142,50 @@ export function workspaceDescriptor(over: Record<string, unknown> = {}): Record<
     ...over,
   };
 }
+
+// ------------------------------------------------------------------------------ M1 (v1) data tree
+
+/** Ids and values of the fixture v1 tree (shapes from the M1 build, tag m1-baseline). */
+export const V1 = {
+  roomId: "room_00112233445566aa",
+  shareLane: "lane_aaaaaaaaaaaaaaaa",
+  forkLane: "lane_bbbbbbbbbbbbbbbb",
+  joinedLane: "lane_cccccccccccccccc",
+  shareAgent: "11111111-aaaa-4aaa-8aaa-111111111111",
+  forkAgent: "22222222-bbbb-4bbb-8bbb-222222222222",
+  registrationId: "reg-v1-joined",
+  /** Stand-ins for plaintext v1 secrets (the archive keeps them until the user deletes them). */
+  secret: "V1-FIXTURE-SECRET-not-a-real-key",
+};
+
+/**
+ * Writes the M1 layout under `dataDir` (plugin-data/rooms), owner-only: gateway/state.json (v 1,
+ * a share lane and a fork lane, lane keys), gateway/host-key.json, gateway/rooms/<id>/events.jsonl,
+ * member/device.json, member/rooms.json (one joined lane with its registration), and limits.json.
+ */
+export function writeV1Tree(dataDir: string, fs: typeof import("node:fs"), path: typeof import("node:path")): void {
+  const dir = (p: string) => fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+  const file = (p: string, v: unknown) => fs.writeFileSync(p, typeof v === "string" ? v : JSON.stringify(v, null, 2), { mode: 0o600 });
+  const gw = path.join(dataDir, "gateway");
+  const mem = path.join(dataDir, "member");
+  dir(path.join(gw, "rooms", V1.roomId));
+  dir(mem);
+  const relay = { endpoint: "relay.paseo.sh:443", useTls: true };
+  const lane = (id: string, agentId: string, origin: unknown, label: string) => ({ v: 1, id, roomId: V1.roomId, label, origin, agentId, workspaceId: "wks_1", serverId: `lane_${"S".repeat(32)}`, publicKeyB64: "A".repeat(44), relay, createdAt: "2026-10-28T00:00:00Z", status: "open" });
+  file(path.join(gw, "state.json"), {
+    v: 1,
+    rooms: [{ v: 1, id: V1.roomId, name: "Old room", createdAt: "2026-10-28T00:00:00Z", status: "active" }],
+    lanes: [lane(V1.shareLane, V1.shareAgent, { kind: "share", agentId: V1.shareAgent }, "Live"), lane(V1.forkLane, V1.forkAgent, { kind: "fork", parentAgentId: V1.shareAgent, contextItems: 2, contextChars: 40 }, "Fork")],
+    laneKeys: { [V1.shareLane]: { publicKeyB64: "A".repeat(44), secretKeyB64: V1.secret } },
+    members: [],
+    invites: [],
+    grants: [],
+    revokedGrantIds: [],
+  });
+  file(path.join(gw, "host-key.json"), { v: 1, alg: "ed25519", keyId: "0123456789abcdef", publicKey: "B".repeat(43), privateKeyPkcs8: V1.secret, createdAt: "2026-10-28T00:00:00Z" });
+  file(path.join(gw, "rooms", V1.roomId, "events.jsonl"), `${JSON.stringify({ v: 1, roomId: V1.roomId, seq: 0, type: "room.created" })}\n`);
+  file(path.join(mem, "device.json"), { v: 1, alg: "ed25519", keyId: "fedcba9876543210", publicKey: "C".repeat(43), privateKeyPkcs8: V1.secret, createdAt: "2026-10-28T00:00:00Z" });
+  file(path.join(mem, "rooms.json"), { v: 1, rooms: [{ v: 1, roomId: "room_99887766554433ff", roomName: "Joined", laneId: V1.joinedLane, laneLabel: "Live", memberId: "mem_0011223344556677", status: "active", registrationId: V1.registrationId }] });
+  file(path.join(dataDir, "limits.json"), "{}");
+  for (const p of [path.dirname(dataDir), dataDir]) fs.chmodSync(p, 0o700);
+}

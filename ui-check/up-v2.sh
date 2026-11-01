@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Start three disposable Paseo daemons running the rooms plugin's identity v2 runtime
-# (PASEO_ROOMS_PROTOCOL=v2) with demo state, for a manual check of the v2 screens in the real
-# Paseo app. Never touches ~/.paseo or the main daemon: every CLI call passes --home and PASEO_HOME
-# points under plugin/ui-check/.homes-v2.
+# Start three disposable Paseo daemons running the rooms plugin (identity v2, the only runtime since
+# the I-15 cut-over) with demo state, for a manual check of the Rooms screens in the real Paseo app.
+# Never touches ~/.paseo or the main daemon: every CLI call passes --home and PASEO_HOME points under
+# plugin/ui-check/.test-homes. Each home carries the test-home marker, because the plugin honours
+# PASEO_ROOMS_DEV_* switches (here only the loopback relay of --offline) only on a marked test home.
 #
 #   v2-owner    127.0.0.1:6912   owns "UI check room v2" (and "SAS demo room"), hosts the lane
 #   v2-member   127.0.0.1:6913   member device A (admitted by the real SAS flow)
@@ -31,7 +32,7 @@ PLUGIN_DIR=$(dirname "$UI_DIR")
 P=/opt/Paseo/resources/bin/paseo
 NODE=(env ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin)
 TSX=("${NODE[@]}" "$PLUGIN_DIR/node_modules/tsx/dist/cli.mjs")
-HOMES=$UI_DIR/.homes-v2
+HOMES=$UI_DIR/.test-homes
 OWNER=$HOMES/v2-owner
 MEMBER=$HOMES/v2-member
 MEMBER2=$HOMES/v2-member2
@@ -50,8 +51,8 @@ for h in "$HOMES" "$OWNER" "$MEMBER" "$MEMBER2"; do
     "$MAIN_HOME"|"$MAIN_HOME"/*) echo "Refusing: $h resolves to ~/.paseo" >&2; exit 2 ;;
   esac
   case "$r" in
-    "$(realpath -m "$UI_DIR")"/.homes-v2|"$(realpath -m "$UI_DIR")"/.homes-v2/v2-*) ;;
-    *) echo "Refusing: $h is not under $UI_DIR/.homes-v2" >&2; exit 2 ;;
+    "$(realpath -m "$UI_DIR")"/.test-homes|"$(realpath -m "$UI_DIR")"/.test-homes/v2-*) ;;
+    *) echo "Refusing: $h is not under $UI_DIR/.test-homes" >&2; exit 2 ;;
   esac
 done
 unset PASEO_HOME   # never inherited; every call sets it explicitly
@@ -71,8 +72,9 @@ if [ -e "$HOMES" ]; then echo "$HOMES already exists. Run $UI_DIR/down-v2.sh fir
 # ------------------------------------------------------------------ environment of the test daemons
 # Speech off before the first start (no model download).
 export PASEO_DICTATION_ENABLED=false PASEO_VOICE_MODE_ENABLED=false
-# The v2 runtime with the protected fallback-file keystore (never the user's keyring).
-export PASEO_ROOMS_PROTOCOL=v2 PASEO_ROOMS_KEYSTORE=fallback-file
+# The protected fallback-file keystore (never the user's keyring).
+export PASEO_ROOMS_KEYSTORE=fallback-file
+unset PASEO_ROOMS_PROTOCOL   # removed at the cut-over; ignored if set
 # No development timers, short grants or test clock: the demo runs on production timings.
 unset PASEO_ROOMS_KEK_FILE PASEO_ROOMS_TEST_CLOCK PASEO_ROOMS_DEV_SHORT_GRANTS PASEO_ROOMS_DEV_GRANT_TTL_S PASEO_ROOMS_DEV_MLS_FAST
 if [ "$OFFLINE" = 1 ]; then
@@ -98,6 +100,9 @@ write_config() {
 }
 JSON
   chmod 600 "$home/config.json"
+  # Test-home marker (exact text checked by server/platform/test-clock.ts).
+  printf 'paseo-rooms e2e test home; the test clock override may be used here\n' > "$home/rooms-test-home"
+  chmod 600 "$home/rooms-test-home"
 }
 
 fail() {

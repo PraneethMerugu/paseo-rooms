@@ -4,7 +4,6 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ensureInertMcp, registerAgentGuard, restrictRoomAgentConfig, ROOM_LANE_ENV } from "../../server/gateway/agent-guard";
-import { Gateway } from "../../server/gateway/gateway";
 import { checkRoomAgentConfig, findStoredAgentRecord, projectDirNameFromCwd, verifyRoomAgent } from "../../server/gateway/tripwire";
 import { FORK_VERIFIED_PROVIDERS, isForkVerifiedProvider } from "../../shared/policy";
 import { tempDir } from "./helpers";
@@ -56,26 +55,8 @@ test("tripwire: reads the daemon's stored record; a missing record fails closed"
   }
 });
 
-test("tripwire on resume: the gateway refuses to reopen a fork lane agent whose stored config was altered", async () => {
-  const tmp = tempDir();
-  const home = join(tmp.dir, "home");
-  const gw = new Gateway(join(tmp.dir, "data"), home, { endpoint: "relay.example:443", useTls: true });
-  try {
-    const room = gw.host.createRoom("Lab");
-    const lane = gw.host.createLane({ roomId: room.id, label: "Fork", origin: { kind: "fork", parentAgentId: "p", contextItems: 1, contextChars: 5 }, agentId: "fork-1", workspaceId: "w" });
-    const inert = ensureInertMcp(gw.dataDir);
-    storeRecord(home, "fork-1", "/w", restrictRoomAgentConfig({ provider: "claude" }, inert));
-    assert.doesNotThrow(() => gw.assertRoomAgentIntact("fork-1"));
-    assert.doesNotThrow(() => gw.assertRoomAgentIntact("some-other-agent"), "non-lane agents are not checked");
-    storeRecord(home, "fork-1", "/w", { mcpServers: { paseo: { type: "http", url: "http://127.0.0.1/mcp/agents" } } });
-    assert.throws(() => gw.assertRoomAgentIntact("fork-1"), /isolation check/);
-    assert.equal(gw.forkLaneOfAgent("fork-1")?.id, lane.id);
-  } finally {
-    await gw.stop();
-    gw.host.dispose();
-    tmp.cleanup();
-  }
-});
+// The resume tripwire (session_open) for room agents left by M1 is tested at runtime level in
+// v2-migration.test.ts.
 
 test("C-iso3: fork lanes only for verified providers (allowlist, exact provider id)", () => {
   assert.deepEqual([...FORK_VERIFIED_PROVIDERS], ["claude"]);

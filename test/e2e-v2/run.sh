@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Identity v2 end-to-end test (implementation plan I-8 to I-11): room endpoint transport, sessions,
-# SAS enrollment, lane grants v2 and device linking between disposable Paseo 0.13.2 test daemons running
-# the plugin with PASEO_ROOMS_PROTOCOL=v2. The driver restarts the owner and member daemons once,
+# Rooms end-to-end test (identity v2; implementation plan I-8 to I-15): room endpoint transport,
+# sessions, SAS enrollment, lane grants v2, device linking, MLS, rotation and the checks ported from the
+# M1 e2e (out-of-scope denials, one-time invite, file modes, secret scan, room log verification,
+# archived agent closes its lane) between disposable Paseo 0.13.2 test daemons. The driver restarts the owner and member daemons once,
 # mid-enrollment, views the lane through the member, waits for an idle and a forced grant rotation
 # (short grants: 40 s), links a second device of the member (third daemon) and lets the 72 h hold pass
 # on the owner's test clock, revokes, and scans every home for invite and link codes (prc2., prl2.) and
@@ -13,13 +14,15 @@
 #   relay   : fake relay process             127.0.0.1:6923  (default, offline)
 #             or the live relay relay.paseo.sh:443 with --live-relay (network; needs the user's go-ahead)
 #
-# TEST-ONLY clock: the owner daemon (host and admin daemon) runs with PASEO_ROOMS_TEST_CLOCK=1 and its
-# home carries the marker file `rooms-test-home`; the plugin honours the override only on such a home
-# under .test-homes (server/platform/test-clock.ts). No other daemon gets the switch.
+# TEST-ONLY clock: the owner daemon (host and admin daemon) runs with PASEO_ROOMS_TEST_CLOCK=1; no other
+# daemon gets the switch. Every home carries the marker file `rooms-test-home`: the plugin honours the
+# clock switch and the PASEO_ROOMS_DEV_* switches only on such a home under .test-homes
+# (server/platform/test-clock.ts) and ignores them anywhere else.
 #
 # Never touches ~/.paseo or the main daemon: every CLI call passes --home and PASEO_HOME explicitly.
-# Creates ONE agent on the owner for the lane (Claude Haiku, created without a prompt: no model call),
-# archived at the end; no other agents, no model or API calls. Keys use the protected fallback file
+# Creates TWO agents on the owner (Claude Haiku, both created without a prompt: no model call): the
+# shared one and one that is never shared (the denial checks); both are archived at the end. No model
+# or API calls. Keys use the protected fallback file
 # (PASEO_ROOMS_KEYSTORE=fallback-file), so the user's keyring is never read or written. The daemons'
 # own relay registration stays off in both modes; only the plugin's room endpoint uses the relay.
 #
@@ -85,7 +88,7 @@ done
 mkdir -p "$LOGDIR"
 export PASEO_DICTATION_ENABLED=false PASEO_VOICE_MODE_ENABLED=false
 # Plugin settings for the test daemons (inherited by the daemons and their plugin processes).
-export PASEO_ROOMS_PROTOCOL=v2 PASEO_ROOMS_KEYSTORE=fallback-file
+export PASEO_ROOMS_KEYSTORE=fallback-file
 # Development short grants (grants-v2 section 5): honoured by the host only; never set outside tests.
 export PASEO_ROOMS_DEV_SHORT_GRANTS=1 PASEO_ROOMS_DEV_GRANT_TTL_S=40
 # Development MLS timers (I-13): witness within 1 s, joiner check 5 s; the repair delay stays at its
@@ -159,9 +162,12 @@ fi
 write_config "$OWNER" "$OWNER_PORT"
 write_config "$MEMBER" "$MEMBER_PORT"
 write_config "$MEMBER2" "$MEMBER2_PORT"
-# TEST-ONLY clock marker, owner home only (exact text checked by server/platform/test-clock.ts).
-printf 'paseo-rooms e2e test home; the test clock override may be used here\n' > "$OWNER/rooms-test-home"
-chmod 600 "$OWNER/rooms-test-home"
+# Test-home marker on every home (exact text checked by server/platform/test-clock.ts): the development
+# switches are honoured only there. The clock switch itself goes to the owner daemon only.
+for h in "$OWNER" "$MEMBER" "$MEMBER2"; do
+  printf 'paseo-rooms e2e test home; the test clock override may be used here\n' > "$h/rooms-test-home"
+  chmod 600 "$h/rooms-test-home"
+done
 PASEO_ROOMS_TEST_CLOCK=1 pa "$OWNER" daemon start --timeout 120 | tail -1
 for h in "$MEMBER" "$MEMBER2"; do pa "$h" daemon start --timeout 120 | tail -1; done
 for h in "$OWNER" "$MEMBER" "$MEMBER2"; do pa "$h" plugin install "$PLUGIN_DIR" --json | tail -3; done

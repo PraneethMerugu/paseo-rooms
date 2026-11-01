@@ -326,6 +326,33 @@ test("lane endpoint v2: no control channel; failed attempts consume the bucket; 
   }
 });
 
+test("C-13: an archived lane agent stops its endpoint at once and the lane is closed (lane.closed); once only", async () => {
+  const env = await setup();
+  try {
+    const gone: string[] = [];
+    (env.lanes as unknown as { o: { onAgentGone(laneId: string, reason: string): void } }).o.onAgentGone = (laneId, reason) => {
+      gone.push(`${laneId}:${reason}`);
+      adminDo(env, "lane.closed", { laneId });
+    };
+    const d = newDevice();
+    admit(env, d);
+    const g = issue(env, d);
+    const l = await link(env.ep, "c1", g.token);
+    assert.equal(l.link.accepted, true);
+    assert.deepEqual(env.lanes.onAgentArchived("some-other-agent"), []);
+    assert.deepEqual(env.lanes.onAgentArchived("agent-1"), [env.laneId]);
+    assert.deepEqual(gone, [`${env.laneId}:agent_archived`]);
+    assert.equal(env.lanes.endpoints.has(env.laneId), false, "endpoint stopped and dropped");
+    assert.equal(l.link.closed, true, "the open link is cut");
+    assert.equal(env.room.host.state.auth.lanes[env.laneId].status, "closed");
+    assert.deepEqual(env.lanes.onAgentArchived("agent-1"), [], "idempotent");
+    env.lanes.sync();
+    assert.equal(env.lanes.endpoints.has(env.laneId), false, "not restarted");
+  } finally {
+    await env.cleanup();
+  }
+});
+
 test("P-9: a stolen grant on a second live link closes both links, unlists the gid and logs grant.suspected-theft", async () => {
   const env = await setup({ livenessWaitMs: 400 });
   try {

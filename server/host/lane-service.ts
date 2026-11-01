@@ -32,8 +32,7 @@ import { z } from "zod";
 import type { RoomState } from "../authority/fold";
 import { firstIssue, LaneId, RoomId } from "../authority/schema";
 import { edKid, versionKey } from "../authority/state";
-import type { Lane } from "../../shared/schemas";
-import { LaneEndpoint, type LaneGrantAuthority, type LinkSession } from "../gateway/lane-endpoint";
+import { LaneEndpoint, type AgentGoneReason, type EndpointLane, type LaneGrantAuthority, type LinkSession } from "../gateway/lane-endpoint";
 import type { Kek } from "../keystore/keystore";
 import { DEFAULT_LIMITS, resolveLimits, type ResourceLimits } from "../limits";
 import { log } from "../log";
@@ -72,6 +71,11 @@ export interface LaneServiceOptions {
   livenessWaitMs?: number;
   /** Test only: build endpoints without starting them (no daemon, no relay). */
   autostart?: boolean;
+  /**
+   * C-13: the lane's agent was archived or deleted. The endpoint has already stopped serving; the
+   * runtime closes the lane in the room log (`lane.closed`, signed by this daemon's admin key).
+   */
+  onAgentGone?(laneId: string, reason: AgentGoneReason): void;
 }
 
 export class LaneService {
@@ -80,6 +84,8 @@ export class LaneService {
   private readonly served = new Map<string, string>();
   private bindings: LaneBinding[];
   private stopped = false;
+  /** Lanes whose agent is gone: no endpoint is started again in this process (C-13). */
+  private readonly gone = new Set<string>();
 
   constructor(private readonly o: LaneServiceOptions) {
     this.bindings = this.readBindings();
@@ -98,7 +104,7 @@ export class LaneService {
 
   /**
    * Creates a lane for an agent of this daemon. `submit` signs and submits `lane.created` as an admin
-   * (the RPC call is the confirmation in the development runtime). Returns the new lane.
+   * (confirmed by the caller). Returns the new lane.
    */
   createLane(i: { agentId: string; workspaceId: string; label: string; owner: string; submit: (data: unknown) => void }): { laneId: string; serverId: string } {
     const laneId = newId("lane");
@@ -195,12 +201,43 @@ export class LaneService {
     }
     for (const b of this.bindings) {
       const l = s.auth.lanes[b.laneId];
-      if (!l || l.status === "closed" || s.auth.closed || this.endpoints.has(b.laneId)) continue;
+      if (!l || l.status === "closed" || s.auth.closed || this.endpoints.has(b.laneId) || this.gone.has(b.laneId)) continue;
       const ep = this.makeEndpoint(b, l.offer.serverId);
       if (!ep) continue;
       this.endpoints.set(b.laneId, ep);
       this.served.set(b.laneId, l.offer.serverId);
       if (this.o.autostart !== false) void ep.start();
+    }
+  }
+
+  /**
+   * Lifecycle hook agent.archived (C-13): every running endpoint of that agent stops at once and is
+   * handed to `onAgentGone`. Returns the lane ids.
+   */
+  onAgentArchived(agentId: string): string[] {
+    const out: string[] = [];
+    for (const [laneId, ep] of this.endpoints) {
+      if (ep.lane.agentId !== agentId) continue;
+      ep.agentGone("agent_archived");
+      out.push(laneId);
+    }
+    return out;
+  }
+
+  /** The endpoint stopped for good (agent archived or missing): drop it and report it once. */
+  private agentGone(laneId: string, reason: AgentGoneReason): void {
+    const ep = this.endpoints.get(laneId);
+    if (ep) {
+      this.endpoints.delete(laneId);
+      this.served.delete(laneId);
+      void ep.stop(reason);
+    }
+    this.gone.add(laneId);
+    log("v2_lane_agent_gone", { roomId: this.roomId, laneId, reason });
+    try {
+      this.o.onAgentGone?.(laneId, reason);
+    } catch (e) {
+      log("v2_lane_close_failed", { roomId: this.roomId, laneId, error: String((e as Error)?.message ?? e).slice(0, 200) });
     }
   }
 
@@ -254,28 +291,20 @@ export class LaneService {
       log("v2_lane_key_missing", { roomId: this.roomId, laneId: b.laneId });
       return null;
     }
-    const pub = x25519.getPublicKey(b64uDecode(k.secret, 32));
-    const lane = {
-      v: 1,
-      id: b.laneId,
-      roomId: this.roomId,
-      label: b.label,
-      origin: { kind: "share", agentId: b.agentId },
-      agentId: b.agentId,
-      workspaceId: b.workspaceId,
-      serverId,
-      publicKeyB64: Buffer.from(pub).toString("base64"),
-      relay: this.o.relay,
-      createdAt: new Date(0).toISOString(),
-      status: "open",
-    } as unknown as Lane;
+    const lane: EndpointLane = { id: b.laneId, roomId: this.roomId, label: b.label, origin: { kind: "share" }, agentId: b.agentId, workspaceId: b.workspaceId, serverId, relay: this.o.relay };
     const projectNames: ProjectNamePolicy = { show: namesShown(this.o.host.state, b.laneId), label: neutralProjectLabel(undefined, b.label) };
-    return new LaneEndpoint(lane, { authority: this.authority(b.laneId, serverId), projectNames, errorRefs: true, paseoHome: this.o.paseoHome, limits: this.o.limits ?? V2_LANE_LIMITS });
+    return new LaneEndpoint(lane, {
+      authority: this.authority(b.laneId, serverId),
+      projectNames,
+      errorRefs: true,
+      paseoHome: this.o.paseoHome,
+      limits: this.o.limits ?? V2_LANE_LIMITS,
+      onAgentGone: (laneId, reason) => this.agentGone(laneId, reason),
+    });
   }
 
   private authority(laneId: string, aud: string): LaneGrantAuthority {
     return {
-      controlChannel: false,
       failedAttemptsPerMinute: FAILED_LINKS_PER_MINUTE,
       check: (token, id, opts) => (id === laneId ? this.o.grants.verify(token, { laneId, aud }, opts) : { ok: false, reason: "wrong_audience" }),
       keyPair: () => {

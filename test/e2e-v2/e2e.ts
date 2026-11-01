@@ -57,6 +57,7 @@ import { execFileSync } from "node:child_process";
 import WebSocket from "ws";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { createHostChannelTransport } from "@getpaseo/client/internal/hosts";
+import { RoomLogFold } from "../../server/authority/fold";
 
 const OWNER = process.env.E2E_OWNER_HOME!;
 const MEMBER = process.env.E2E_MEMBER_HOME!;
@@ -137,6 +138,18 @@ function files(dir: string): string[] {
   return out;
 }
 
+/** Directories under a tree (no node_modules). */
+function dirs(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (name === "node_modules") continue;
+    const p = join(dir, name);
+    const st = lstatSync(p);
+    if (st.isDirectory() && !st.isSymbolicLink()) out.push(p, ...dirs(p));
+  }
+  return out;
+}
+
 /** RJCS for the ASCII-only invite payload: sorted keys, no whitespace (signatures-and-encoding.md 2). */
 function canonical(v: unknown): string {
   if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
@@ -176,8 +189,10 @@ async function main() {
   check("TEST-ONLY clock available on the owner's marked test home only", so.testClockOffsetMs === 0 && sm.testClockOffsetMs === undefined && sm2.testClockOffsetMs === undefined, { owner: so.testClockOffsetMs ?? null });
   const noClock = await attempt(() => rpc(m, "rooms.v2.test.clock.advance", { ms: 1000 }));
   check("the test clock RPC is not registered on a daemon without the switch and marker", !noClock.ok, { error: noClock.ok ? null : noClock.error });
-  const m1 = await attempt(() => rpc(o, "rooms.overview", {}));
-  check("M1 RPCs are not registered under the v2 switch", !m1.ok, { error: m1.ok ? null : m1.error });
+  const m1 = await Promise.all(["rooms.overview", "rooms.create", "rooms.join", "rooms.log"].map((x) => attempt(() => rpc(o, x, {}))));
+  check("no M1 RPC is registered (v2 is the only runtime; no PASEO_ROOMS_PROTOCOL switch)", m1.every((r) => !r.ok), { errors: m1.map((r) => (r.ok ? "LEAK" : r.error.slice(0, 60))) });
+  const fresh = (await rpc(o, "rooms.v2.status", {})).migration;
+  check("a fresh home has nothing to migrate from M1", fresh === null, { migration: fresh });
   const dev = await attempt(() => rpc(o, "rooms.v2.dev.member.admit", {}));
   check("the I-8 stand-in admission RPCs are gone", !dev.ok, { error: dev.ok ? null : dev.error });
 
@@ -191,8 +206,12 @@ async function main() {
   check("an interactive admin action without its confirmation token is refused (I-14)", !noToken.ok, { error: noToken.ok ? null : noToken.error });
   // The lane's agent: one Claude Haiku agent created WITHOUT a prompt (no model call).
   const agent = await o.createAgent({ provider: "claude", model: "claude-haiku-4-5", cwd: SCRATCH, title: "rooms v2 e2e lane" });
-  AGENT_ID = agent.id;
+  AGENT_IDS.push(agent.id);
   log("lane_agent_created", { agentId: String(agent.id).slice(0, 8), prompt: false });
+  // A second agent on the same daemon, never shared (also created WITHOUT a prompt): the lane must not
+  // reveal it (the M1 e2e used the fork's parent for this).
+  const other = await o.createAgent({ provider: "claude", model: "claude-haiku-4-5", cwd: SCRATCH, title: "rooms v2 e2e not shared" });
+  AGENT_IDS.push(other.id);
   const lane = await adminRpc(o, "rooms.v2.lane.create", { roomId, agentId: agent.id, label: "Live" });
   const laneId: string = lane.laneId;
   const laneUp = await attempt(() => until("lane endpoint online", async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.lanes.find((l: any) => l.laneId === laneId)?.endpoint === "online", 30_000));
@@ -286,6 +305,14 @@ async function main() {
   check("member synced the log to the owner's head", mv?.head.seq === ov?.head.seq && mv?.head.hash === ov?.head.hash, { memberHead: mv?.head.seq, ownerHead: ov?.head.seq });
   check("owner sees exactly one live session, for that device", ov?.sessions.length === 1 && ov.sessions[0].deviceId === mv?.deviceId, { sessions: ov?.sessions.length });
   check("no alerts on the member", (mv?.alerts ?? []).length === 0, { alerts: mv?.alerts });
+  // The invite is one-time (ported from the M1 e2e): a second daemon presenting the used code fails.
+  await rpc(m2, "rooms.v2.join.start", { code, label: "E2E reuse attempt", ...(LIVE ? {} : { trustRelay: true }) });
+  const reuse = await attempt(() => until("reuse refused", async () => {
+    const j = (await rpc(m2, "rooms.v2.status", {})).joining.find((x: any) => x.roomId === roomId);
+    return j?.state === "failed" ? j : null;
+  }, 30_000, 250));
+  check("the invite is one-time: a used code is refused", reuse.ok && /used/i.test(`${reuse.value.failure} ${reuse.value.lastError}`), reuse.ok ? { failure: reuse.value.failure } : { error: reuse.error });
+  await rpc(m2, "rooms.v2.join.dismiss", { roomId }).catch(() => undefined);
 
   // ------------------------------------------------------------ 7. lane through the member (grants v2)
   const aJoinedNow = async () => (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
@@ -332,6 +359,34 @@ async function main() {
   check("project names and paths hidden from the viewer (13.2 default)", !viewText.includes(SCRATCH) && !viewText.includes("v2-scratch"), {});
   const denied = await attempt(() => routed.sendAgentMessage(agent.id, "should be denied"));
   check("prompting through the lane is denied", !denied.ok, { error: denied.ok ? null : denied.error });
+  const tl = await attempt<any>(() => routed.fetchAgentTimeline(agent.id, { direction: "tail", limit: 20 }));
+  check("lane timeline readable (the agent has had no turn: no model call)", tl.ok, tl.ok ? { entries: tl.value.entries.length } : { error: tl.error });
+  // Out-of-scope operations (ported from the M1 e2e): everything outside the shared agent is denied.
+  const fake = randomUUID();
+  const denials: Array<[string, () => Promise<unknown>]> = [
+    ["fetchAgent(other agent on the same daemon)", () => routed.fetchAgent(other.id)],
+    ["fetchAgent(random id)", () => routed.fetchAgent(fake)],
+    ["fetchAgent(prefix of the shared id)", () => routed.fetchAgent(String(agent.id).slice(0, 8))],
+    ["fetchAgent(title of the shared agent)", () => routed.fetchAgent("rooms v2 e2e lane")],
+    ["fetchAgentTimeline(other agent)", () => routed.fetchAgentTimeline(other.id, { direction: "tail", limit: 5 })],
+    ["cancelAgent(shared)", () => routed.cancelAgent(agent.id)],
+    ["archiveAgent(shared)", () => routed.archiveAgent(agent.id)],
+    ["listTerminals", () => routed.listTerminals("/tmp")],
+    ["getDaemonConfig", () => routed.getDaemonConfig()],
+    ["listHosts on the routed session", () => routed.listHosts()],
+    ["invokePluginRpc on the routed session", () => routed.invokePluginRpc(PLUGIN, "rooms.v2.status", {})],
+  ];
+  const denialResults: Array<{ op: string; denied: boolean; error: string }> = [];
+  for (const [op, f] of denials) {
+    const r = await attempt(f);
+    denialResults.push({ op, denied: !r.ok && /not authorized|access_denied|denied|not found|permission/i.test(r.error), error: r.ok ? `LEAK ${JSON.stringify(r.value).slice(0, 60)}` : r.error.slice(0, 70) });
+  }
+  check("all out-of-scope operations through the lane are denied", denialResults.every((d) => d.denied), { denials: denialResults });
+  const pill = await attempt(() => until("lane agents", async () => {
+    const la = await rpc(o, "rooms.lane.agents", {});
+    return la.lanes.find((l: any) => l.agentId === agent.id && l.laneId === laneId && l.connectedMembers === 1) ?? null;
+  }, 10_000));
+  check("composer pill data: the shared agent is a lane with 1 connected member (rooms.lane.agents)", pill.ok, pill.ok ? {} : { error: pill.error });
 
   // ------------------------------------------------------------ 8. rotation: deferral, forced at 75 %, idle at 50 %
   const g0 = (await memberLane())!;
@@ -597,9 +652,11 @@ async function main() {
   for (const [label, home] of [["owner", OWNER], ["member", MEMBER], ["member2", MEMBER2]] as const) {
     const root = join(home, "plugin-data", "rooms");
     modes[`${label}:plugin-data/rooms`] = (statSync(root).mode & 0o777).toString(8);
+    for (const d of dirs(root)) modes[`${label}:${d.slice(home.length + 1)}/`] = (statSync(d).mode & 0o777).toString(8);
     for (const f of files(root)) {
       const text = readFileSync(f, "utf8");
       const rel = f.slice(home.length + 1);
+      modes[`${label}:${rel}`] = (statSync(f).mode & 0o777).toString(8);
       if (/"(seed|secret|secretKey|sigSeed|dhSecret|tokenKey)"\s*:/.test(text)) plaintextSecrets.push(`${label}:${rel}`);
       if (/\.sealed$/.test(f)) {
         modes[`${label}:${rel}`] = (statSync(f).mode & 0o777).toString(8);
@@ -641,11 +698,42 @@ async function main() {
   }
   const hostFiles = files(join(OWNER, "plugin-data", "rooms", "host"));
   check("MLS: no message text in any file of any home or the relay log (host files included)", markerHits.length === 0 && hostFiles.some((f) => /mls\.sealed$/.test(f)), { found: [...new Set(markerHits)], hostFilesScanned: hostFiles.length });
-  check("data dirs 0700 and sealed files 0600", Object.entries(modes).every(([k, v]) => (k.endsWith("rooms") ? v === "700" : v === "600")), { modes });
+  const badModes = Object.entries(modes).filter(([k, v]) => (k.endsWith("rooms") || k.endsWith("/") ? v !== "700" : v !== "600"));
+  check("plugin data modes: every directory 0700 and every file 0600 (sealed files included)", badModes.length === 0, { bad: badModes, checked: Object.keys(modes).length });
+
+  // Room log (ported from the M1 "hash chain and signatures verify"): the owner's log file, folded
+  // from its genesis in this process, verifies every entry hash, chain link and host signature, and
+  // every statement signature and fold rule, and reaches the head the owner reports.
+  const hostDir = join(OWNER, "plugin-data", "rooms", "host", roomId);
+  const logCheck = await attempt(async () => {
+    const fold = RoomLogFold.fromGenesis(new Uint8Array(readFileSync(join(hostDir, "genesis.json"))));
+    const bodies = readFileSync(join(hostDir, "log", "bodies.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const entries = readFileSync(join(hostDir, "log", "entries.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const types: Record<string, number> = {};
+    for (const e of entries) {
+      const b = bodies.find((x: any) => x.seq === e.entry.seq);
+      fold.append(e, b ? new Uint8Array(Buffer.from(b.body, "base64url")) : undefined);
+      types[e.entry.type] = (types[e.entry.type] ?? 0) + 1;
+    }
+    return { head: fold.head, entries: entries.length, types };
+  });
+  const ownerHead = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.head;
+  check("room log: hash chain, host and statement signatures verify by an independent fold of the owner's file", logCheck.ok && logCheck.value.head.seq === ownerHead?.seq && logCheck.value.head.hash === ownerHead?.hash, logCheck.ok ? { entries: logCheck.value.entries, headSeq: logCheck.value.head.seq } : { error: logCheck.error });
+  for (const t of ["member.admitted", "lane.created", "grant.issued", "host.key.rotated", "device.added", "member.removed", "mls.commit"])
+    check(`room log has ${t}`, logCheck.ok && (logCheck.value.types[t] ?? 0) > 0, logCheck.ok ? {} : { error: "no log" });
   if (!LIVE && RELAY_LOG && existsSync(RELAY_LOG)) {
     const lines = readFileSync(RELAY_LOG, "utf8");
     check("traffic went through the local fake relay", /v2:server\(control\)/.test(lines) && /v2:client\(conn_/.test(lines) && /v2:server\(conn_/.test(lines));
   }
+
+  // C-13 (ported from the M1 behaviour): archiving the shared agent closes its lane at once.
+  await o.archiveAgent(agent.id).catch(() => undefined);
+  const laneClosed = await attempt(() => until("lane closed after archive", async () => {
+    const r = (await rpc(o, "rooms.v2.status", {})).owned.find((x: any) => x.roomId === roomId);
+    const l = r?.lanes.find((x: any) => x.laneId === laneId);
+    return l?.status === "closed" && !(await rpc(o, "rooms.lane.agents", {})).lanes.some((x: any) => x.agentId === agent.id) ? l : null;
+  }, 15_000));
+  check("archiving the shared agent closes its lane (lane.closed) and it is no longer a lane agent", laneClosed.ok, laneClosed.ok ? {} : { error: laneClosed.error });
 
   await o.close();
   await m.close();
@@ -655,16 +743,18 @@ async function main() {
   process.exit(failures ? 1 : 0);
 }
 
-let AGENT_ID: string | null = null;
+const AGENT_IDS: string[] = [];
 
-/** Archives the lane agent (best effort); the daemons are stopped and the homes deleted afterwards. */
+/** Archives the agents this run created (best effort); the daemons are stopped and the homes deleted afterwards. */
 async function archiveAgent(): Promise<void> {
-  if (!AGENT_ID) return;
+  if (!AGENT_IDS.length) return;
   try {
     const c = await daemonClient(OWNER, "cleanup");
-    await c.archiveAgent(AGENT_ID).catch(() => undefined);
+    for (const id of AGENT_IDS) {
+      await c.archiveAgent(id).catch(() => undefined);
+      log("agent_archived", { agentId: id.slice(0, 8) });
+    }
     await c.close();
-    log("lane_agent_archived", { agentId: AGENT_ID.slice(0, 8) });
   } catch {}
 }
 

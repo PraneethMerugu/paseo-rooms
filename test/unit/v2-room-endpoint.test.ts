@@ -455,11 +455,8 @@ test("session timers: pings keep a quiet session alive; repeated eviction is log
   }
 });
 
-test("v2 runtime in-process: switch, relay address rules, owner and member runtimes over the fake relay", async () => {
-  const { roomsProtocol, relayAddress, genesisRelay, RoomsRuntimeV2 } = await import("../../server/runtime-v2");
-  assert.equal(roomsProtocol({}), "v1");
-  assert.equal(roomsProtocol({ PASEO_ROOMS_PROTOCOL: "v2" }), "v2");
-  assert.equal(roomsProtocol({ PASEO_ROOMS_PROTOCOL: "V2" }), "v1");
+test("v2 runtime in-process: relay address rules, owner and member runtimes over the fake relay", async () => {
+  const { relayAddress, genesisRelay, RoomsRuntimeV2 } = await import("../../server/runtime-v2");
   assert.deepEqual(genesisRelay({}), { host: "relay.paseo.sh", port: 443, tls: true });
   assert.deepEqual(relayAddress({ host: "relay.paseo.sh", port: 443 }, { PASEO_ROOMS_RELAY_TLS: "false" }), { endpoint: "relay.paseo.sh:443", useTls: true }, "plain ws only for loopback");
   assert.deepEqual(relayAddress({ host: "127.0.0.1", port: 6923 }, { PASEO_ROOMS_RELAY_TLS: "false" }), { endpoint: "127.0.0.1:6923", useTls: false });
@@ -469,7 +466,7 @@ test("v2 runtime in-process: switch, relay address rules, owner and member runti
   const mk = (name: string) => {
     const home = join(t.dir, name);
     mkdirSync(home, { mode: 0o700 });
-    return new RoomsRuntimeV2({ PASEO_HOME: home, PASEO_ROOMS_KEYSTORE: "fallback-file", PASEO_ROOMS_RELAY_ENDPOINT: `127.0.0.1:${relay.port}`, PASEO_ROOMS_RELAY_TLS: "false", PASEO_ROOMS_DEV_INSECURE_RELAY: "1" });
+    return new RoomsRuntimeV2({ PASEO_HOME: home, PASEO_ROOMS_KEYSTORE: "fallback-file", PASEO_ROOMS_RELAY_ENDPOINT: `127.0.0.1:${relay.port}`, PASEO_ROOMS_RELAY_TLS: "false", PASEO_ROOMS_DEV_INSECURE_RELAY: "1" }, undefined, { allowDevSwitches: true });
   };
   const owner = mk("owner");
   const member = mk("member");

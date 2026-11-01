@@ -1,8 +1,9 @@
-// Identity v2 development runtime (implementation plan I-8; decision D-2). Used only when the plugin
-// starts with PASEO_ROOMS_PROTOCOL=v2; it never ships, and the M1 runtime is unchanged otherwise.
+// Rooms runtime (identity v2; implementation plan I-8 to I-15). Since the cut-over (I-15) it is the
+// only runtime: the M1 code and the PASEO_ROOMS_PROTOCOL development switch are gone.
 //
 // Start (asynchronous): the plugin-data/rooms tree is created or checked (owner-only, no symlinks),
-// the KeyStore is opened (I-3), then every owned room is reopened from its log (RoomHost.open re-folds)
+// M1 data found there is archived (server/migration/v1.ts, migration.md section 2; the member's v1
+// host registrations are removed once a PaseoApi is attached), the KeyStore is opened (I-3), then every owned room is reopened from its log (RoomHost.open re-folds)
 // and its room endpoint, which serves enrollment, registered on the relay. Then every member journal
 // (I-9) resumes from its state: a pending join resumes with `enroll.resume`, an admitted one runs lane
 // registration and opens its room session (C-12: armed at start, not on first app contact).
@@ -21,7 +22,11 @@
 // (the gate in lane-registration.ts), registers each lane as a connected host, and rotates grants on
 // the schedule of grants-v2 5 (server/member/grant-scheduler.ts), on `grant.revoked` pushes and on
 // authentication failures of its registration. Short grants for tests: PASEO_ROOMS_DEV_SHORT_GRANTS=1
-// on the host (PASEO_ROOMS_DEV_GRANT_TTL_S, default 60).
+// on the host (PASEO_ROOMS_DEV_GRANT_TTL_S, default 60). Every PASEO_ROOMS_DEV_* switch is honoured only
+// on a marked e2e test home (server/platform/test-clock.ts testHomeRefusal) and dropped elsewhere.
+//
+// Lane agents (C-13): when a lane's agent is archived (hook agent.archived) or found archived or
+// missing at start, its lane endpoint stops at once and this daemon's admin key signs `lane.closed`.
 //
 // Device links (I-11): a member's active device creates a `prl2.` link code, answers the host's
 // `link.request` with its own nonce, compares the SAS on its own screen and signs `device.added`
@@ -103,8 +108,12 @@ import { MlsDelivery } from "./host/mls-delivery";
 import { mlsAdapter, type MlsAdapter } from "./mls/adapter";
 import { MlsMember, type MlsTimings } from "./mls/member";
 import { SealedMlsStore } from "./mls/sealed-store";
-import { dataDir as roomsDataDir, resolvePaseoHome } from "./paths";
 import { writePrivateFile } from "./platform/durable";
+import { resolvePaseoHome } from "./platform/home";
+import { gateDevSwitches } from "./platform/test-clock";
+import { ensureInertMcp } from "./gateway/agent-guard";
+import { verifyRoomAgent } from "./gateway/tripwire";
+import { archivedKeyFiles, deleteArchivedKeys, dismissNotice, HOSTS_BACKOFF_MS, migrateV1, readMigration, removeV1Registrations, type HostsRemoveApi, type MigrationRecord } from "./migration/v1";
 import { defaultProtection, ProtectionError, type FileProtection, type ProtectionProblem } from "./platform/file-protection";
 import { b64u, b64uDecode } from "./proto/b64u";
 import { isValidLabel } from "./proto/enroll";
@@ -113,18 +122,12 @@ import { ed25519PrivateKeyFromSeed, rawPublicKey, x25519PrivateKeyFromSecret } f
 import { rjcsParse } from "./proto/rjcs";
 import type { RelayAddress } from "./transport/relay-server";
 
-export const PROTOCOL_ENV = "PASEO_ROOMS_PROTOCOL";
 /**
  * DEV-ONLY: short MLS timers (witness, joiner check, retries) so the offline e2e runs in seconds. The
  * repair delay keeps its production value: joins go through the prompt Add (round 9, item 5).
  */
 export const ENV_DEV_MLS_FAST = "PASEO_ROOMS_DEV_MLS_FAST";
 const DEV_MLS_TIMINGS: Partial<MlsTimings> = { witnessMaxDelayMs: 1000, epochConfirmMs: 5000, retryMs: 2000 };
-
-/** Read once at plugin start (contribute). */
-export function roomsProtocol(env: NodeJS.ProcessEnv = process.env): "v1" | "v2" {
-  return env[PROTOCOL_ENV] === "v2" ? "v2" : "v1";
-}
 
 const DEFAULT_RELAY = { host: "relay.paseo.sh", port: 443 };
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
@@ -228,14 +231,26 @@ export class RoomsRuntimeV2 {
    */
   readonly clock: TestClock;
 
+  /** The environment in use: PASEO_ROOMS_DEV_* removed unless this is a marked e2e test home. */
+  private readonly env: NodeJS.ProcessEnv;
+  /** Migration from M1 (migration.md section 2): the record, once read at start. */
+  private migration: MigrationRecord | null = null;
+  private hostsCleanup: Promise<void> | null = null;
+
   constructor(
-    private readonly env: NodeJS.ProcessEnv = process.env,
+    env: NodeJS.ProcessEnv = process.env,
     private readonly protection: FileProtection = defaultProtection(),
-    /** Test only: shorter session timers and retries. */
-    private readonly tuning: { timings?: ConstructorParameters<typeof RoomClient>[0]["timings"]; retryMs?: number[] } = {},
+    /**
+     * Test only: shorter session timers and retries; `allowDevSwitches` keeps PASEO_ROOMS_DEV_* on a
+     * temporary home (unit tests), which the test-home guard would otherwise drop.
+     */
+    private readonly tuning: { timings?: ConstructorParameters<typeof RoomClient>[0]["timings"]; retryMs?: number[]; allowDevSwitches?: boolean } = {},
   ) {
     this.paseoHome = resolvePaseoHome(env);
-    this.dataDir = roomsDataDir(this.paseoHome);
+    this.dataDir = nodePath.join(this.paseoHome, "plugin-data", "rooms");
+    const gated = gateDevSwitches(env, this.paseoHome, { allow: tuning.allowDevSwitches === true });
+    if (gated.dropped.length) log("dev_switches_ignored", { switches: gated.dropped, reason: gated.refusal });
+    this.env = gated.env;
     this.clock = new TestClock(env, this.paseoHome);
   }
 
@@ -244,6 +259,109 @@ export class RoomsRuntimeV2 {
     if (!paseo) return;
     this.paseo = paseo;
     if (!this.observing && !this.stopping) this.observeHosts(paseo);
+    this.cleanUpV1Hosts();
+  }
+
+  // ------------------------------------------------------------------------------ migration from M1
+
+  /** Migration 2.3 step 2: removes the member's v1 registrations, retried with backoff until done. */
+  private cleanUpV1Hosts(): void {
+    if (this.hostsCleanup || this.stopping || !this.paseo || this.migration?.hosts !== "pending") return;
+    const hosts = this.paseo.hosts as unknown as HostsRemoveApi;
+    this.hostsCleanup = (async () => {
+      for (let i = 0; !this.stopping; i++) {
+        try {
+          const n = await removeV1Registrations(this.dataDir, hosts, PLUGIN_ID);
+          this.migration = readMigration(this.dataDir);
+          log("v1_registrations_removed", { removed: n });
+          return;
+        } catch (e) {
+          logError("v1_registrations_remove_failed", e, { attempt: i + 1 });
+          await new Promise<void>((r) => (setTimeout(r, HOSTS_BACKOFF_MS[Math.min(i, HOSTS_BACKOFF_MS.length - 1)]) as { unref?: () => void }).unref?.());
+        }
+      }
+    })().finally(() => {
+      this.hostsCleanup = null;
+    });
+  }
+
+  /** Status view of the migration (notice 2.5, archive notice 2.4, routed-entry note 2.3 step 4). */
+  private migrationView() {
+    const m = this.migration;
+    if (!m) return null;
+    return {
+      archive: m.archive,
+      notice: m.noticeDismissedAt === null,
+      gateway: m.gateway,
+      member: m.member,
+      hosts: m.hosts,
+      hostsRemoved: m.hostsRemoved,
+      keyFiles: archivedKeyFiles(this.dataDir),
+      lanes: m.ownerLanes.map((l) => ({ laneId: l.laneId, roomId: l.roomId, agentId: l.agentId, label: l.label, origin: l.origin })),
+    };
+  }
+
+  /** "Delete keys" (migration 2.4): the user's explicit action. Keeps the room logs. */
+  async deleteV1Keys(): Promise<{ removed: string[] }> {
+    await this.start();
+    const removed = deleteArchivedKeys(this.dataDir);
+    this.migration = readMigration(this.dataDir);
+    log("v1_archive_keys_deleted", { files: removed.length });
+    return { removed };
+  }
+
+  async dismissMigrationNotice(): Promise<void> {
+    await this.start();
+    dismissNotice(this.dataDir);
+    this.migration = readMigration(this.dataDir);
+  }
+
+  // ------------------------------------------------------------------------------ lane agents
+
+  /** Open lanes this daemon serves, by agent (composer pill, "Open room…" redirect). */
+  laneAgents(): Array<{ agentId: string; laneId: string; roomId: string; roomName: string; connectedMembers: number }> {
+    const out: Array<{ agentId: string; laneId: string; roomId: string; roomName: string; connectedMembers: number }> = [];
+    for (const o of this.owned.values()) {
+      if (o.host.state.auth.closed) continue;
+      for (const l of o.lanes.lanes()) {
+        if (l.status === "closed" || !l.agentId) continue;
+        out.push({ agentId: l.agentId, laneId: l.laneId, roomId: o.host.roomId, roomName: `Room ${o.host.roomId.slice(5, 11)}`, connectedMembers: l.links });
+      }
+    }
+    return out;
+  }
+
+  /** Lifecycle hook agent.archived (C-13): lanes of that agent stop serving and are closed. */
+  onAgentArchived(agentId: string): string[] {
+    const closed: string[] = [];
+    for (const o of this.owned.values()) closed.push(...o.lanes.onAgentArchived(agentId));
+    return closed;
+  }
+
+  /**
+   * Tripwire on resume (C-iso2) for room agents created by Rooms: M1 fork lanes left behind by the
+   * migration keep their inert MCP shadow (migration 2.2 step 4). Throws to refuse the open.
+   */
+  assertRoomAgentIntact(agentId: string): void {
+    const lane = this.migration?.ownerLanes.find((l) => l.origin === "fork" && l.agentId === agentId);
+    if (!lane) return;
+    const r = verifyRoomAgent(this.paseoHome, agentId, null, ensureInertMcp(this.dataDir));
+    if (r.ok) return;
+    log("room_agent_tripwire", { laneId: lane.laneId, agentId, when: "session_open", problems: r.problems });
+    throw new Error(`Room agent failed the isolation check: ${r.problems.join("; ")}`);
+  }
+
+  /** C-13: the lane's agent is gone. The admin key of this daemon closes the lane in the log. */
+  private closeLaneForAgent(roomId: string, laneId: string, reason: string): void {
+    const o = this.owned.get(roomId);
+    if (!o?.signer) {
+      log("v2_lane_close_skipped", { roomId, laneId, reason, why: "no admin key on this daemon" });
+      return;
+    }
+    const l = o.host.state.auth.lanes[laneId];
+    if (!l || l.status === "closed") return;
+    this.adminSubmit(roomId, "lane.closed", { laneId });
+    log("lanes_closed_for_archived_agent", { roomId, laneId, reason });
   }
 
   start(): Promise<void> {
@@ -283,6 +401,14 @@ export class RoomsRuntimeV2 {
     this.protection.ensureDir(this.dataDir);
     const check = this.protection.verifyTree(this.dataDir);
     if (!check.ok) throw new ProtectionError(check.problems);
+    // Migration from M1 before any key is read (migration.md 2): archive v1 data, record it.
+    try {
+      this.migration = (await migrateV1(this.dataDir, { log })).record;
+    } catch (e) {
+      logError("v1_migration_failed", e);
+      this.migration = readMigrationSafe(this.dataDir);
+    }
+    this.cleanUpV1Hosts();
     const explicitFile = this.env[ENV_KEYSTORE] === "fallback-file" || this.env[ENV_KEYSTORE] === "operator-file";
     const status = await openKeyStore({
       dataDir: this.dataDir,
@@ -369,7 +495,15 @@ export class RoomsRuntimeV2 {
       },
     });
     grants.afterAppend = () => endpoint.afterAppend();
-    lanes = new LaneService({ dataDir: this.dataDir, kek: this.kek!, host, grants, relay: relayAddress(g, this.env), paseoHome: this.paseoHome });
+    lanes = new LaneService({
+      dataDir: this.dataDir,
+      kek: this.kek!,
+      host,
+      grants,
+      relay: relayAddress(g, this.env),
+      paseoHome: this.paseoHome,
+      onAgentGone: (laneId, reason) => this.closeLaneForAgent(roomId, laneId, reason),
+    });
     // The admin daemon's automatic approvals of held device adds (identity-model.md 6.3).
     const approver = signer ? setInterval(() => this.autoApprove(roomId), 2000) : null;
     (approver as { unref?: () => void } | null)?.unref?.();
@@ -584,6 +718,7 @@ export class RoomsRuntimeV2 {
         : null,
       ...(this.permissionProblems ? { permissionProblems: this.permissionProblems.slice(0, 20).map((p) => ({ path: p.path, code: p.code, detail: p.detail })) } : {}),
       platform: process.platform,
+      migration: this.migrationView(),
       owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes, holds, signer, moved }) => ({
         roomId: host.roomId,
         serverId: endpoint.serverId,
@@ -1131,7 +1266,7 @@ export class RoomsRuntimeV2 {
     }
   }
 
-  /** Signs (the RPC call is the confirmation in the development runtime) and submits through the endpoint. */
+  /** Signs (the caller took the confirmation token, or the action is policy-automatic) and submits through the endpoint. */
   private adminSubmit(roomId: string, type: StatementType, data: unknown) {
     const o = this.ownedRoom(roomId);
     if (!o.signer) throw new Error("No admin key for this room on this daemon");
@@ -1713,6 +1848,14 @@ export class RoomsRuntimeV2 {
     }
     this.kek?.dispose();
     log("v2_runtime_stopped", {});
+  }
+}
+
+function readMigrationSafe(dataDir: string): MigrationRecord | null {
+  try {
+    return readMigration(dataDir);
+  } catch {
+    return null;
   }
 }
 

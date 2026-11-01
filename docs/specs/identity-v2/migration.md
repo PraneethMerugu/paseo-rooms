@@ -1,6 +1,6 @@
 # Migration from M1 to identity v2
 
-- **Status:** proposed specification, not implemented.
+- **Status:** implemented on 2026-11-01 (plan I-15): `server/migration/v1.ts`; tests 1 and 2 in `test/unit/v2-migration.test.ts`, test 3 in `test/e2e-v2/migration-run.sh`. Section 5: the two v1 documents are marked superseded; the architecture edits and the M1-RESULTS item are left to I-17.
 - **Decision:** **M1 rooms are invalidated, not migrated.** The plugin is a prototype. M1 rooms exist only on test daemons and the owner's own machines, and none of them carries data anyone depends on. Invalidation is acceptable at this stage and is far simpler and safer than a migration path.
 
 ## 1. Why not migrate

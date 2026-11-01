@@ -1,16 +1,17 @@
 // I-14: RPC contracts of the v2 runtime as the UI uses them. The plugin's server entry is contributed
-// to a fake PluginServerContext (PASEO_ROOMS_PROTOCOL=v2, a temporary PASEO_HOME, the file keystore
+// to a fake PluginServerContext (a temporary, marked test PASEO_HOME, the file keystore
 // and the in-process fake relay; no network, never ~/.paseo); every call goes through the contract's
 // input schema, the registered handler and the output schema, and the handler's result must equal
 // its parsed form (no field outside the contract). Also: admin confirmation tokens (identity-model
 // 5.3) and `stale_base` re-confirmation (room-log-v2 2, R-9), the recovery offer, and "Fix permissions".
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { PluginRpcContract } from "@getpaseo/plugin";
 import { ConfirmationBook, ConfirmationError, CONFIRM_TTL_MS, describeAdminAction, type DescribeContext } from "../../server/admin/confirmations";
 import type { RoomState } from "../../server/authority/state";
+import { TEST_HOME_MARKER, TEST_HOME_MARKER_TEXT } from "../../server/platform/test-clock";
 import * as rpc from "../../shared/rpc";
 import * as v2 from "../../shared/rpc-v2";
 import { startFakeRelay } from "./fake-relay";
@@ -82,8 +83,9 @@ test("I-14 contracts through the server entry: handlers, shapes, tokens, stale_b
   const relay = await startFakeRelay();
   const home = join(t.dir, ".test-homes", "v2-contract");
   mkdirSync(home, { recursive: true, mode: 0o700 });
+  // A marked test home: the plugin honours PASEO_ROOMS_DEV_* only there (I-15).
+  writeFileSync(join(home, TEST_HOME_MARKER), TEST_HOME_MARKER_TEXT, { mode: 0o600 });
   const env = {
-    PASEO_ROOMS_PROTOCOL: "v2",
     PASEO_HOME: home,
     PASEO_ROOMS_KEYSTORE: "fallback-file",
     PASEO_ROOMS_RELAY_ENDPOINT: `127.0.0.1:${relay.port}`,
@@ -110,9 +112,12 @@ test("I-14 contracts through the server entry: handlers, shapes, tokens, stale_b
   };
   const prepared = async (action: v2.AdminActionV2) => (await call(v2.roomsV2AdminPrepare, { action })).confirmToken;
   try {
-    // Registration: every v2 contract except the TEST-ONLY clock, bootstrap and Fix permissions; no other M1 call.
-    const expected = [...V2.filter((c) => c.name !== "rooms.v2.test.clock.advance").map((c) => c.name), rpc.roomsBootstrap.name, rpc.roomsPermissionsFix.name].sort();
+    // Registration: every v2 contract except the TEST-ONLY clock (no marker switch here), and every
+    // contract of shared/rpc.ts (bootstrap, Fix permissions, lane agents, migration); no M1 call.
+    const expected = [...V2.filter((c) => c.name !== "rooms.v2.test.clock.advance").map((c) => c.name), ...contracts(rpc).map((c) => c.name)].sort();
     assert.deepEqual([...handlers.keys()].sort(), expected);
+    for (const m1 of ["rooms.overview", "rooms.create", "rooms.join", "rooms.invite.create", "rooms.member.revoke", "rooms.log"]) assert.equal(handlers.has(m1), false, m1);
+    assert.deepEqual(await call(rpc.roomsLaneAgents, {}), { lanes: [] });
 
     assert.equal((await call(rpc.roomsBootstrap, {})).protocol, "v2");
     const s0 = await call(v2.roomsV2Status, {});
@@ -121,6 +126,7 @@ test("I-14 contracts through the server entry: handlers, shapes, tokens, stale_b
     assert.equal(s0.keystore?.fallback, true);
     assert.match(s0.keystore?.notice ?? "", /unprotected on disk/);
     assert.equal(s0.platform, process.platform);
+    assert.equal(s0.migration, null, "a fresh home has no M1 data to migrate");
     assert.equal(s0.permissionProblems, undefined);
 
     // Create with a recovery key: the code once, with the file of identity-model 5.4.1.

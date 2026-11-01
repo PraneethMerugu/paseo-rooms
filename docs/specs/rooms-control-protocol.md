@@ -1,6 +1,7 @@
 # Rooms control protocol v1
 
-- **Status:** implemented in Milestone 1 (`server/gateway/control-server.ts`, `server/member/control-client.ts`, schemas in `shared/control.ts`). Not yet externally reviewed.
+- **Superseded (2026-11-01):** by `identity-v2/` (implementation plan I-15; `identity-v2/migration.md` section 5). The code this document describes was deleted at the identity v2 cut-over and is kept in git at tag `m1-baseline`. Kept for reference only.
+- **Status:** implemented in Milestone 1 (removed at the cut-over) (`server/gateway/control-server.ts`, `server/member/control-client.ts`, schemas in `shared/control.ts`). Not yet externally reviewed.
 - **Scope:** enrollment and grant lifecycle between a member plugin and the lane endpoint of a gateway with an embedded host. It replaces, for M1 only, the member-to-host channel of `rooms-architecture.md` section 8.2.
 
 ## 1. Transport
