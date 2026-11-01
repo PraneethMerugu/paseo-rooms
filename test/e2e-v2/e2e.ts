@@ -50,7 +50,7 @@
 // owner's join card (rooms.v2.status) and from the member's join view, and checking they are equal
 // before pressing "Codes match" and "Admit" programmatically. A mismatch fails the run. The device
 // link's SAS is read the same way from device A's link view and device B's join view.
-import { readdirSync, readFileSync, statSync, lstatSync, existsSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, lstatSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -159,11 +159,36 @@ function canonical(v: unknown): string {
 
 /** Restarts one test daemon (same home and port; the plugin restarts with it). */
 function restartDaemon(home: string): void {
-  if (!/\.test-homes\/v2-[a-z]+$/.test(home)) throw new Error("refusing to restart a daemon outside .test-homes/v2-*");
+  stopDaemon(home);
+  startDaemon(home);
+}
+
+function daemonEnv(home: string): NodeJS.ProcessEnv {
+  if (!/\.test-homes\/v2-[a-z0-9]+$/.test(home)) throw new Error("refusing to touch a daemon outside .test-homes/v2-*");
   // The TEST-ONLY clock switch goes to the owner daemon only (the plugin also requires the marker file).
-  const env = { ...process.env, PASEO_HOME: home, ...(home === OWNER ? { PASEO_ROOMS_TEST_CLOCK: "1" } : {}) };
-  execFileSync(PASEO_BIN, ["daemon", "stop", "--home", home], { env, stdio: ["ignore", "ignore", "ignore"], timeout: 120_000 });
-  execFileSync(PASEO_BIN, ["daemon", "start", "--timeout", "120", "--home", home], { env, stdio: ["ignore", "ignore", "ignore"], timeout: 180_000 });
+  return { ...process.env, PASEO_HOME: home, ...(home === OWNER ? { PASEO_ROOMS_TEST_CLOCK: "1" } : {}) };
+}
+
+function stopDaemon(home: string): void {
+  execFileSync(PASEO_BIN, ["daemon", "stop", "--home", home], { env: daemonEnv(home), stdio: ["ignore", "ignore", "ignore"], timeout: 120_000 });
+}
+
+function startDaemon(home: string): void {
+  execFileSync(PASEO_BIN, ["daemon", "start", "--timeout", "120", "--home", home], { env: daemonEnv(home), stdio: ["ignore", "ignore", "ignore"], timeout: 180_000 });
+}
+
+/**
+ * TEST-ONLY host rollback, with the owner daemon stopped: keeps entries `0..keep-1` of the owner's room
+ * log and their bodies (whole lines, so the host opens a consistent, shorter log).
+ */
+function cutOwnerLog(roomId: string, keep: number): void {
+  if (!/\.test-homes\/v2-owner$/.test(OWNER) || !/^[A-Za-z0-9_-]+$/.test(roomId)) throw new Error("refusing to cut a log outside the owner test home");
+  const dir = join(OWNER, "plugin-data", "rooms", "host", roomId, "log");
+  const lines = (f: string) => readFileSync(join(dir, f), "utf8").split("\n").filter((l) => l.length > 0);
+  const entries = lines("entries.jsonl");
+  if (entries.length <= keep) throw new Error("nothing to cut");
+  writeFileSync(join(dir, "entries.jsonl"), entries.slice(0, keep).map((l) => `${l}\n`).join(""));
+  writeFileSync(join(dir, "bodies.jsonl"), lines("bodies.jsonl").filter((l) => (JSON.parse(l) as { seq: number }).seq < keep).map((l) => `${l}\n`).join(""));
 }
 
 async function v2Ready(c: any, what: string): Promise<any> {
@@ -734,6 +759,39 @@ async function main() {
     return l?.status === "closed" && !(await rpc(o, "rooms.lane.agents", {})).lanes.some((x: any) => x.agentId === agent.id) ? l : null;
   }, 15_000));
   check("archiving the shared agent closes its lane (lane.closed) and it is no longer a lane agent", laneClosed.ok, laneClosed.ok ? {} : { error: laneClosed.error });
+
+  // ------------------------------------------------------------ 10. R2.1: detection survives a member restart
+  // TEST-ONLY host rollback after every other check: the owner daemon is stopped, its room log is cut
+  // back to below the member device A's verified head (hiding the removal and what followed), and the
+  // owner starts again. The member daemon restarts too, so only its sealed copy at rest knows the head.
+  // If the owner signs new entries before the member reconnects, the same seqs now hold other entries:
+  // that is a fork (two host-signed entries at one seq), also a refusal of the other history.
+  const copyBefore = (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+  const cutTo = copyBefore?.head?.seq ?? -1;
+  await o.close();
+  await m.close();
+  stopDaemon(OWNER);
+  let cutOk = true;
+  try {
+    cutOwnerLog(roomId, cutTo);
+  } catch (e) {
+    cutOk = false;
+    log("cut_failed", { error: String((e as Error).message).slice(0, 120) });
+  }
+  startDaemon(OWNER);
+  restartDaemon(MEMBER);
+  o = await daemonClient(OWNER, "owner");
+  m = await daemonClient(MEMBER, "member");
+  await v2Ready(o, "owner (rolled back)");
+  await v2Ready(m, "member (restarted)");
+  const ownerCut = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.head;
+  const reconnect = await attempt(() => rpc(m, "rooms.v2.room.connect", { roomId }));
+  const copyAfter = (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+  check(
+    "R2.1: after a member daemon restart, a host log cut below the member's verified head is truncation (fork if the host signed past it again) and the member keeps its head",
+    cutOk && cutTo > 0 && typeof ownerCut?.seq === "number" && !(copyBefore?.alerts ?? []).some((a: any) => a.type === "truncation" || a.type === "fork") && (copyAfter?.alerts ?? []).some((a: any) => (ownerCut.seq < cutTo ? a.type === "truncation" : a.type === "fork") && a.seq === cutTo) && copyAfter?.head?.seq === cutTo && copyAfter?.head?.hash === copyBefore?.head?.hash,
+    { cutTo, ownerHead: ownerCut?.seq, memberHead: copyAfter?.head?.seq, alerts: (copyAfter?.alerts ?? []).map((a: any) => `${a.type}@${a.seq}`), reconnect: reconnect.ok ? reconnect.value : reconnect.error },
+  );
 
   await o.close();
   await m.close();

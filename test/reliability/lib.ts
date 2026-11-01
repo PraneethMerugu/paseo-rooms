@@ -1,6 +1,7 @@
-// Shared helpers for the reliability modules. Talks to the two test daemons the same way
-// test/e2e/e2e.ts does (owner-style DaemonClient with the home's local credential, routed lane view
-// through the member daemon). Never prints invite codes, grants, keys or credentials.
+// Shared helpers for the reliability modules (identity v2 RPCs, `rooms.v2.*`). Talks to the two test
+// daemons the same way test/e2e-v2/e2e.ts does (owner-style DaemonClient with the test home's local
+// credential, routed lane view through the member daemon). Never prints invite codes, grants, keys,
+// SAS digits or credentials.
 //
 // Every module calls assertSafeEnvironment() first: it re-checks the run.sh safety gates
 // (homes under test/reliability/.homes, never ~/.paseo; ports 6930-6939 only).
@@ -14,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { createHostChannelTransport } from "@getpaseo/client/internal/hosts";
+import { RoomLogFold } from "../../server/authority/fold";
 
 export const PLUGIN = "rooms";
 export const PASEO_CLI = "/opt/Paseo/resources/bin/paseo";
@@ -88,6 +90,7 @@ export function rememberSecret(s: string): void {
   appendFileSync(f, s + "\n");
 }
 
+/** A `prc2.` invite code and its token (the bearer part). */
 export function rememberInvite(code: string): void {
   rememberSecret(code);
   try {
@@ -97,18 +100,18 @@ export function rememberInvite(code: string): void {
   }
 }
 
-/** Grant passwords the member daemon stores (for the secret scan only). */
+/** Grant signatures (`prg2.<claims>.<sig>`) the member daemon stores in hosts.json, for the secret scan only. */
 export function harvestGrants(): void {
   const p = join(MEMBER_HOME(), "hosts.json");
   if (!existsSync(p)) return;
-  for (const m of readFileSync(p, "utf8").matchAll(/prg1\.[A-Za-z0-9_-]+\.([A-Za-z0-9_-]{86})/g)) rememberSecret(m[1]);
+  for (const m of readFileSync(p, "utf8").matchAll(/prg2\.[A-Za-z0-9_-]+\.([A-Za-z0-9_-]{86})/g)) rememberSecret(m[1]);
 }
 
-/** Removes anything that looks like an invite, a grant or a long opaque token from free text. */
+/** Removes anything that looks like an invite, a link code, a grant or a long opaque token from free text. */
 export function redact(text: string): string {
   return text
-    .replace(/prc1\.[A-Za-z0-9_-]+/g, "<invite-code>")
-    .replace(/prg1\.[A-Za-z0-9_.-]+/g, "<grant>")
+    .replace(/pr[cl][12]\.[A-Za-z0-9_-]+/g, "<invite-code>")
+    .replace(/prg[12]\.[A-Za-z0-9_.-]+/g, "<grant>")
     .replace(/(token|password|secret|credential|authorization|bearer)(["'\s:=]+)[^\s"',}]+/gi, "$1$2<redacted>")
     .replace(/[A-Za-z0-9_-]{40,}/g, "<opaque>");
 }
@@ -202,6 +205,115 @@ export async function closeQuietly(...clients: Array<{ close(): Promise<unknown>
   for (const c of clients) await c?.close().catch(() => undefined);
 }
 
+export async function laneHost(memberClient: any, lane: { laneId: string; serverId: string }): Promise<any | null> {
+  const d = await memberClient.listHosts();
+  return d.hosts.find((h: any) => h.serverId === lane.serverId || h.source?.key === lane.laneId) ?? null;
+}
+
+// ------------------------------------------------------------------ v2 room operations
+export async function status(client: any): Promise<any> {
+  return rpc(client, "rooms.v2.status", {});
+}
+export async function ownedRoom(owner: any, roomId: string): Promise<any | null> {
+  return (await status(owner)).owned.find((r: any) => r.roomId === roomId) ?? null;
+}
+export async function joinedRoom(member: any, roomId: string): Promise<any | null> {
+  return (await status(member)).joined.find((r: any) => r.roomId === roomId) ?? null;
+}
+export async function joiningRoom(member: any, roomId: string): Promise<any | null> {
+  return (await status(member)).joining.find((r: any) => r.roomId === roomId) ?? null;
+}
+
+/** An interactive admin action (I-14): `rooms.v2.admin.prepare` returns a one-time token, the action uses it. */
+export async function adminRpc(client: any, method: string, input: Record<string, unknown>): Promise<any> {
+  const kind = method.replace(/^rooms\.v2\./, "");
+  const p = await rpc(client, "rooms.v2.admin.prepare", { action: { kind, ...input } });
+  return rpc(client, method, { ...input, confirmToken: p.confirmToken });
+}
+
+/** Waits until the plugin's v2 runtime answers with a state other than `starting`. */
+export async function v2Ready(client: any): Promise<any> {
+  return until("v2 runtime ready", async () => {
+    const s = await status(client).catch(() => null);
+    return s && s.state !== "starting" ? s : null;
+  }, 120_000, 500);
+}
+
+export type RoomLane = { roomId: string; laneId: string; serverId: string };
+
+/** A room (no recovery key: a throwaway test room) with one share-live lane on `agentId`, both endpoints online. */
+export async function createRoomWithLane(owner: any, agentId: string, label: string): Promise<RoomLane> {
+  const created = await rpc(owner, "rooms.v2.room.create", { recovery: "skip" });
+  const roomId: string = created.roomId;
+  await until("room endpoint online", async () => (await ownedRoom(owner, roomId))?.endpoint === "online", 60_000, 500);
+  const lane = await adminRpc(owner, "rooms.v2.lane.create", { roomId, agentId, label });
+  const laneId: string = lane.laneId;
+  const l = await until("lane endpoint online", async () => (await ownedRoom(owner, roomId))?.lanes.find((x: any) => x.laneId === laneId && x.endpoint === "online"), 60_000, 500);
+  return { roomId, laneId, serverId: l.serverId };
+}
+
+/** A fresh one-time invite for the room and lane. The code goes to the secret-scan file only. */
+export async function invite(owner: any, room: RoomLane, note: string): Promise<{ code: string; inviteRef: string }> {
+  const inv = await adminRpc(owner, "rooms.v2.invite.create", { roomId: room.roomId, lanes: [room.laneId], note });
+  rememberInvite(inv.code);
+  return { code: inv.code, inviteRef: inv.inviteRef };
+}
+
+export type EnrollSteps = { startMs: number; sasMs: number; confirmMs: number; admitMs: number; openMs: number };
+
+/**
+ * The real SAS enrollment (enrollment-v2): join.start on the member, both sides show the 6-digit SAS,
+ * a TEST-ONLY programmatic comparison stands in for the people comparing by voice (the digits must be
+ * equal and well-formed; they are never logged), then the member confirms and the owner admits.
+ * Relay trust: only the default relay may be used; a relay that needs the user's trust is refused here.
+ */
+export async function enroll(owner: any, member: any, room: RoomLane, code: string, label: string): Promise<{ memberId: string; deviceId: string; steps: EnrollSteps }> {
+  const t = () => performance.now();
+  const preview = await rpc(member, "rooms.v2.join.preview", { code });
+  if (preview.roomId !== room.roomId) throw new Error("preview names another room");
+  if (preview.relay?.trusted !== true) throw new Error("refusing: the invite's relay is not trusted by default (the reliability suite never grants relay trust)");
+  let s = t();
+  await rpc(member, "rooms.v2.join.start", { code, label });
+  const startMs = Math.round(t() - s);
+  s = t();
+  const mine = await until("member SAS", async () => {
+    const j = await joiningRoom(member, room.roomId);
+    if (j?.state === "failed") throw new Error(`join failed: ${j.failure}`);
+    return j?.sas ? j : null;
+  }, 60_000, 200);
+  const card = await until("owner SAS", async () => (await ownedRoom(owner, room.roomId))?.joinRequests.find((r: any) => r.sas && r.state !== "closed" && r.label === label), 60_000, 200);
+  const sasMs = Math.round(t() - s);
+  // TEST-ONLY comparison: never skipped, never logged.
+  if (!/^\d{3} \d{3}$/.test(String(mine.sas)) || mine.sas !== card.sas) {
+    await rpc(member, "rooms.v2.join.confirm", { roomId: room.roomId, match: false }).catch(() => undefined);
+    throw new Error("SAS mismatch between member and owner: refusing to confirm");
+  }
+  s = t();
+  await rpc(member, "rooms.v2.join.confirm", { roomId: room.roomId, match: true });
+  await until("host saw the member's confirmation", async () => (await ownedRoom(owner, room.roomId))?.joinRequests.find((r: any) => r.pendingId === card.pendingId)?.state === "member_ok", 60_000, 200);
+  const confirmMs = Math.round(t() - s);
+  s = t();
+  await adminRpc(owner, "rooms.v2.join.admit", { roomId: room.roomId, pendingId: card.pendingId });
+  const admitMs = Math.round(t() - s);
+  s = t();
+  const j = await until("member session open", async () => {
+    const r = await joinedRoom(member, room.roomId);
+    return r?.status === "open" ? r : null;
+  }, 60_000, 200);
+  return { memberId: j.memberId, deviceId: j.deviceId, steps: { startMs, sasMs, confirmMs, admitMs, openMs: Math.round(t() - s) } };
+}
+
+/** Lane registered on the member (journal `registered`, a current grant) and its routed host online. */
+export async function laneOnline(member: any, room: RoomLane, timeoutMs = 60_000): Promise<any> {
+  return until("lane registered and online on the member", async () => {
+    const st = await status(member);
+    const j = st.joining.find((r: any) => r.roomId === room.roomId);
+    const l = st.joined.find((r: any) => r.roomId === room.roomId)?.lanes.find((x: any) => x.laneId === room.laneId);
+    if (j?.state !== "registered" || !l?.gid) return null;
+    return (await laneHost(member, room))?.status === "online" ? l : null;
+  }, timeoutMs, 250);
+}
+
 /**
  * Opens a read-only lane view exactly as the app does: a mobile-type client on the member daemon,
  * then a DaemonClient over createHostChannelTransport to the lane's serverId.
@@ -228,32 +340,6 @@ export async function openLaneView(memberHome: string, laneServerId: string): Pr
   routed.subscribeConnectionStatus((s: any) => statuses.push({ at: Date.now(), status: s.status }));
   await routed.connect();
   return { origin, routed, statuses };
-}
-
-export async function laneHost(memberClient: any, lane: { id: string; serverId: string }): Promise<any | null> {
-  const d = await memberClient.listHosts();
-  return d.hosts.find((h: any) => h.serverId === lane.serverId || h.source?.key === lane.id) ?? null;
-}
-
-export async function ownedLaneView(ownerClientRef: any, laneId: string): Promise<any | null> {
-  const ov = await rpc(ownerClientRef, "rooms.overview", {});
-  for (const r of ov.owned) {
-    const l = r.lanes.find((x: any) => x.lane.id === laneId);
-    if (l) return { room: r, lane: l };
-  }
-  return null;
-}
-
-export async function joinedRecord(memberClientRef: any, laneId: string): Promise<any | null> {
-  const ov = await rpc(memberClientRef, "rooms.overview", {});
-  return ov.joined.find((j: any) => j.laneId === laneId) ?? null;
-}
-
-/** Creates a fresh invite and enrolls the member daemon. Secrets go to the scan file only. */
-export async function invite(owner: any, laneId: string, grantTtlSeconds: number): Promise<{ code: string; inviteId: string }> {
-  const inv = await rpc(owner, "rooms.invite.create", { laneId, ttlSeconds: 600, grantTtlSeconds });
-  rememberInvite(inv.code);
-  return { code: inv.code, inviteId: inv.inviteId };
 }
 
 // ------------------------------------------------------------------ daemon lifecycle (test homes only)
@@ -325,40 +411,58 @@ export async function pluginLogs(home: string): Promise<string> {
 }
 
 // ------------------------------------------------------------------ on-disk plugin state (read-only)
-export function gatewayDir(home: string): string {
-  return join(home, "plugin-data", "rooms", "gateway");
-}
-export function memberDir(home: string): string {
-  return join(home, "plugin-data", "rooms", "member");
-}
 export function readJson(path: string): any {
   return JSON.parse(readFileSync(path, "utf8"));
 }
+export function roomsDataDir(home: string): string {
+  return join(home, "plugin-data", "rooms");
+}
+export function hostRoomDir(home: string, roomId: string): string {
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(roomId)) throw new Error("bad room id");
+  return join(roomsDataDir(home), "host", roomId);
+}
+export function memberRoomDir(home: string, roomId: string): string {
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(roomId)) throw new Error("bad room id");
+  return join(roomsDataDir(home), "member", "rooms", roomId);
+}
 
-/** Fingerprints of the owner's keys and access state. Hashes stay in memory; only booleans are logged. */
-export function ownerSnapshot(home: string, laneId: string) {
-  const dir = gatewayDir(home);
-  const state = readJson(join(dir, "state.json"));
+/**
+ * Independent fold of the owner's room log file (genesis, every entry, statement bodies): the hash
+ * chain, host and statement signatures and the fold rules. Returns per-entry hashes (public data) and
+ * the types; throws if anything does not verify.
+ */
+export function verifyOwnerLog(home: string, roomId: string): { head: { seq: number; hash: string }; hashes: string[]; types: string[] } {
+  const dir = hostRoomDir(home, roomId);
+  const fold = RoomLogFold.fromGenesis(new Uint8Array(readFileSync(join(dir, "genesis.json"))));
+  const bodies = new Map<number, string>();
+  for (const l of readFileSync(join(dir, "log", "bodies.jsonl"), "utf8").split("\n").filter(Boolean)) {
+    const b = JSON.parse(l) as { seq: number; body: string };
+    bodies.set(b.seq, b.body);
+  }
+  const hashes: string[] = [];
+  const types: string[] = [];
+  for (const l of readFileSync(join(dir, "log", "entries.jsonl"), "utf8").split("\n").filter(Boolean)) {
+    const e = JSON.parse(l);
+    const b = bodies.get(e.entry.seq);
+    fold.append(e, b ? new Uint8Array(Buffer.from(b, "base64url")) : undefined);
+    hashes.push(e.hash);
+    types.push(e.entry.type);
+  }
+  return { head: fold.head, hashes, types };
+}
+
+/** Public key ids and server ids of the owner's room (status view): what must not change across restarts. */
+export async function ownerSnapshot(owner: any, room: RoomLane) {
+  const r = await ownedRoom(owner, room.roomId);
+  if (!r) throw new Error("owned room not in status");
   return {
-    hostKeyHash: sha256(readFileSync(join(dir, "host-key.json"))),
-    hostKeyId: readJson(join(dir, "host-key.json")).keyId as string,
-    laneKeyHash: state.laneKeys?.[laneId] ? sha256(JSON.stringify(state.laneKeys[laneId])) : null,
-    revokedGids: new Set<string>((state.revokedGrantIds ?? []).map((g: any) => g.gid)),
-    memberStatus: Object.fromEntries((state.members ?? []).map((m: any) => [m.id, m.status])) as Record<string, string>,
-    latestGrantGid: Object.fromEntries((state.grants ?? []).map((g: any) => [g.memberId, g.gid])) as Record<string, string>,
+    hostKid: r.keys.hostKid as string | null,
+    adminKid: r.keys.adminKid as string | null,
+    endpointServerId: r.serverId as string,
+    laneServerId: (r.lanes.find((l: any) => l.laneId === room.laneId)?.serverId ?? null) as string | null,
+    roster: new Map<string, string[]>(r.roster.map((m: any) => [m.memberId, m.devices.map((d: any) => d.deviceId)])),
+    grants: (r.grants as Array<{ deviceId: string; laneId: string; gid: string; exp: number }>).filter((g) => g.laneId === room.laneId),
   };
-}
-
-/** The member's joined record for a lane from rooms.json (holds no grant token). */
-export function memberRecordOnDisk(home: string, laneId: string): any | null {
-  const p = join(memberDir(home), "rooms.json");
-  if (!existsSync(p)) return null;
-  return (readJson(p).rooms ?? []).find((r: any) => r.laneId === laneId) ?? null;
-}
-
-export function deviceKeyHash(home: string): string | null {
-  const p = join(memberDir(home), "device.json");
-  return existsSync(p) ? sha256(readFileSync(p)) : null;
 }
 
 /** Stored agent record: $PASEO_HOME/agents/<cwd slug>/<agentId>.json (read-only scan). */

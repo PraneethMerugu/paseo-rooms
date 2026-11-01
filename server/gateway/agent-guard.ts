@@ -60,10 +60,18 @@ export interface InertMcpServer {
   env: Record<string, string>;
 }
 
+export const INERT_MCP_FILE = "inert-mcp.cjs";
+
+/** The inert server's descriptor, without writing anything (checks in an unverified data folder). */
+export function inertMcpServer(dataDir: string): InertMcpServer {
+  return { type: "stdio", command: process.execPath, args: [join(dataDir, INERT_MCP_FILE)], env: { ELECTRON_RUN_AS_NODE: "1" } };
+}
+
 export function ensureInertMcp(dataDir: string): InertMcpServer {
-  const path = join(dataDir, "inert-mcp.cjs");
+  const inert = inertMcpServer(dataDir);
+  const path = inert.args[0];
   if (!existsSync(path) || readFileSync(path, "utf8") !== INERT_MCP_SOURCE) writePrivateFile(path, INERT_MCP_SOURCE);
-  return { type: "stdio", command: process.execPath, args: [path], env: { ELECTRON_RUN_AS_NODE: "1" } };
+  return inert;
 }
 
 /**

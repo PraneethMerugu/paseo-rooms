@@ -132,6 +132,7 @@ export function describeAdminAction(ctx: DescribeContext, a: AdminActionV2): Des
         ...base,
         title: "Create an invite",
         details: [
+          ...(a.roomName ? [`Room name: ${a.roomName}`] : []),
           `Role: ${a.role ?? "watch"}`,
           lanes.length ? `Lanes: ${lanes.map((l) => laneName(ctx, l)).join(", ")}` : "Lanes: none",
           `Valid for ${Math.round((a.expS ?? INVITE_EXP_DEFAULT_S) / 60)} minutes, once.`,

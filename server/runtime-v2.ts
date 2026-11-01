@@ -78,7 +78,6 @@ import type { StatementData, StatementType } from "./authority/statements";
 import { autoApprovalEndsAt } from "./authority/holds";
 import { AdminHoldClock } from "./admin/hold-clock";
 import { edKid, versionKey, type RoomState } from "./authority/state";
-import type { KeyChange } from "./authority/statements";
 import { DeviceLinker } from "./member/device-link";
 import { readLinkSection, writeLinkSection } from "./member/enrollment-journal";
 import { TestClock } from "./platform/test-clock";
@@ -103,6 +102,7 @@ import { EnrollmentJournal } from "./member/enrollment-journal";
 import { checkInvite, DEFAULT_TRUSTED_RELAYS, laneHostLabel, requireRelayTrust, type InvitePreview } from "./member/invite-check";
 import { LaneRegistrar, type HostsApi } from "./member/lane-registration";
 import { RoomClient } from "./member/room-client";
+import { SealedLogCopy } from "./member/log-copy";
 import { RoomLogFold } from "./authority/fold";
 import { MlsDelivery } from "./host/mls-delivery";
 import { mlsAdapter, type MlsAdapter } from "./mls/adapter";
@@ -110,10 +110,10 @@ import { MlsMember, type MlsTimings } from "./mls/member";
 import { SealedMlsStore } from "./mls/sealed-store";
 import { writePrivateFile } from "./platform/durable";
 import { resolvePaseoHome } from "./platform/home";
-import { gateDevSwitches } from "./platform/test-clock";
-import { ensureInertMcp } from "./gateway/agent-guard";
-import { verifyRoomAgent } from "./gateway/tripwire";
-import { archivedKeyFiles, deleteArchivedKeys, dismissNotice, HOSTS_BACKOFF_MS, migrateV1, readMigration, removeV1Registrations, type HostsRemoveApi, type MigrationRecord } from "./migration/v1";
+import { gateDevSwitches, testHomeRefusal } from "./platform/test-clock";
+import { inertMcpServer } from "./gateway/agent-guard";
+import { isMarkedRoomAgent, readStoredAgentRecord, verifyRoomAgent } from "./gateway/tripwire";
+import { archivedKeyFiles, deleteArchivedKeys, dismissNotice, HOSTS_BACKOFF_MS, migrateV1, readMigration, removeV1Registrations, v1ForkAgentIds, type HostsRemoveApi, type MigrationRecord } from "./migration/v1";
 import { defaultProtection, ProtectionError, type FileProtection, type ProtectionProblem } from "./platform/file-protection";
 import { b64u, b64uDecode } from "./proto/b64u";
 import { isValidLabel } from "./proto/enroll";
@@ -132,7 +132,7 @@ const DEV_MLS_TIMINGS: Partial<MlsTimings> = { witnessMaxDelayMs: 1000, epochCon
 const DEFAULT_RELAY = { host: "relay.paseo.sh", port: 443 };
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
 
-export function genesisRelay(env: NodeJS.ProcessEnv = process.env): { host: string; port: number; tls: true } {
+export function genesisRelay(env: NodeJS.ProcessEnv): { host: string; port: number; tls: true } {
   const raw = env.PASEO_ROOMS_RELAY_ENDPOINT;
   if (!raw) return { ...DEFAULT_RELAY, tls: true };
   const m = /^([A-Za-z0-9.-]{1,253}):(\d{1,5})$/.exec(raw);
@@ -141,12 +141,12 @@ export function genesisRelay(env: NodeJS.ProcessEnv = process.env): { host: stri
 }
 
 /** Member side (P-20): TLS unless PASEO_ROOMS_DEV_INSECURE_RELAY=1 and the relay is on loopback. */
-export function memberRelayAddress(relay: { host: string; port: number }, env: NodeJS.ProcessEnv = process.env): RelayAddress {
+export function memberRelayAddress(relay: { host: string; port: number }, env: NodeJS.ProcessEnv): RelayAddress {
   return { endpoint: `${relay.host}:${relay.port}`, useTls: memberRelayUseTls(relay.host, isDevInsecureRelay(env)) };
 }
 
 /** Owner side: where the room endpoint reaches its relay. TLS unless the development override applies to a loopback host. */
-export function relayAddress(relay: { host: string; port: number }, env: NodeJS.ProcessEnv = process.env): RelayAddress {
+export function relayAddress(relay: { host: string; port: number }, env: NodeJS.ProcessEnv): RelayAddress {
   const plain = env.PASEO_ROOMS_RELAY_TLS === "false" && LOOPBACK.has(relay.host);
   return { endpoint: `${relay.host}:${relay.port}`, useTls: !plain };
 }
@@ -230,6 +230,11 @@ export class RoomsRuntimeV2 {
    * with PASEO_ROOMS_TEST_CLOCK=1 (server/platform/test-clock.ts), where tests may move it forward.
    */
   readonly clock: TestClock;
+  /**
+   * True only on a marked e2e test home (testHomeRefusal): the development RPCs (`rooms.v2.mls.send`,
+   * `rooms.v2.mls.messages`) are registered only then (index.server.ts).
+   */
+  readonly testHome: boolean;
 
   /** The environment in use: PASEO_ROOMS_DEV_* removed unless this is a marked e2e test home. */
   private readonly env: NodeJS.ProcessEnv;
@@ -252,6 +257,7 @@ export class RoomsRuntimeV2 {
     if (gated.dropped.length) log("dev_switches_ignored", { switches: gated.dropped, reason: gated.refusal });
     this.env = gated.env;
     this.clock = new TestClock(env, this.paseoHome);
+    this.testHome = testHomeRefusal(this.paseoHome) === null;
   }
 
   /** The PaseoApi of the latest RPC context: lane registration waits for it (section 8). */
@@ -301,9 +307,28 @@ export class RoomsRuntimeV2 {
     };
   }
 
-  /** "Delete keys" (migration 2.4): the user's explicit action. Keeps the room logs. */
-  async deleteV1Keys(): Promise<{ removed: string[] }> {
+  /**
+   * V-6: archive actions change files only in a data folder that passed the permission check, both at
+   * start (`ready`) and now (the tree may have changed since).
+   */
+  private async requireVerifiedTree(): Promise<void> {
     await this.start();
+    if (this.state !== "ready") throw new Error("Rooms did not start because its data folder failed the permission check. Fix permissions first.");
+    const check = this.protection.verifyTree(this.dataDir);
+    if (!check.ok) {
+      this.permissionProblems = check.problems;
+      throw new ProtectionError(check.problems);
+    }
+  }
+
+  /** "Delete keys" (migration 2.4): the user's explicit action. Keeps the room logs. */
+  async deleteV1Keys(expected?: readonly string[]): Promise<{ removed: string[] }> {
+    await this.requireVerifiedTree();
+    if (expected) {
+      const now = archivedKeyFiles(this.dataDir).sort();
+      const shown = [...new Set(expected)].sort();
+      if (now.length !== shown.length || now.some((f, i) => f !== shown[i])) throw new Error("The key files changed since the dialog opened. Review them and confirm again.");
+    }
     const removed = deleteArchivedKeys(this.dataDir);
     this.migration = readMigration(this.dataDir);
     log("v1_archive_keys_deleted", { files: removed.length });
@@ -311,7 +336,7 @@ export class RoomsRuntimeV2 {
   }
 
   async dismissMigrationNotice(): Promise<void> {
-    await this.start();
+    await this.requireVerifiedTree();
     dismissNotice(this.dataDir);
     this.migration = readMigration(this.dataDir);
   }
@@ -341,14 +366,33 @@ export class RoomsRuntimeV2 {
   /**
    * Tripwire on resume (C-iso2) for room agents created by Rooms: M1 fork lanes left behind by the
    * migration keep their inert MCP shadow (migration 2.2 step 4). Throws to refuse the open.
+   *
+   * Fails closed (V-1), independent of the runtime state and of the in-memory migration record. An
+   * agent is a room agent when its stored record carries a Rooms marker (isMarkedRoomAgent) or it is
+   * an M1 fork listed in migration.json, an unarchived v1 `gateway/state.json` or an archive
+   * (read synchronously here, so this works before start reaches the migration and after a failed
+   * permission check). A room agent must pass verifyRoomAgent. The resume is also refused when the
+   * agent's stored record exists but cannot be read, and when the record is missing while the list
+   * of M1 forks cannot be read (migration.json unreadable).
    */
   assertRoomAgentIntact(agentId: string): void {
-    const lane = this.migration?.ownerLanes.find((l) => l.origin === "fork" && l.agentId === agentId);
-    if (!lane) return;
-    const r = verifyRoomAgent(this.paseoHome, agentId, null, ensureInertMcp(this.dataDir));
-    if (r.ok) return;
-    log("room_agent_tripwire", { laneId: lane.laneId, agentId, when: "session_open", problems: r.problems });
-    throw new Error(`Room agent failed the isolation check: ${r.problems.join("; ")}`);
+    const forks = v1ForkAgentIds(this.dataDir);
+    for (const l of this.migration?.ownerLanes ?? []) if (l.origin === "fork") forks.ids.add(l.agentId);
+    const known = forks.complete || this.migration !== null;
+    const stored = readStoredAgentRecord(this.paseoHome, agentId, null);
+    const room = (stored.state === "ok" && isMarkedRoomAgent(stored.record)) || forks.ids.has(agentId);
+    const refuse = (problems: string[]): never => {
+      log("room_agent_tripwire", { agentId, when: "session_open", forksKnown: known, problems });
+      throw new Error(`Room agent failed the isolation check: ${problems.join("; ")}`);
+    };
+    if (!room) {
+      if (stored.state === "unreadable") refuse(["stored agent record unreadable; Rooms cannot tell whether this is a room agent"]);
+      if (stored.state === "missing" && !known) refuse(["stored agent record not found and the list of room agents (migration.json) is not readable"]);
+      return;
+    }
+    // A pure descriptor: nothing is written into a data folder that may have failed the permission check.
+    const r = verifyRoomAgent(this.paseoHome, agentId, null, inertMcpServer(this.dataDir));
+    if (!r.ok) refuse(r.problems);
   }
 
   /** C-13: the lane's agent is gone. The admin key of this daemon closes the lane in the log. */
@@ -1723,6 +1767,8 @@ export class RoomsRuntimeV2 {
       // Enrollment 5.7 (round 9, item 3): what the host showed before admission must be in the log;
       // so must the `endpoint.rotated` a moved endpoint showed (keys 4.6).
       anchors: [...(j?.preAdmissionAnchors() ?? []), ...(opts.moved ? [{ source: "moved", signed: opts.moved }] : [])],
+      // Room-log 8.2 (R2.1): the verified copy, maxSignedHead, receipts and stopping alerts at rest.
+      store: new SealedLogCopy({ dataDir: this.dataDir, kek, roomId, genesisHash: v.genesisHash }),
       onIngest: (s, b, a) => {
         if (mls && !this.owned.has(roomId)) mls.ingest(s, b, a);
         this.onMemberEntry(roomId, s, b, a);

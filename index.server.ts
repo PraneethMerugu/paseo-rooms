@@ -96,7 +96,7 @@ export default function contribute(server: PluginServerContext) {
   // Migration from M1 (migration.md 2.4 and 2.5).
   handle(roomsMigrationDeleteKeys, (i) => {
     if (i.confirm !== true) throw new Error("Confirmation required");
-    return rt.deleteV1Keys();
+    return rt.deleteV1Keys(i.expected);
   });
   handle(roomsMigrationDismiss, async () => {
     await rt.dismissMigrationNotice();
@@ -146,8 +146,12 @@ export default function contribute(server: PluginServerContext) {
   handle(roomsV2DeviceVeto, (i) => rt.vetoDevice(i.roomId, i.ref));
   handleAdmin(roomsV2DeviceApprove, "device.approve", (i) => rt.approveDevice(i.roomId, i.ref));
   handleAdmin(roomsV2ConflictResolve, "device.conflict.resolve", (i) => rt.resolveConflict(i.roomId, i.memberId));
-  handle(roomsV2MlsSend, (i) => rt.mlsSend(i.roomId, i.text));
-  handle(roomsV2MlsMessages, (i) => rt.mlsMessages(i.roomId));
+  // DEVELOPMENT-ONLY unsigned chat path (until R3.4's sender signature): registered only on a marked
+  // e2e test home, the same home check as the test clock (server/platform/test-clock.ts).
+  if (rt.testHome) {
+    handle(roomsV2MlsSend, (i) => rt.mlsSend(i.roomId, i.text));
+    handle(roomsV2MlsMessages, (i) => rt.mlsMessages(i.roomId));
+  }
   // Rotation and recovery (I-12). Admin actions need the token of their confirmation dialog (I-14);
   // a member's own rekey and the recovery procedures (typed recovery code) do not.
   handle(roomsV2DeviceRekey, (i) => rt.requestRekey(i.roomId));

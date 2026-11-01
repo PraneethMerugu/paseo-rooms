@@ -9,7 +9,7 @@ import { useState } from "react";
 import { Text, View } from "react-native";
 import { roomsMigrationDeleteKeys, roomsMigrationDismiss, roomsPermissionsFix } from "../shared/rpc";
 import { roomsV2LaneCreate, roomsV2RoomCreate, roomsV2Status } from "../shared/rpc-v2";
-import { Badge, Button, commandCenterHint, errorText, Section, Segmented, useStyles, type Styles } from "./ui";
+import { Button, commandCenterHint, errorText, Section, Segmented, useStyles, type Styles } from "./ui";
 import { RecoveryCodeModal, useAdminConfirm, type RecoveryOffer } from "./v2-dialogs";
 import { JoinedCardV2, JoinFormV2, JoiningCardV2 } from "./v2-member";
 import { OwnedRoomCardV2, STATUS_V2_KEY, type OwnedV2 } from "./v2-owner";
@@ -195,7 +195,7 @@ function MigrationNotices({ m, theme, styles }: { m: NonNullable<Status["migrati
                   busy={busy}
                   onPress={() => {
                     setBusy(true);
-                    void deleteKeys({ confirm: true })
+                    void deleteKeys({ confirm: true, expected: m.keyFiles })
                       .then((r) => {
                         toast.show(`Deleted ${r.removed.length} file(s)`, { variant: "success" });
                         setConfirm(false);

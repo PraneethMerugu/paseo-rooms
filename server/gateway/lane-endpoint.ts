@@ -76,7 +76,7 @@ export type EndpointStatus = "starting" | "online" | "offline" | "closed";
 
 export type AgentGoneReason = "agent_archived" | "agent_missing";
 
-/** The claim fields the lane endpoint uses (M1 `GrantClaims` and v2 `GrantClaimsV2` both have them). */
+/** The claim fields the lane endpoint uses (from v2 `GrantClaimsV2`). */
 export interface LinkClaims {
   sub: string;
   dev: string;
@@ -113,7 +113,9 @@ export interface LaneEndpointDeps {
   onAgentGone?(laneId: string, reason: AgentGoneReason): void;
   /**
    * Isolation tripwire for fork lanes (C-iso2): verifies the room agent's final stored config.
-   * A failure keeps the lane offline and is logged; it is not retried.
+   * A failure keeps the lane offline and is logged; it is not retried. Not wired in production since
+   * the cut-over (v2 creates no fork lanes; LaneService does not pass it). Retained deliberately for a
+   * future sandboxed room agent runner; tested in lane-endpoint.test.ts.
    */
   verifyRoomAgent?(lane: EndpointLane): { ok: boolean; problems: string[] };
 }
@@ -145,7 +147,7 @@ export class LaneEndpoint {
   /** Full text of errors viewers got as generic text. Owner-only (rooms.lane.errors); never forwarded. */
   readonly errors: LaneErrorLog;
   readonly authority: LaneGrantAuthority;
-  /** v2: failed link attempts (grants-v2 section 11). Null in M1. */
+  /** Failed link attempts (grants-v2 section 11). Null when the authority sets no rate (unit tests). */
   readonly failures: TokenBucket | null;
 
   constructor(readonly lane: EndpointLane, readonly deps: LaneEndpointDeps) {

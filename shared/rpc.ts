@@ -51,7 +51,11 @@ export const roomsLaneAgents = defineRpc({
  */
 export const roomsMigrationDeleteKeys = defineRpc({
   name: "rooms.migration.keys.delete",
-  input: z.object({ confirm: z.literal(true) }),
+  /**
+   * `expected`: the key files the dialog listed (relative paths). When given, the call is refused if
+   * the files on disk differ, so what is deleted is what was shown (cut-over review V-9).
+   */
+  input: z.object({ confirm: z.literal(true), expected: z.array(z.string().max(200)).max(64).optional() }),
   output: z.object({ removed: z.array(z.string()) }),
 });
 

@@ -1,7 +1,11 @@
 // JSON-lines logging to the plugin's stdout (visible in `paseo plugin logs rooms`).
 // Secrets are never passed to the logger; as a second line of defence, known secret fields are redacted.
-const SECRET_KEYS = /^(token|grant|password|inviteCode|secret|secretKey|secretKeyB64|privateKey|privateKeyPem|connection|sig|nonce)$/i;
-const SECRET_VALUES = /(prg1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|prc1\.[A-Za-z0-9_-]+|password=[^&\s"]+)/g;
+// `code` and `recovery` are not listed as keys: many events carry an error `code` or a recovery
+// "created"/"skipped" flag. Invite, link and recovery codes are caught by their value format instead.
+const SECRET_KEYS = /^(token|grant|password|inviteCode|linkCode|recoveryCode|confirmToken|seed|secret|secretKey|secretKeyB64|privateKey|privateKeyPem|connection|sig|nonce)$/i;
+/** v2 grants (prg2.), invite codes (prc2.), link codes (prl2.), recovery codes (prk2-), the v1 formats, relay passwords. */
+const SECRET_VALUES =
+  /(prg[12]\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|prg[12]\.[A-Za-z0-9_-]+|prc[12]\.[A-Za-z0-9_-]+|prl2\.[A-Za-z0-9_-]+|prk2(?:-[A-Za-z2-7]+)+|password=[^&\s"]+)/g;
 
 function redact(value: unknown, depth = 0): unknown {
   if (depth > 6) return "[depth]";

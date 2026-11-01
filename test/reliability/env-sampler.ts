@@ -3,6 +3,9 @@
 // for a short allowlist of non-secret variables, MCP URLs lose their query string (bearer tokens),
 // and no file is ever opened for reading (credential checks use access(2) only).
 //
+// Tracked secrets (invite codes, tokens) can be passed in; the report then names the env variables
+// whose value contains one, and says whether the command line does. Values are never reported.
+//
 // Library use: startSampler(match) / stop() from agent-environment-inspection.test.ts.
 // CLI use (parent positive control, from run.sh):
 //   env-sampler.ts <out.json> <seconds> <ownerListen>
@@ -43,6 +46,11 @@ export interface ProcReport {
   envVarsMentioningMainDaemonPort: string[];
   pathDirsWithPaseoCli: string[];
   credentialReadable: { paseoHomeLocalCredential: boolean | null; mainHomeLocalCredential: boolean };
+  /** access(2) only: the Rooms plugin's fallback KEK file and data directory under PASEO_HOME. */
+  roomsDataReadable: { kekFallbackFile: boolean | null; dataDir: boolean | null };
+  /** Names of env variables whose value contains a tracked secret; never the values. */
+  envVarsWithTrackedSecret: string[];
+  cmdlineHasTrackedSecret: boolean;
   callerAgentIds: string[];
   cmdlineHasPaseoAgentMcpUrl: boolean;
   cmdlineHasInertMcp: boolean;
@@ -143,9 +151,12 @@ export interface SamplerOptions {
   /** Decides which processes are recorded. Gets the process env and argv. */
   match: (env: Map<string, string>, argv: string[]) => boolean;
   intervalMs?: number;
+  /** Secrets to look for in env values and the command line (at least 20 characters each). */
+  secrets?: string[];
 }
 
-export function inspectProcess(pid: number, e: Map<string, string>, args: string[], ownerListen: string): ProcReport {
+export function inspectProcess(pid: number, e: Map<string, string>, args: string[], ownerListen: string, secrets: string[] = []): ProcReport {
+  const tracked = secrets.filter((x) => x.length >= 20);
   const ownerPort = ownerListen.split(":").pop()!;
   const names = [...e.keys()].sort();
   const paseoRelatedEnv: Record<string, string> = {};
@@ -179,6 +190,12 @@ export function inspectProcess(pid: number, e: Map<string, string>, args: string
       paseoHomeLocalCredential: home ? readable(join(home, "local-credential")) : null,
       mainHomeLocalCredential: readable(join(homedir(), ".paseo", "local-credential")),
     },
+    roomsDataReadable: {
+      kekFallbackFile: home ? (existsSync(join(home, "plugin-data", "rooms", "keystore", "kek.fallback")) ? readable(join(home, "plugin-data", "rooms", "keystore", "kek.fallback")) : null) : null,
+      dataDir: home ? (existsSync(join(home, "plugin-data", "rooms")) ? readable(join(home, "plugin-data", "rooms")) : null) : null,
+    },
+    envVarsWithTrackedSecret: names.filter((n) => tracked.some((x) => e.get(n)!.includes(x))),
+    cmdlineHasTrackedSecret: tracked.some((x) => cmd.includes(x)),
     callerAgentIds: [...new Set([...cmd.matchAll(/callerAgentId=([A-Za-z0-9_-]+)/g)].map((m) => m[1]))],
     cmdlineHasPaseoAgentMcpUrl: cmd.includes("/mcp/agents"),
     cmdlineHasInertMcp: cmd.includes("inert-mcp.cjs"),
@@ -208,7 +225,7 @@ export function startSampler(opts: SamplerOptions): { stop: () => ProcReport[]; 
       if (!e) continue;
       const args = readArgv(pid);
       if (!opts.match(e, args)) continue;
-      seen.set(pid, inspectProcess(pid, e, args, opts.ownerListen));
+      seen.set(pid, inspectProcess(pid, e, args, opts.ownerListen, opts.secrets));
     }
   };
   tick();

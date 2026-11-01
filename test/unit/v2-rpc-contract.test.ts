@@ -76,6 +76,12 @@ test("I-14 describe: a role changed by another admin since the dialog opened is 
   assert.equal(rm.typeToConfirm, "remove");
 });
 
+test("V-9: the invite dialog shows the room name its token is bound to", () => {
+  const ctx = { state: { members: {}, auth: { lanes: {}, closed: false, versions: {} }, pending: {}, conflicts: {} } as unknown as RoomState, label: () => "", lanes: [], joinRequest: () => null, ownAdminKid: null, ownMemberId: null } as DescribeContext;
+  const d = describeAdminAction(ctx, { kind: "invite.create", roomId: `room_${"a".repeat(32)}`, roomName: "Lab bench" });
+  assert.ok(d.details.includes("Room name: Lab bench"), JSON.stringify(d.details));
+});
+
 // ------------------------------------------------------------------------------ through the server entry
 
 test("I-14 contracts through the server entry: handlers, shapes, tokens, stale_base, recovery offer", async () => {
@@ -244,4 +250,38 @@ test("I-14 client texts: members see mapped codes only; ids and recovery codes a
   assert.deepEqual(recoveryCodeLines(code), ["prk2-", "abcd-efgh-ijkl-mnop", "qrst-uvwx-yz23-4567", "abce-abcf-abcg-abch", "abci-abcj"]);
   assert.equal(recoveryCheckGroup(code), "abcj");
   assert.equal(fmtSas("317837"), "317 837");
+});
+
+test("V-3: the development MLS RPCs (rooms.v2.mls.send, rooms.v2.mls.messages) are not registered outside a marked test home", async () => {
+  const t = tempDir();
+  const env: Record<string, string> = { PASEO_HOME: "", PASEO_ROOMS_KEYSTORE: "fallback-file" };
+  const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+  const { default: contribute } = await import("../../index.server");
+  const registered = async (home: string) => {
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    Object.assign(process.env, { ...env, PASEO_HOME: home });
+    const names = new Set<string>();
+    const server = { handle: (c: PluginRpcContract) => void names.add(c.name), before: () => () => undefined, on: () => () => undefined };
+    const dispose = (contribute as (s: unknown) => () => Promise<void>)(server);
+    await dispose();
+    return names;
+  };
+  try {
+    const dev = ["rooms.v2.mls.send", "rooms.v2.mls.messages"];
+    const plain = await registered(join(t.dir, "home"));
+    assert.ok(plain.has("rooms.v2.status"), "the entry registered its RPCs");
+    for (const n of dev) assert.equal(plain.has(n), false, `${n} on an ordinary home`);
+    // Named like a test home but without the marker: still absent.
+    const unmarked = await registered(join(t.dir, ".test-homes", "v2-unmarked"));
+    for (const n of dev) assert.equal(unmarked.has(n), false, `${n} on an unmarked test-home path`);
+    const markedHome = join(t.dir, ".test-homes", "v2-marked");
+    mkdirSync(markedHome, { recursive: true, mode: 0o700 });
+    writeFileSync(join(markedHome, TEST_HOME_MARKER), TEST_HOME_MARKER_TEXT, { mode: 0o600 });
+    const marked = await registered(markedHome);
+    for (const n of dev) assert.equal(marked.has(n), true, `${n} on a marked test home`);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+    t.cleanup();
+  }
 });

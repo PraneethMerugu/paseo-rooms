@@ -71,7 +71,6 @@ export type DsReply = { ok: true; frame: Record<string, unknown> } | { ok: false
 type Pkg = { ref: string; kp: string };
 type Pool = { sig: string; single: Pkg[]; lastResort: Pkg | null };
 type PoolName = "current" | "rekey";
-type WelcomeRec = { seq: number; commitHash: string; welcome: string; targets: string[]; at: number };
 
 const PkgS = z.strictObject({ ref: z.string().max(64), kp: z.string().max(64 * 1024) });
 const PoolS = z.strictObject({ sig: z.string().max(64), single: z.array(PkgS).max(KP_POOL_MAX), lastResort: PkgS.nullable() });

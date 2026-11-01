@@ -2,7 +2,9 @@
 # Rooms end-to-end test (identity v2; implementation plan I-8 to I-15): room endpoint transport,
 # sessions, SAS enrollment, lane grants v2, device linking, MLS, rotation and the checks ported from the
 # M1 e2e (out-of-scope denials, one-time invite, file modes, secret scan, room log verification,
-# archived agent closes its lane) between disposable Paseo 0.13.2 test daemons. The driver restarts the owner and member daemons once,
+# archived agent closes its lane) between disposable Paseo 0.13.2 test daemons. At the very end it cuts the
+# owner's room log (TEST-ONLY host rollback, owner daemon stopped) and restarts both daemons: the member must
+# keep its head and raise truncation from its sealed log copy (roadmap R2.1). The driver restarts the owner and member daemons once,
 # mid-enrollment, views the lane through the member, waits for an idle and a forced grant rotation
 # (short grants: 40 s), links a second device of the member (third daemon) and lets the 72 h hold pass
 # on the owner's test clock, revokes, and scans every home for invite and link codes (prc2., prl2.) and

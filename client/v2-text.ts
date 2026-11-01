@@ -13,6 +13,8 @@ export function alertText(type: string): { text: string; tone: Tone; stopsSendin
       return { text: "This room's history contains an invalid entry. The host may be misbehaving. Later entries are not processed.", tone: "danger", stopsSending: true };
     case "withholding":
       return { text: "The host may be holding back room entries from this device.", tone: "warn", stopsSending: false };
+    case "local_copy_corrupt":
+      return { text: "This device's saved copy of the room history was damaged. It is being fetched again from the host and checked against what this device saw before.", tone: "warn", stopsSending: false };
     case "unverified_head_claim":
       return { text: "A device reported a different history without evidence. Admins were told.", tone: "muted", stopsSending: false };
     case "roster_mismatch":

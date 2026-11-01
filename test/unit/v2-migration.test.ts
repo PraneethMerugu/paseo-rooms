@@ -300,3 +300,235 @@ test("I-15: PASEO_ROOMS_DEV_* switches are honoured only on a marked e2e test ho
     t.cleanup();
   }
 });
+
+// ------------------------------------------------------------------------------ cut-over review fixes
+
+/** Writes an agent's stored record the way Paseo 0.13.2 does ($PASEO_HOME/agents/<cwd slug>/<id>.json). */
+function storeAgent(homeDir: string, agentId: string, record: unknown | string): void {
+  const d = join(homeDir, "agents", projectDirNameFromCwd("/w"));
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(join(d, `${agentId}.json`), typeof record === "string" ? record : JSON.stringify(record));
+}
+const OTHER_AGENT = "33333333-cccc-4ccc-8ccc-333333333333";
+const V2_ROOM_AGENT = "44444444-dddd-4ddd-8ddd-444444444444";
+const altered = (id: string, labels: Record<string, string> = {}) => ({ id, provider: "claude", cwd: "/w", labels, config: { mcpServers: { paseo: { type: "http", url: "http://127.0.0.1/mcp/agents" } } } });
+const plain = (id: string) => ({ id, provider: "claude", cwd: "/w", labels: {}, config: { model: "x" } });
+
+test("V-1: the resume tripwire fails closed when the start-time permission check failed (migration never ran)", async (tc) => {
+  if (process.platform === "win32") return tc.skip("POSIX modes");
+  const h = home();
+  try {
+    fs.chmodSync(join(h.data, "limits.json"), 0o644);
+    const rt = new RoomsRuntimeV2({ PASEO_HOME: h.dir, PASEO_ROOMS_KEYSTORE: "fallback-file" });
+    await rt.start();
+    assert.equal(rt.status().state, "error");
+    assert.ok(fs.existsSync(join(h.data, "gateway", "state.json")), "the migration did not run");
+    assert.equal(fs.existsSync(join(h.data, "inert-mcp.cjs")), false, "the check writes nothing");
+    // The M1 fork (listed in the live v1 state) with an altered stored config: refused.
+    storeAgent(h.dir, V1.forkAgent, altered(V1.forkAgent));
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /isolation check/);
+    // A room agent identified by its stored record alone (inert shadow plus an extra MCP server): refused.
+    storeAgent(h.dir, V2_ROOM_AGENT, { id: V2_ROOM_AGENT, labels: {}, config: { mcpServers: { paseo: { type: "stdio", command: process.execPath, args: [join(h.data, "inert-mcp.cjs")], env: { ELECTRON_RUN_AS_NODE: "1" } }, extra: { type: "stdio", command: "/bin/sh", args: [] } } } });
+    assert.throws(() => rt.assertRoomAgentIntact(V2_ROOM_AGENT), /unexpected MCP servers/);
+    // An M1 room agent recognised by its lane label, even if no list names it.
+    storeAgent(h.dir, OTHER_AGENT, altered(OTHER_AGENT, { "rooms.lane": "lane_eeeeeeeeeeeeeeee" }));
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /isolation check/);
+    // An ordinary agent passes; an unreadable stored record is refused.
+    storeAgent(h.dir, OTHER_AGENT, plain(OTHER_AGENT));
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(OTHER_AGENT));
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.shareAgent), "share agents: no record, list readable");
+    storeAgent(h.dir, OTHER_AGENT, "{not json");
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /unreadable/);
+    await rt.stop();
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("V-1: the resume tripwire fails closed when migration.json cannot be read", async () => {
+  const h = home();
+  try {
+    await migrateV1(h.data, { now: NOW });
+    fs.writeFileSync(join(h.data, "migration.json"), "{broken", { mode: 0o600 });
+    const rt = new RoomsRuntimeV2({ PASEO_HOME: h.dir, PASEO_ROOMS_KEYSTORE: "fallback-file" });
+    await rt.start();
+    assert.equal(rt.status().migration, null, "the record is not loaded");
+    // The archived v1 state still names the fork.
+    storeAgent(h.dir, V1.forkAgent, altered(V1.forkAgent));
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /isolation check/);
+    // After "Delete keys" the archive no longer names it: a missing record is refused, since Rooms
+    // cannot tell whether it belongs to a room agent; an unreadable one too; a marked one is checked.
+    fs.unlinkSync(join(h.data, ARCHIVE, "gateway", "state.json"));
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /not readable/);
+    storeAgent(h.dir, OTHER_AGENT, "[]");
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /unreadable/);
+    storeAgent(h.dir, OTHER_AGENT, altered(OTHER_AGENT, { "rooms.lane": V1.forkLane }));
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /isolation check/);
+    storeAgent(h.dir, OTHER_AGENT, plain(OTHER_AGENT));
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(OTHER_AGENT), "an ordinary agent with a readable record resumes");
+    await rt.stop();
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("V-1: the resume tripwire works before start reaches the migration step", () => {
+  const h = home();
+  const rt = new RoomsRuntimeV2({ PASEO_HOME: h.dir, PASEO_ROOMS_KEYSTORE: "fallback-file" });
+  try {
+    assert.equal(rt.state, "starting");
+    const inert = ensureInertMcp(h.data);
+    storeAgent(h.dir, V1.forkAgent, { id: V1.forkAgent, provider: "claude", cwd: "/w", labels: {}, config: restrictRoomAgentConfig({ provider: "claude" }, inert) });
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.forkAgent), "an intact shadow passes");
+    storeAgent(h.dir, V1.forkAgent, altered(V1.forkAgent));
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /isolation check/, "listed only in the unmigrated gateway/state.json");
+    fs.rmSync(join(h.dir, "agents"), { recursive: true });
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /stored agent record not found/);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("V-6: Delete keys and Dismiss refuse while the permission check fails", async (tc) => {
+  if (process.platform === "win32") return tc.skip("POSIX modes");
+  const h = home();
+  try {
+    await migrateV1(h.data, { now: NOW });
+    fs.chmodSync(join(h.data, "limits.json"), 0o644);
+    const rt = new RoomsRuntimeV2({ PASEO_HOME: h.dir, PASEO_ROOMS_KEYSTORE: "fallback-file" });
+    await rt.start();
+    assert.equal(rt.status().state, "error");
+    await assert.rejects(rt.deleteV1Keys(), /permission check/);
+    await assert.rejects(rt.dismissMigrationNotice(), /permission check/);
+    assert.equal(archivedKeyFiles(h.data).length, 3, "no key file deleted");
+    assert.equal(readMigration(h.data)?.noticeDismissedAt, null);
+    // Fixed: both work.
+    assert.equal((await rt.fixPermissions()).ok, true);
+    await rt.dismissMigrationNotice();
+    // V-9: the files the dialog listed must be the files on disk.
+    const listed = archivedKeyFiles(h.data);
+    await assert.rejects(rt.deleteV1Keys(listed.slice(1)), /changed since the dialog opened/);
+    assert.equal(archivedKeyFiles(h.data).length, 3);
+    assert.equal((await rt.deleteV1Keys(listed)).removed.length, 3);
+    await rt.stop();
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("V-6: Delete keys never follows a symlink inside the archive, and the archive name is constrained", (tc) => {
+  if (process.platform === "win32") return tc.skip("symlinks");
+  const h = home();
+  const outside = tempDir();
+  try {
+    return (async () => {
+      await migrateV1(h.data, { now: NOW });
+      // <archive>/gateway -> a directory outside the data folder holding a file named like a key.
+      fs.writeFileSync(join(outside.dir, "host-key.json"), "precious");
+      fs.rmSync(join(h.data, ARCHIVE, "gateway"), { recursive: true });
+      fs.symlinkSync(outside.dir, join(h.data, ARCHIVE, "gateway"));
+      assert.throws(() => deleteArchivedKeys(h.data, NOW), /symbolic link/);
+      assert.equal(fs.readFileSync(join(outside.dir, "host-key.json"), "utf8"), "precious");
+      // An archive name in migration.json is joined into paths: anything but v1-archive-<date>[-n] is refused.
+      const rec = JSON.parse(fs.readFileSync(join(h.data, "migration.json"), "utf8"));
+      fs.writeFileSync(join(h.data, "migration.json"), JSON.stringify({ ...rec, archive: "../../elsewhere" }), { mode: 0o600 });
+      assert.throws(() => readMigration(h.data), /not readable/);
+      // A directory that only starts with the prefix is not an archive.
+      fs.mkdirSync(join(h.data, "v1-archive-evil", "member"), { recursive: true });
+      fs.writeFileSync(join(h.data, "v1-archive-evil", "member", "device.json"), "{}");
+      assert.ok(!archivedKeyFiles(h.data).some((f) => f.startsWith("v1-archive-evil")));
+    })().finally(() => {
+      outside.cleanup();
+      h.cleanup();
+    });
+  } catch (e) {
+    outside.cleanup();
+    h.cleanup();
+    throw e;
+  }
+});
+
+test("V-4: the archive name is free for every part that moves; an existing archive is never overwritten", async () => {
+  const h = home();
+  try {
+    // A same-day archive that holds member/ only (an earlier member-only migration).
+    fs.mkdirSync(join(h.data, ARCHIVE, "member"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(join(h.data, ARCHIVE, "member", "device.json"), "older", { mode: 0o600 });
+    const r = await migrateV1(h.data, { now: NOW });
+    assert.equal(r.record?.archive, `${ARCHIVE}-2`);
+    assert.deepEqual([r.record?.gateway, r.record?.member], ["archived", "archived"]);
+    assert.equal(fs.readFileSync(join(h.data, ARCHIVE, "member", "device.json"), "utf8"), "older");
+    assert.equal(fs.existsSync(join(h.data, ARCHIVE, "gateway")), false);
+    assert.ok(fs.existsSync(join(h.data, `${ARCHIVE}-2`, "gateway", "host-key.json")));
+
+    // v1 gateway data reappears while the member step of that record is still pending: the gateway
+    // waits (its archive already holds gateway/) and gets a fresh archive once nothing is pending.
+    const rec = readMigration(h.data)!;
+    fs.writeFileSync(join(h.data, "migration.json"), JSON.stringify({ ...rec, member: "pending" }), { mode: 0o600 });
+    fs.mkdirSync(join(h.data, "member"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(join(h.data, "member", "extra.json"), "{}", { mode: 0o600 });
+    fs.mkdirSync(join(h.data, "gateway"), { mode: 0o700 });
+    fs.writeFileSync(join(h.data, "gateway", "host-key.json"), "again", { mode: 0o600 });
+    fs.chmodSync(join(h.data, "member"), 0o700);
+    const later = () => new Date("2026-11-01T12:00:00Z");
+    const r2 = await migrateV1(h.data, { now: later });
+    assert.deepEqual([r2.record?.archive, r2.record?.gateway, r2.record?.member], [`${ARCHIVE}-2`, "archived", "archived"]);
+    assert.ok(fs.existsSync(join(h.data, "gateway", "host-key.json")), "deferred, not merged into the older archive");
+    assert.equal(fs.readFileSync(join(h.data, `${ARCHIVE}-2`, "gateway", "host-key.json"), "utf8").includes("again"), false);
+    assert.ok(fs.existsSync(join(h.data, `${ARCHIVE}-2`, "member", "extra.json")), "the pending member step finished");
+    const r3 = await migrateV1(h.data, { now: later });
+    // The first same-day archive holds no gateway/, so the gateway may go there.
+    assert.equal(r3.record?.archive, ARCHIVE);
+    assert.equal(fs.readFileSync(join(h.data, ARCHIVE, "gateway", "host-key.json"), "utf8"), "again");
+    assert.equal(fs.readFileSync(join(h.data, ARCHIVE, "member", "device.json"), "utf8"), "older");
+    // A leftover entry whose name the pending archive already holds is never renamed over it.
+    const rec3 = readMigration(h.data)!;
+    fs.writeFileSync(join(h.data, "migration.json"), JSON.stringify({ ...rec3, member: "pending", archive: `${ARCHIVE}-2` }), { mode: 0o600 });
+    fs.writeFileSync(join(h.data, "member", "extra.json"), "newer", { mode: 0o600 });
+    await assert.rejects(migrateV1(h.data, { now: later }), /already exists/);
+    assert.equal(fs.readFileSync(join(h.data, `${ARCHIVE}-2`, "member", "extra.json"), "utf8"), "{}");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("V-5: a pending record is reconciled with the disk; leftover v1 member entries are retried", async () => {
+  const h = home();
+  try {
+    // (a) Crash after the gateway rename, before the record was written: gateway stays "pending" in
+    // the record although the data is archived.
+    fs.writeFileSync(join(h.data, "member", "extra.json"), "{}", { mode: 0o600 });
+    fs.writeFileSync(join(h.data, "member", "settings.json"), "{}", { mode: 0o600 });
+    const busy = Object.assign(new Error("busy"), { code: "EBUSY" });
+    const first = await migrateV1(h.data, {
+      now: NOW,
+      platform: "win32",
+      sleep: async () => undefined,
+      renameSync: (from, to) => {
+        if (from.includes(`${nodePath.sep}member${nodePath.sep}`)) throw busy;
+        fs.renameSync(from, to);
+      },
+    });
+    assert.deepEqual([first.record?.gateway, first.record?.member], ["archived", "pending"]);
+    const rec = readMigration(h.data)!;
+    assert.equal(rec.gateway, "archived", "written after each part");
+    fs.writeFileSync(join(h.data, "migration.json"), JSON.stringify({ ...rec, gateway: "pending" }), { mode: 0o600 });
+
+    // (b) A partial shared-member move: device.json and rooms.json moved, extra.json did not, so
+    // detectV1 no longer sees v1 member data.
+    fs.mkdirSync(join(h.data, ARCHIVE, "member"), { recursive: true, mode: 0o700 });
+    for (const f of ["device.json", "rooms.json"]) fs.renameSync(join(h.data, "member", f), join(h.data, ARCHIVE, "member", f));
+    assert.deepEqual(detectV1(h.data), { gateway: false, member: false });
+
+    const next = await migrateV1(h.data, { now: NOW });
+    assert.equal(next.changed, true);
+    assert.deepEqual([next.record?.gateway, next.record?.member], ["archived", "archived"]);
+    assert.deepEqual(fs.readdirSync(join(h.data, "member")).sort(), ["settings.json"], "only v2 entries stay");
+    assert.deepEqual(fs.readdirSync(join(h.data, ARCHIVE, "member")).sort(), ["device.json", "extra.json", "rooms.json"]);
+    assert.deepEqual([readMigration(h.data)?.gateway, readMigration(h.data)?.member], ["archived", "archived"]);
+    // Settled: the next run changes nothing.
+    assert.equal((await migrateV1(h.data, { now: NOW })).changed, false);
+  } finally {
+    h.cleanup();
+  }
+});

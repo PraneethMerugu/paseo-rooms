@@ -90,7 +90,7 @@ export function decodeInvite(code: unknown): InvitePayload {
 export const RELAY_HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
 
-export function isDevInsecureRelay(env: NodeJS.ProcessEnv = process.env): boolean {
+export function isDevInsecureRelay(env: NodeJS.ProcessEnv): boolean {
   return env[DEV_INSECURE_RELAY_ENV] === "1";
 }
 

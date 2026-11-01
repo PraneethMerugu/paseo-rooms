@@ -28,8 +28,18 @@
 // - `onIngest` hands every accepted entry, with the fold state before and after it, to the MLS member
 //   (I-13), which fetches MLS bodies itself with `msg.fetch`.
 //
-// Not here: persistence of the verified copy, maxSignedHead and receipts (not yet in the member
-// journal; truncation is detected within one process lifetime only), MLS gossip of log heads
+// - Persistence (room-log-v2.md 6.1 and 8.2; roadmap R2.1): with a `store`, the verified chain, its
+//   statement bodies, `maxSignedHead`, the receipts of this device's own statements and the alerts that
+//   stop sending survive a restart. On construction the stored chain is re-folded from the genesis (every
+//   hash, link, hsig and statement checked again); `log.fetch` then resumes from its head. A stored
+//   `maxSignedHead` beyond the re-folded chain, and every stored receipt, become anchors: the host's
+//   chain must reach them with the same hash (`fork` otherwise, with the two host-signed entries) and
+//   its head must not be below them (`truncation`). Local damage (a file that does not open, a chain that
+//   does not fold, a head record that disagrees with the chain) raises `local_copy_corrupt`, drops the
+//   stored chain and re-verifies everything the host serves against the anchors that are left; two
+//   host-signed stored entries at one seq are a `fork`, not damage.
+//
+// Not here: MLS gossip of log heads
 // (`logHead` is sent in every MLS message's authenticated data, but `checkPeerHead` is not yet fed from
 // it), and the UI for alerts (I-14). Alerts are kept in memory and passed to `onAlert`.
 import WebSocket from "ws";
@@ -38,6 +48,7 @@ import { isEquivocationProof, SignedEntry as SignedEntrySchema, verifySignedEntr
 import { FoldError, RoomLogFold, type RoomState } from "../authority/fold";
 import { verifyGenesis, type RoomGenesis } from "../authority/genesis";
 import { log } from "../log";
+import type { LogCopyStore, StoredAlert } from "./log-copy";
 import { NOISE_MAX_MESSAGE_BYTES } from "../noise/cipher-state";
 import type { NoiseHandshake, NoiseKeyPair } from "../noise/handshake-state";
 import { createRoomIkInitiator, type RoomEndpointBinding } from "../noise/prologue";
@@ -58,7 +69,7 @@ import {
 } from "../transport/room-session";
 import { RJCS_MAX_FRAME_BYTES } from "../proto/rjcs";
 
-export type RoomAlertType = "fork" | "truncation" | "withholding" | "unverified_head_claim" | "invalid_entry";
+export type RoomAlertType = "fork" | "truncation" | "withholding" | "unverified_head_claim" | "invalid_entry" | "local_copy_corrupt";
 
 export type RoomAlert = {
   type: RoomAlertType;
@@ -69,9 +80,17 @@ export type RoomAlert = {
   proof: SignedEntry[];
   /** unverified_head_claim and peer-sourced alerts: who made the claim. */
   peer?: { memberId: string; deviceId: string };
-  /** invalid_entry: the fold reason. fork and truncation from a pre-admission anchor: `pre_admission:<source>`. */
+  /**
+   * invalid_entry: the fold reason. fork and truncation from an anchor: `<kind>:<source>` (kinds
+   * `pre_admission`, `stored`, `receipt`). local_copy_corrupt: what was damaged.
+   */
   reason?: string;
+  /** Loaded from the stored copy (raised before a restart). */
+  restored?: true;
 };
+
+/** A host-signed entry the fetched chain must contain at its seq with the same hash. */
+export type RoomAnchor = { source: string; signed: SignedEntry; kind?: "pre_admission" | "stored" | "receipt" };
 
 export type PeerHeadResult = "consistent" | "fork" | "withholding" | "unverified_head_claim";
 
@@ -111,7 +130,9 @@ export interface RoomClientOptions {
    */
   endpoint?: { serverId: string; dh: { pub: string } };
   /** Signed entries received before admission, checked against the fetched log (enrollment 5.7). */
-  anchors?: readonly { source: string; signed: SignedEntry }[];
+  anchors?: readonly RoomAnchor[];
+  /** The verified copy at rest (server/member/log-copy.ts). Without it nothing survives a restart. */
+  store?: LogCopyStore;
   /** Test only: bind the handshake to something else than this room (wrong prologue). */
   bindingOverride?: RoomEndpointBinding;
   /** Test only: inject the first handshake message's ephemeral. */
@@ -151,7 +172,7 @@ export class RoomClient {
   readonly alerts: RoomAlert[] = [];
   /** Set by fork, truncation and invalid_entry: stop sending application messages, keep reading (6.6). */
   sendingStopped = false;
-  private readonly fold: RoomLogFold | null;
+  private fold: RoomLogFold | null;
   /** Handshake hash `h` of the current session (b64u), set once the handshake completed. */
   handshakeHash: string | null = null;
   private readonly chain: SignedEntry[] = [];
@@ -164,8 +185,16 @@ export class RoomClient {
   private readonly pending = new Map<number, Pending>();
   private syncing: Promise<void> = Promise.resolve();
   private readonly now: () => number;
-  /** Pre-admission anchors by seq; removed once checked. */
-  private readonly anchors = new Map<number, { source: string; signed: SignedEntry }[]>();
+  /** Pre-admission, stored and receipt anchors by seq; removed once checked. */
+  private readonly anchors = new Map<number, RoomAnchor[]>();
+  /** A stored `maxSignedHead` beyond the chain (restart, or a host that has not served it again yet). */
+  private storedMax: SignedEntry | null = null;
+  /** Statement bodies of the chain (kept only with a store, for the copy at rest). */
+  private readonly bodies = new Map<number, Uint8Array>();
+  /** Restored entries not yet handed to `onIngest` (done once the session is open, as before). */
+  private replay: { signed: SignedEntry; before: Readonly<RoomState>; after: Readonly<RoomState> }[] = [];
+  /** Damage found in the stored copy, if any. */
+  restoreProblems: string[] = [];
 
   constructor(private readonly o: RoomClientOptions) {
     if (o.genesis) {
@@ -180,11 +209,8 @@ export class RoomClient {
     } else throw new Error("room client needs a genesis or an enrollment target");
     this.timings = resolveTimings(o.timings);
     this.now = o.now ?? Date.now;
-    for (const a of o.anchors ?? []) {
-      const list = this.anchors.get(a.signed.entry.seq) ?? [];
-      list.push(a);
-      this.anchors.set(a.signed.entry.seq, list);
-    }
+    for (const a of o.anchors ?? []) this.addAnchor(a);
+    if (o.store && this.fold) this.restore(o.store);
   }
 
   /** Pre-admission anchors not yet matched against the fetched log. */
@@ -197,9 +223,10 @@ export class RoomClient {
     return this.fold ? this.fold.head : { seq: -1, hash: this.genesisHash };
   }
 
-  /** Highest signed entry this member verified. */
+  /** Highest signed entry this member verified (in this process or, with a store, before a restart). */
   get maxSignedHead(): SignedEntry | null {
-    return this.chain.at(-1) ?? null;
+    const tail = this.chain.at(-1) ?? null;
+    return this.storedMax && (!tail || this.storedMax.entry.seq > tail.entry.seq) ? this.storedMax : tail;
   }
 
   get state() {
@@ -243,6 +270,7 @@ export class RoomClient {
       this.hello = hello;
       this.status = "open";
       await this.compareHead(hello.head);
+      this.replayRestored();
       await this.sync();
       await this.request({ t: "log.subscribe", fromSeq: this.head.seq + 1 });
       log("room_client_open", { roomId: this.roomId, head: this.head.seq, deviceId: hello.deviceId });
@@ -276,6 +304,30 @@ export class RoomClient {
   /** One request frame; resolves with the reply, rejects with RoomSessionError on `error`. */
   request(frame: Omit<Frame, "id">, timeoutMs = 30_000): Promise<Frame> {
     if (!this.crypto) return Promise.reject(new RoomSessionError("closed"));
+    const sent = this.requestRaw(frame, timeoutMs);
+    // Room-log 6.4 "own statements": keep the receipt until the chain contains it.
+    return frame.t === "stmt.submit" ? sent.then((reply) => (this.noteReceipt(reply.receipt), reply)) : sent;
+  }
+
+  /**
+   * A receipt for one of this device's statements. One at or below the own head must be the chain's
+   * entry (`fork` with proof otherwise); one beyond it becomes an anchor kept at rest until it is seen.
+   */
+  noteReceipt(value: unknown): void {
+    const p = SignedEntrySchema.safeParse(value);
+    if (!p.success || !this.fold || this.processingStopped) return;
+    const r = p.data;
+    const seq = r.entry.seq;
+    if (!this.validAt(r, seq)) return;
+    if (seq <= this.head.seq) {
+      if (this.chain[seq].hash !== r.hash) this.raiseFork(seq, this.chain[seq], r);
+      return;
+    }
+    this.addAnchor({ kind: "receipt", source: "own_statement", signed: r });
+    this.persist();
+  }
+
+  private requestRaw(frame: Omit<Frame, "id">, timeoutMs: number): Promise<Frame> {
     const id = this.nextId++;
     return new Promise<Frame>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -524,6 +576,7 @@ export class RoomClient {
 
   /** Folds entries in order; the first that fails raises `invalid_entry` and stops processing. */
   private ingest(entries: unknown[], bodies: Map<number, Uint8Array>): void {
+    let appended = false;
     for (const e of entries) {
       if (this.processingStopped) return;
       const seq = this.head.seq + 1;
@@ -534,16 +587,118 @@ export class RoomClient {
         if (!(err instanceof FoldError)) throw err;
         this.processingStopped = true;
         this.raise({ type: "invalid_entry", roomId: this.roomId, seq, at: this.now(), proof: [], reason: err.reason });
-        return;
+        break;
       }
       const signed = SignedEntrySchema.parse(e);
       this.chain.push(signed);
+      const body = bodies.get(seq);
+      if (this.o.store && body) this.bodies.set(seq, body);
       this.checkAnchors(signed);
+      this.hook(signed, before, this.requireFold().state);
+      appended = true;
+    }
+    if (appended) this.persist();
+  }
+
+  private hook(signed: SignedEntry, before: Readonly<RoomState>, after: Readonly<RoomState>): void {
+    try {
+      this.o.onIngest?.(signed, before, after);
+    } catch (err) {
+      log("room_client_ingest_hook_failed", { roomId: this.roomId, error: String((err as Error)?.message ?? err).slice(0, 160) });
+    }
+  }
+
+  /** Hands the restored entries to `onIngest` once, in order, before new entries (same order as a refetch). */
+  private replayRestored(): void {
+    const list = this.replay;
+    this.replay = [];
+    for (const r of list) this.hook(r.signed, r.before, r.after);
+  }
+
+  // ----------------------------------------------------------------------------- copy at rest
+
+  private addAnchor(a: RoomAnchor): void {
+    const list = this.anchors.get(a.signed.entry.seq) ?? [];
+    if (list.some((x) => x.signed.hash === a.signed.hash && (x.kind ?? "pre_admission") === (a.kind ?? "pre_admission"))) return;
+    list.push(a);
+    this.anchors.set(a.signed.entry.seq, list);
+  }
+
+  /** Room-log 8.2 "On start": re-verify the stored chain and fold; local damage is re-checked against the host. */
+  private restore(store: LogCopyStore): void {
+    const fold = this.requireFold();
+    const copy = store.load();
+    const problems = [...copy.problems];
+    let discard = problems.some((p) => p.startsWith("segment_"));
+    const replay: typeof this.replay = [];
+    for (const { signed, body } of copy.entries) {
+      const before = fold.state;
       try {
-        this.o.onIngest?.(signed, before, this.requireFold().state);
+        fold.append(signed, body);
       } catch (err) {
-        log("room_client_ingest_hook_failed", { roomId: this.roomId, error: String((err as Error)?.message ?? err).slice(0, 160) });
+        if (!(err instanceof FoldError)) throw err;
+        problems.push(`stored_chain_invalid:${signed.entry.seq}`);
+        discard = true;
+        break;
       }
+      this.chain.push(signed);
+      if (body) this.bodies.set(signed.entry.seq, body);
+      replay.push({ signed, before, after: fold.state });
+    }
+    const max = copy.maxSignedHead;
+    if (!discard && max && max.entry.seq <= this.head.seq && this.chain[max.entry.seq].hash !== max.hash) {
+      // Two different entries at one seq, both stored by this device. Both host-signed: the host
+      // equivocated (keep the chain, raise fork). Otherwise local damage.
+      if (isEquivocationProof(this.chain[max.entry.seq], max, fold.hostKeyAt)) {
+        this.raise({ type: "fork", roomId: this.roomId, seq: max.entry.seq, at: this.now(), proof: [this.chain[max.entry.seq], max], reason: "stored:max_signed_head" });
+      } else {
+        problems.push("stored_head_mismatch");
+        discard = true;
+      }
+    }
+    for (const a of copy.alerts) this.raise({ ...a, roomId: this.roomId, restored: true }, false);
+    if (discard) {
+      // The chain at rest is not used. What stays authentic (the sealed head record, the journal's
+      // pre-admission anchors) is checked against what the host serves; nothing is taken on trust.
+      this.chain.length = 0;
+      this.bodies.clear();
+      const fresh = RoomLogFold.fromGenesis(this.o.genesis!);
+      this.fold = fresh;
+      replay.length = 0;
+      try {
+        store.discardChain();
+      } catch (err) {
+        log("member_log_copy_discard_failed", { roomId: this.roomId, error: String((err as Error)?.message ?? err).slice(0, 160) });
+      }
+    }
+    this.replay = replay;
+    if (max && max.entry.seq > this.head.seq) {
+      this.storedMax = max;
+      this.addAnchor({ kind: "stored", source: "max_signed_head", signed: max });
+    }
+    for (const r of copy.receipts) {
+      if (r.entry.seq > this.head.seq) this.addAnchor({ kind: "receipt", source: "own_statement", signed: r });
+      else if (this.chain[r.entry.seq].hash !== r.hash) this.raiseFork(r.entry.seq, this.chain[r.entry.seq], r);
+    }
+    this.restoreProblems = problems;
+    if (problems.length) this.raise({ type: "local_copy_corrupt", roomId: this.roomId, seq: this.maxSignedHead?.entry.seq ?? -1, at: this.now(), proof: [], reason: problems.join(",").slice(0, 200) });
+    log("member_log_copy_loaded", { roomId: this.roomId, entries: this.chain.length, maxSignedHead: this.maxSignedHead?.entry.seq ?? -1, receipts: copy.receipts.length, problems: problems.length });
+  }
+
+  /** Writes the copy at rest; a failed write is logged and the session goes on (detection then lasts this process). */
+  private persist(): void {
+    const store = this.o.store;
+    if (!store || !this.fold) return;
+    try {
+      store.save({
+        chain: this.chain,
+        bodyAt: (seq) => this.bodies.get(seq),
+        maxSignedHead: this.maxSignedHead,
+        receipts: [...this.anchors.values()].flat().filter((a) => a.kind === "receipt").map((a) => a.signed),
+        alerts: this.alerts.filter((a): a is RoomAlert & { type: StoredAlert["type"] } => STORED_ALERTS.has(a.type)).map(({ type, seq, at, proof, peer, reason }) => ({ type, seq, at, proof, ...(peer ? { peer } : {}), ...(reason ? { reason: reason.slice(0, 200) } : {}) })),
+      });
+    } catch (err) {
+      log("member_log_copy_write_failed", { roomId: this.roomId, error: String((err as Error)?.message ?? err).slice(0, 160) });
     }
   }
 
@@ -588,7 +743,7 @@ export class RoomClient {
       // Both are host-signed entries at one seq: an equivocation proof when both verify under the
       // fold's host key for that seq. Otherwise still a fork, but the proof does not stand alone.
       const proven = isEquivocationProof(a.signed, signed, this.requireFold().hostKeyAt);
-      this.raise({ type: "fork", roomId: this.roomId, seq: signed.entry.seq, at: this.now(), proof: [a.signed, signed], reason: `pre_admission${proven ? "" : "_unproven"}:${a.source}` });
+      this.raise({ type: "fork", roomId: this.roomId, seq: signed.entry.seq, at: this.now(), proof: [a.signed, signed], reason: `${a.kind ?? "pre_admission"}${proven ? "" : "_unproven"}:${a.source}` });
     }
   }
 
@@ -597,8 +752,19 @@ export class RoomClient {
     for (const [seq, list] of [...this.anchors]) {
       if (seq <= this.head.seq) continue;
       this.anchors.delete(seq);
-      for (const a of list) this.raise({ type: "truncation", roomId: this.roomId, seq, at: this.now(), proof: [a.signed], reason: `pre_admission:${a.source}` });
+      for (const a of list) this.raise({ type: "truncation", roomId: this.roomId, seq, at: this.now(), proof: [a.signed], reason: `${a.kind ?? "pre_admission"}:${a.source}` });
     }
+    this.persist();
+  }
+
+  /**
+   * Same alert already raised (a restored one, or the same check again after a reconnect). Claims
+   * without evidence are all kept: repeated claims from one device are what admins look at (6.3).
+   */
+  private known(a: RoomAlert): boolean {
+    if (a.type === "unverified_head_claim") return false;
+    const key = alertKey(a);
+    return this.alerts.some((x) => alertKey(x) === key);
   }
 
   private raiseUnverified(seq: number, peer: { memberId: string; deviceId: string }): PeerHeadResult {
@@ -606,12 +772,21 @@ export class RoomClient {
     return "unverified_head_claim";
   }
 
-  private raise(a: RoomAlert): void {
+  private raise(a: RoomAlert, notify = true): void {
     if (a.type === "fork" || a.type === "truncation" || a.type === "invalid_entry") this.sendingStopped = true;
+    if (this.known(a)) return;
     this.alerts.push(a);
-    log("room_alert", { roomId: this.roomId, type: a.type, seq: a.seq, ...(a.peer ? { peerDevice: a.peer.deviceId } : {}) });
+    if (!notify) return;
+    log("room_alert", { roomId: this.roomId, type: a.type, seq: a.seq, ...(a.peer ? { peerDevice: a.peer.deviceId } : {}), ...(a.type === "local_copy_corrupt" ? { reason: a.reason } : {}) });
     this.o.onAlert?.(a);
+    if (STORED_ALERTS.has(a.type)) this.persist();
   }
+}
+
+const STORED_ALERTS = new Set<RoomAlertType>(["fork", "truncation", "invalid_entry", "withholding"]);
+
+function alertKey(a: RoomAlert): string {
+  return [a.type, a.seq, a.reason ?? "", a.peer?.deviceId ?? "", ...a.proof.map((p) => p.hash)].join("|");
 }
 
 function isReply(frame: Frame): boolean {

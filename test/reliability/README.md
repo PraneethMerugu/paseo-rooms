@@ -1,12 +1,10 @@
 # Reliability and environment-inspection tests
 
-These are routine tests for the `rooms` plugin, run against two disposable test daemons. They cover the "restarts", "flaky-enrollment loop" and "real environment of the fork process" items from `review/HARDENING-PLAN.md` section E, as approved in "Decisions, round 2".
+These are routine tests for the `rooms` plugin, run against two disposable test daemons. They cover the "restarts", "flaky-enrollment loop" and "real environment of the room agent's process" items from `review/HARDENING-PLAN.md` section E, as approved in "Decisions, round 2". Since the identity v2 cut-over the room agent is the shared live agent (no fork lanes).
 
 Fuzzing, credential forgery and replay, concurrency races, and stress or resource-exhaustion tests are **out of scope**. They belong in `test/security/` and will be written or approved by the user separately.
 
-**Status:** written and typechecked. **Not run yet.** Running needs explicit approval: `run.sh` refuses to start without `--i-reviewed-this`.
-
-**Stale since the identity v2 cut-over (I-15, 2026-11-01):** these modules drive the M1 RPCs (`rooms.create`, `rooms.join`, `rooms.overview`, ...), which no longer exist. They still typecheck because they call RPCs by name, but every module would fail at its first RPC. They need a rewrite against the `rooms.v2.*` RPCs (implementation plan, "after I-9") before anyone runs them.
+**Status:** ported to the identity v2 RPCs (`rooms.v2.*`) on 2026-11-01 and typechecked. **Not run yet.** Running needs explicit approval: `run.sh` refuses to start without `--i-reviewed-this`.
 
 ## How to run
 
@@ -14,125 +12,101 @@ Fuzzing, credential forgery and replay, concurrency races, and stress or resourc
 cd plugin
 bash test/reliability/run.sh --i-reviewed-this
 bash test/reliability/run.sh --i-reviewed-this --only enrollment-reliability
-KEEP_HOMES=1 RL_ENROLL_CYCLES=20 bash test/reliability/run.sh --i-reviewed-this
+KEEP_HOMES=1 RL_ENROLL_CYCLES=5 bash test/reliability/run.sh --i-reviewed-this
 ```
 
 Modules run in this order: environment inspection, then enrollment, then restarts. Restarts go last because they are the most disruptive. Each module is a `node:test` file run on the Node bundled with Paseo through tsx. One failing module does not stop the others. The exit code is non-zero if any module, the cleanup or the secret scan fails.
 
 To typecheck: `npx tsc -p test/reliability/tsconfig.json`. The root `npm run typecheck` also covers these files.
 
+## Shared steps (`lib.ts`)
+
+- **Room with a lane:** `rooms.v2.room.create` (no recovery key: a throwaway room), then `rooms.v2.lane.create` on the parent agent (share-live). Both endpoints must be online on the relay.
+- **Interactive admin actions** (invite, lane, admit, remove) go through `rooms.v2.admin.prepare` and its one-time `confirmToken`, as the UI does.
+- **Enrollment** is the real SAS flow: `join.preview` (the relay must be trusted by default; the suite never grants relay trust), `join.start`, both sides show the 6-digit SAS, a **TEST-ONLY programmatic comparison** stands in for the people comparing by voice (the digits must be equal and well-formed, and are never logged; a mismatch sends `match: false` and fails the step), `join.confirm`, then `join.admit`.
+- **Room log check:** an independent fold of the owner's `host/<roomId>/log` files (hash chain, host and statement signatures, fold rules).
+
 ## Modules
 
 ### 1. `restart-persistence.test.ts`
 
-**Findings:** C-12 (member rotation timers after restart) and P-13 (revocation durability).
+**Findings:** P-13 (revocation durability), C-12 (member grant scheduler after a restart) and roadmap R2.1 (the member's verified log copy at rest).
 
-**Setup:** a share-live lane bound to the throwaway parent, so no new agent is created. Only the test daemons are stopped and started, through `paseo daemon stop|start --home`.
+**Setup:** one room with a share-live lane on the throwaway parent, so no new agent is created. Only the test daemons are stopped and started, through `paseo daemon stop|start --home`.
 
-The file is one scenario run as ordered steps. A failed step can make later steps fail, so read the first failure first.
+The file is one scenario run as ordered steps. A failed step can make later steps fail, so read the first failure first. Fingerprints are public key ids and server ids from `rooms.v2.status` and the per-entry hashes of the owner's room log (sealed files are re-sealed with a fresh nonce on every write, so their bytes are not a fingerprint).
 
 | Step | Checks |
 |---|---|
-| Baseline | The member enrolls with a 1 h grant. The test records fingerprints of the host key, the lane key, the revocation list and the room log. Fingerprints are SHA-256 hashes kept in memory; only booleans are logged. |
-| Owner restart, idle | The host key and lane key are unchanged. The room log verifies, and the events from before the restart are unchanged. The revocation list has lost no entries. The member is still active. The lane endpoint and the member's lane host come back online. |
-| Owner restart, live view open | An app-style read-only view (routed through the member daemon, as in the e2e) is open during the restart. The view reconnects on its own. The test records the recovery time. |
-| Member restart, idle | The device key is unchanged. The membership is still active, and the grant is either unchanged or rotated forward. The lane host comes back online. |
-| Member restart, live view open | A new view works after the restart. Whether the old view recovered on its own is recorded but not asserted. |
-| P-13 revocation | The owner revokes the member. After both daemons restart, all of the following hold: the owner still shows the member as `revoked`, the revoked grant id is in the persisted list, the member's view and `rooms.json` both show `revoked`, the lane host does not reappear during a 20 s watch, and the log contains `member.revoked` and verifies. |
-| C-12 rotation | The member re-enrolls with a 30 s grant. The member daemon is stopped until 3 s past expiry, then started. For 15 s the test watches `rooms.json` on disk without making further RPCs, to see whether the parked rotation ran on its own. It then contacts the member daemon. Within 120 s the member must hold a newer grant and be online again. |
+| Baseline | The member enrolls (SAS) and its lane registers with a grant and comes online. The owner's roster lists the device; a current grant exists. |
+| Owner restart, idle | Host key id, admin key id, room endpoint and lane offer unchanged. The room log verifies and keeps every entry from before. Endpoints come back online; the member's session reopens (whether it reopened by itself is recorded, not asserted: automatic member reconnect is an I-8 follow-up) and its lane comes back online. |
+| Owner restart, live view open | An app-style read-only view (routed through the member daemon) is open during the restart. The view must become readable again; the recovery time is recorded. |
+| Member restart, idle | Same member and device ids, head not behind, no alerts, a current grant, and the member's verified log copy (`member/rooms/<roomId>/log/head.sealed` and `seg-000000.sealed`) is on disk and sealed. |
+| Member restart, live view open | A new view works after the restart. Whether the old view recovered by itself is recorded, not asserted. |
+| P-13 removal | The owner removes the member (`member.remove`). After both daemons restart: the member is not in the roster, no grant for its device, a new session of the device ends with `access_ended`, the lane host does not reappear during a 20 s watch, and the log contains `member.removed` and verifies. |
 | Final | Keys and the log chain are intact after all restarts. |
 
 **Expected:** pass.
 
-Two outcomes in the C-12 step are informational only, not asserted:
-
-- `rotatedBeforeFurtherContact`. C-12 is *partial* (`review/FIXES-B-D.md`): rotation needs a PaseoApi, which exists only after an RPC or hook. The `rooms.bootstrap` probe that `startDaemon` uses to confirm the plugin loaded is itself such a contact. This value is therefore not a measure of "no contact at all".
-- `oldViewRecoveredItself` in the member live-view step.
+**Not ported:** the M1 step "grant rotation across expiry while the member daemon is stopped". It needs grants shorter than the 1 h minimum of `grantTtl`; the development short grants are honoured only on `.test-homes/v2-*` e2e homes, and the e2e covers forced and idle rotation with them.
 
 **Evidence:** `restart-persistence.jsonl`.
 
 ### 2. `enrollment-reliability.test.ts`
 
-**Finding:** the M1 intermittent enrollment failure (`M1-RESULTS.md`, open issue 8). In that failure, a `rooms.join` failed with an empty error message about 0.7 s after a host was removed, and the gateway never saw the attempt.
+**Finding:** the M1 intermittent enrollment failure (`M1-RESULTS.md`, open issue 8). In that failure, a join failed with an empty error message about 0.7 s after a lane host was removed.
 
-**Setup:** N = 20 sequential cycles on one share-live lane. N can be set with `RL_ENROLL_CYCLES`, up to 50. Each cycle does the following:
+**Setup:** N = 10 sequential cycles (`RL_ENROLL_CYCLES`, up to 20). A daemon can join a given room only once and v2 has no leave RPC yet, so each cycle uses a fresh room with one share-live lane on the parent:
 
-1. creates a fresh invite;
-2. calls `rooms.join`;
-3. waits for the lane host to come online;
-4. calls `rooms.leave`;
-5. waits for the lane host to be removed.
+1. room and lane, both endpoints online;
+2. a fresh invite;
+3. the SAS enrollment above, until the member's room session is open;
+4. the lane registers with a grant and its routed host comes online on the member;
+5. `member.remove`; the member's session ends (`removed`) and the lane host is removed.
 
-There are no artificial delays. Each cycle starts right after the previous host was removed, which is the M1 timing.
+There are no artificial delays: each cycle starts right after the previous lane host was removed, which is the M1 timing. Rooms are not closed afterwards (closing needs the close delay); the cleanup stops the daemons, which ends their relay registrations.
 
-**What is recorded per cycle:**
+**What is recorded per cycle:** the time of every step (room, invite, enrollment sub-steps, lane online, removal, session end, host removal) and the time since the previous host was removed. **On a failure:** redacted error details with the cause chain, the member's join state and the owner's join cards (states only, never the SAS), and the last 200 lines of each daemon's plugin log, redacted.
 
-- the time taken by every step;
-- the time since the previous host was removed.
+**Expected:** pass, all cycles. A failure is a real result, not noise. Afterwards every cycle's room log must verify by an independent fold and hold exactly one `member.admitted` and one `member.removed`.
 
-**On a failure, the test also records:**
-
-- the error's name, message and code, its cause chain and any `AggregateError` members, all redacted;
-- whether the owner saw the enrollment;
-- the member's record;
-- the last 200 lines of each daemon's plugin log, redacted.
-
-**Expected:** pass, with 20 of 20 cycles succeeding. A connect retry was added after M1, so the failure may not reproduce. A failure is a real result, not noise: it is the M1 issue, now with diagnostics. After the cycles, the room log must verify and must contain a join and a leave for every successful cycle.
-
-**Evidence:**
-
-- `enrollment-cycles.jsonl`
-- `enrollment-summary.json`
-- `enroll-failure-<n>-<step>-{member,owner}.log`
+**Evidence:** `enrollment-cycles.jsonl`, `enrollment-summary.json`, `enroll-failure-<n>-<step>-{member,owner}.log`.
 
 ### 3. `agent-environment-inspection.test.ts`
 
-**Findings:** C-1 and P-5 (which control routes a room agent can reach).
+**Findings:** C-1 and P-5 (what a room agent can reach).
 
-**Setup:** creates one fork lane from the parent. This makes throwaway agent 2. The gateway creates the fork without a prompt, checks it with the tripwire, then sends the instruction "Reply with the word OK and nothing else." That is the only prompt the fork receives.
+v2 shares the live agent only (no fork lanes, I-15), so the agent a room exposes is the owner's own throwaway parent. The module creates a room with a share-live lane on the parent and one invite that is never used, then sends the parent one trivial prompt: "Reply with the word OK and nothing else." While that turn runs, the test samples `/proc` for the parent's provider processes (command line carrying the owner test daemon's `/mcp/agents` URL). For each process it reports:
 
-While that first turn runs, the test samples `/proc` for processes with `PASEO_ROOMS_LANE=<lane>`. This covers the provider process and its children, such as the inert MCP server. For each process it reads `environ` and `cmdline` and reports:
+- the names of `PASEO_*`, `CLAUDE*`, `ANTHROPIC*` and `MCP*` variables. Values are shown only for a short allowlist of non-secret variables, such as `PASEO_HOME`. Other values appear as `<set>`;
+- the names, not values, of variables whose value contains a tracked room secret (the invite code and token), and whether the command line does;
+- the names of variables that mention the daemon port; the `PATH` directories that contain a `paseo` CLI;
+- whether `$PASEO_HOME/local-credential`, `~/.paseo/local-credential`, the Rooms fallback KEK file and the Rooms data directory are readable. This uses `access(2)` from the test process only, which is valid because the test process has the same uid and namespaces as the agent. The files are never opened;
+- the MCP config from the command line (names, types, basenames, URLs without query), the uid, `NoNewPrivs`, the seccomp mode, and the namespaces.
 
-- the names of `PASEO_*`, `CLAUDE*`, `ANTHROPIC*` and `MCP*` variables. Values are shown only for a short allowlist of non-secret variables, such as `PASEO_HOME` and the lane id. Other values appear as `<set>`.
-- the names, not values, of any variables that mention the daemon port;
-- the `PATH` directories that contain a `paseo` CLI;
-- whether `$PASEO_HOME/local-credential` and `~/.paseo/local-credential` are readable. This uses `access(2)` from the test process only, which is valid because the test process has the same uid and namespaces as the fork. The files are never opened.
-- the MCP config from the command line: server names, types and basenames, with URLs stripped of their query string;
-- the uid, `NoNewPrivs`, the seccomp mode, and whether the process shares the net, mount and user namespaces with the test process;
-- whether the owner **test** daemon port accepts TCP connections.
+The main daemon (6767) is never contacted.
 
-The main daemon (6767) is never contacted. The test only reports whether any variable's value mentions that port.
-
-The test also reports the fork's stored agent config: MCP server summary, `toolPolicy` keys and env names.
-
-**Positive control:** the same sampler runs while the parent's turn runs, matching processes whose command line carries the owner's `/mcp/agents` URL.
-
-**Expected:**
+**Before sharing (positive control):** run.sh runs the same sampler during the parent's first turn, before any room exists. It validates the method (the `/mcp/agents` URL is seen) and gives the env names before sharing.
 
 | Test | Expected |
 |---|---|
-| Fork processes observed | pass. If it fails, the inspection is inconclusive. |
-| Stored config holds only the inert `paseo` server and no preapprovals | pass |
-| No fork command line carries Paseo's agent MCP URL | pass |
-| The parent control saw that URL | pass. It is skipped if the control report is missing. |
-| Different uid; credential not readable; no `paseo` on `PATH`; no daemon address or `PASEO_HOME` in env; own network and mount namespaces | **Known failing, marked `todo`.** This documents the owner-uid gap: M1 forks run as the owner's OS user (HARDENING-PLAN, "Correction to earlier claims"). Rooms are watch-only by decision until sandboxed lanes exist. `todo` failures are reported but do not fail the run. |
+| Shared agent processes observed | pass. If it fails, the inspection is inconclusive. |
+| Stored config (MCP servers, tool policy, env names) unchanged by sharing | pass |
+| No environment variable added by sharing; no `PASEO_ROOMS_LANE` marker | pass |
+| No room secret in env values or the command line | pass |
+| Positive control saw the agent MCP URL | pass (skipped if the control report is missing) |
+| Different uid; credential, fallback KEK and Rooms data not readable; no `paseo` on `PATH`; own network namespace | **Marked `todo`, by design.** A share-live agent is the owner's own agent and runs as the owner's OS user. These document its reach; viewers cannot prompt it (lane permissions are `workspace.read` only, checked in the e2e). `todo` failures are reported but do not fail the run. |
 
-**Evidence:**
-
-- `agent-environment.json` (0600)
-- `parent-environment.json` (0600)
+**Evidence:** `agent-environment.json` (0600), `parent-environment.json` (0600).
 
 ## Resources used
 
 - **Daemons:** two loopback test daemons, owner `127.0.0.1:6930` and member `127.0.0.1:6931`. Only ports 6930 to 6939 are allowed.
-- **Homes:** `PASEO_HOME` is under `test/reliability/.homes/` (0700, git-ignored). Each `config.json` is written before the first start, with relay registration off, plugins on, and dictation and voice mode off, so no speech model is downloaded. The script also exports `PASEO_DICTATION_ENABLED=false` and `PASEO_VOICE_MODE_ENABLED=false`.
-- **Agents:** at most 2 throwaway agents on the owner, both using Claude `claude-haiku-4-5` with a trivial prompt:
-  1. the parent, created by `run.sh`;
-  2. the fork, created by module 3.
-
-  That makes two short turns in total. Modules 1 and 2 use share-live lanes on the parent and create no agents.
+- **Homes:** `PASEO_HOME` is under `test/reliability/.homes/` (0700, git-ignored). Each `config.json` is written before the first start, with daemon relay registration off, plugins on, and dictation and voice mode off, so no speech model is downloaded.
+- **Keys:** `PASEO_ROOMS_KEYSTORE=fallback-file` (a protected file in each test home); the user's keyring is never read or written. `PASEO_ROOMS_KEK_FILE`, the relay overrides, the test clock and every `PASEO_ROOMS_DEV_*` switch are unset.
+- **Agents:** one throwaway agent on the owner, Claude `claude-haiku-4-5`, with two short turns in total (its creation prompt, and the one prompt of module 3). Modules 1 and 2 share it and create no agents.
 - **Network:**
-  - the Paseo relay, which lanes use;
+  - the Paseo relay (`relay.paseo.sh:443`), which room and lane endpoints use. Module 2 registers two endpoints per cycle (room and lane) until the daemons stop;
   - the Claude provider, for the two turns.
 - **Logs:** written to `test/reliability/logs/<UTC run id>/` (git-ignored). Each run gets a new directory, so earlier evidence is never overwritten.
 
@@ -152,7 +126,7 @@ Every CLI call passes `--home` and sets `PASEO_HOME` explicitly. The TypeScript 
 
 A trap runs on exit, including on failure and Ctrl-C. It does the following:
 
-1. If the owner test daemon is down, it starts it, then archives every agent listed in `agents.txt`. Archiving the parent also archives its fork.
+1. If the owner test daemon is down, it starts it, then archives every agent listed in `agents.txt`.
 2. It saves the plugin and daemon logs.
 3. It removes the plugin and stops both test daemons.
 4. It runs the e2e secret scan (`test/reliability/secret-scan.ts`, moved from the removed M1 e2e) over the homes and logs. The scan uses the invite codes, invite tokens and grant signatures the modules tracked.
@@ -174,5 +148,6 @@ paseo daemon stop --home test/reliability/.homes/{owner,member}
 - `lib.ts`: clients, safety re-checks, daemon stop and start, on-disk snapshots, and redaction.
 - `env-sampler.ts`: the read-only `/proc` sampler. It is a library, and also a CLI for the parent control.
 - `*.test.ts`: the three modules.
+- `secret-scan.ts`: the cleanup's scan for tracked invite codes, tokens and grant signatures.
 - `tsconfig.json`
 - `.gitignore`

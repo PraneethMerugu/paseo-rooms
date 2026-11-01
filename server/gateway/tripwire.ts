@@ -18,7 +18,7 @@
 // on resume; no agent.create hook runs then).
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, win32 } from "node:path";
-import { checkInertMcp, type InertMcpCheckOptions, type InertMcpServer } from "./agent-guard";
+import { checkInertMcp, INERT_MCP_FILE, type InertMcpCheckOptions, type InertMcpServer } from "./agent-guard";
 
 export interface TripwireResult {
   ok: boolean;
@@ -53,6 +53,34 @@ export function findStoredAgentRecord(paseoHome: string, agentId: string, cwd?: 
     return null;
   }
   return null;
+}
+
+export type StoredAgentRead = { state: "missing" } | { state: "unreadable"; file: string } | { state: "ok"; file: string; record: unknown };
+
+/** Reads an agent's stored record: missing (or a malformed agent id), unreadable, or parsed. */
+export function readStoredAgentRecord(paseoHome: string, agentId: string, cwd?: string | null): StoredAgentRead {
+  const file = findStoredAgentRecord(paseoHome, agentId, cwd);
+  if (!file) return { state: "missing" };
+  try {
+    const record = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    if (!record || typeof record !== "object" || (record as { id?: unknown }).id !== agentId) return { state: "unreadable", file };
+    return { state: "ok", file, record };
+  } catch {
+    return { state: "unreadable", file };
+  }
+}
+
+/**
+ * Whether a stored record carries a Rooms marker, independent of migration.json (V-1): the M1 lane
+ * label `rooms.lane`, or a "paseo" MCP entry that runs an `inert-mcp.cjs` (the shadow the agent
+ * guard adds to every agent created with PASEO_ROOMS_LANE; the env itself is not stored by Paseo).
+ */
+export function isMarkedRoomAgent(record: unknown): boolean {
+  const r = record as { labels?: Record<string, unknown> | null; config?: { mcpServers?: Record<string, unknown> | null } | null } | null;
+  if (typeof r?.labels?.["rooms.lane"] === "string") return true;
+  const paseo = r?.config?.mcpServers?.paseo as { args?: unknown } | null | undefined;
+  const arg = Array.isArray(paseo?.args) ? paseo.args[0] : undefined;
+  return typeof arg === "string" && win32.basename(arg).toLowerCase() === INERT_MCP_FILE;
 }
 
 /** Pure check of a stored record's config. Exported for tests. */

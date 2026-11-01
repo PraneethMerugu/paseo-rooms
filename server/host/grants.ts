@@ -174,7 +174,7 @@ export function verifyGrantV2(token: unknown, c: VerifyContext): GrantCheck {
  * Effective lifetime (section 5): 12 h, shortened by policy, never lengthened. Below 1 h only with
  * the development switch on the host.
  */
-export function grantTtlS(policyTtl: number, env: NodeJS.ProcessEnv = process.env): number {
+export function grantTtlS(policyTtl: number, env: NodeJS.ProcessEnv): number {
   const base = Math.max(GRANT_TTL_MIN_S, Math.min(GRANT_TTL_MAX_S, Math.floor(policyTtl)));
   if (env[ENV_DEV_SHORT_GRANTS] !== "1") return base;
   const dev = Number(env[ENV_DEV_GRANT_TTL] ?? 60);
@@ -261,7 +261,7 @@ export class HostGrants {
   }
 
   ttlS(): number {
-    return grantTtlS(this.o.host.state.auth.policy.grantTtl, this.o.env);
+    return grantTtlS(this.o.host.state.auth.policy.grantTtl, this.o.env ?? {});
   }
 
   currentOf(deviceId: string, laneId: string): CurrentGrant | undefined {

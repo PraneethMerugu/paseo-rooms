@@ -56,7 +56,7 @@ export function checkInvite(code: unknown, o: { nowS: number; trustedRelays: rea
   }
   if (payload.exp + EXP_GRACE_S < o.nowS) throw new JoinRefusedError("expired");
   const relay = payload.endpoint.relay;
-  if (relay.tls !== true || !relayHostAllowed(relay.host, isDevInsecureRelay(o.env))) throw new JoinRefusedError("relay_not_allowed");
+  if (relay.tls !== true || !relayHostAllowed(relay.host, isDevInsecureRelay(o.env ?? {}))) throw new JoinRefusedError("relay_not_allowed");
   const trusted = o.trustedRelays.includes(relayKey(relay));
   return {
     payload,

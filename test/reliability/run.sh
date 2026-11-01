@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Reliability modules for the paseo-rooms plugin. Two disposable Paseo 0.13.2 test daemons:
+# Reliability modules for the paseo-rooms plugin (identity v2 RPCs, rooms.v2.*). Two disposable Paseo
+# 0.13.2 test daemons:
 #
 #   owner  : test/reliability/.homes/owner   127.0.0.1:6930
 #   member : test/reliability/.homes/member  127.0.0.1:6931
+#   relay  : the live Paseo relay (relay.paseo.sh:443) for room and lane endpoints (network)
 #
 # Never touches ~/.paseo or the main daemon: every CLI call passes --home and PASEO_HOME explicitly.
-# Creates at most two throwaway agents on the owner (a parent with a trivial prompt, and the fork made
-# by agent-environment-inspection) and archives them in the always-run cleanup.
+# Room keys use the protected fallback file (PASEO_ROOMS_KEYSTORE=fallback-file), so the user's keyring
+# is never read or written. Creates ONE throwaway agent on the owner (the parent, with a trivial prompt;
+# agent-environment-inspection shares it and prompts it once more: two short turns in total) and
+# archives it in the always-run cleanup. The development switches (short grants, test clock, loopback
+# relay) are honoured only on .test-homes/v2-* e2e homes, so none applies here and none is set.
 #
 #   bash test/reliability/run.sh --i-reviewed-this                 all modules
 #   bash test/reliability/run.sh --i-reviewed-this --only enrollment-reliability
@@ -73,6 +78,10 @@ fi
 [ -x "$P" ] || { echo "paseo CLI not found at $P" >&2; exit 2; }
 
 export PASEO_DICTATION_ENABLED=false PASEO_VOICE_MODE_ENABLED=false
+# Room keys: the protected fallback file under each test home; never the user's keyring.
+export PASEO_ROOMS_KEYSTORE=fallback-file
+unset PASEO_ROOMS_KEK_FILE PASEO_ROOMS_RELAY_ENDPOINT PASEO_ROOMS_RELAY_TLS PASEO_ROOMS_TEST_CLOCK
+for v in $(compgen -e | grep '^PASEO_ROOMS_DEV_' || true); do unset "$v"; done
 pa() { local home=$1; shift; PASEO_HOME=$home "$P" "$@" --home "$home" < /dev/null; }
 
 write_config() {
@@ -141,8 +150,9 @@ for h in "$OWNER" "$MEMBER"; do pa "$h" daemon start --timeout 120 | tail -1; do
 for h in "$OWNER" "$MEMBER"; do pa "$h" plugin install "$PLUGIN_DIR" --json | tail -3; done
 for h in "$OWNER" "$MEMBER"; do pa "$h" plugin ls; done
 
-echo "== throwaway parent agent on owner (agent 1 of at most 2)"
-# Positive control for the environment inspection: sample the parent's provider process.
+echo "== throwaway parent agent on owner (the only agent; turn 1 of 2)"
+# Positive control and before-sharing baseline for the environment inspection: sample the parent's
+# provider process during its first turn, before any room exists.
 "${TSX[@]}" "$RL_DIR/env-sampler.ts" "$LOGDIR/parent-environment.json" 240 "127.0.0.1:$OWNER_PORT" &
 SAMPLER=$!
 (cd "$SCRATCH" && PASEO_HOME=$OWNER "$P" run --home "$OWNER" --provider claude --model claude-haiku-4-5 --mode default \

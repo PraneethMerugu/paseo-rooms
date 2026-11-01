@@ -15,6 +15,17 @@ test("logger redacts secret fields and token-shaped values", () => {
   for (const s of ["abc", "SECRET", "prg1.aaa.bbb", "prc1.zzz", '"p"']) assert.ok(!out.includes(s), s);
 });
 
+test("logger redacts the v2 secret formats (prc2., prg2., prl2., prk2-) and v2 secret field names (V-2)", () => {
+  const prk = `prk2${"-abcd".repeat(13)}-ef27`;
+  const values = ["prc2.AAAA_bbbb-CCCC", "prg2.eyJjbGFpbXMi.c2lnbmF0dXJl", "prl2.LINK_code-123", prk];
+  const msg = `invite ${values[0]} grant ${values[1]}, link ${values[2]}; recovery ${values[3]}.`;
+  const out = JSON.stringify(__testing.redact({ msg, list: values, confirmToken: "t".repeat(43), seed: "s33d", recoveryCode: "x", linkCode: "y", code: "ENOENT", recovery: "created" }));
+  for (const s of [...values, "t".repeat(43), "s33d", '"x"', '"y"', "prc2.", "prg2.", "prl2.", "prk2-"]) assert.ok(!out.includes(s), s);
+  assert.equal((out.match(/\[redacted\]/g) ?? []).length, 4 + 4 + 4, "each value and each secret field is redacted");
+  // Error codes and the recovery flag stay readable.
+  assert.ok(out.includes('"code":"ENOENT"') && out.includes('"recovery":"created"'));
+});
+
 test("room agent guard shadows Paseo's MCP with an inert non-HTTP server and drops preapprovals", () => {
   const tmp = tempDir();
   try {

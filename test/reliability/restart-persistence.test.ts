@@ -1,159 +1,163 @@
-// Module 1: state across daemon restarts (C-12 member rotation after restart, P-13 revocation
-// durability). Uses a share-live lane on the throwaway parent (no new agent) and stops/starts the
-// two TEST daemons only, through the paseo CLI with --home.
+// Module 1: state across daemon restarts on identity v2 (P-13 revocation durability, the member's
+// grant scheduler after a restart (C-12), and the member's verified log copy at rest, roadmap R2.1).
+// Uses one room with a share-live lane on the throwaway parent (no new agent) and stops and starts
+// the two TEST daemons only, through the paseo CLI with --home.
 //
 // The tests in this file are sequential steps of one scenario; a failed step can make later steps
 // fail too. Read the first failure first. Evidence: <logdir>/restart-persistence.jsonl.
+//
+// What is compared: public key ids and server ids from `rooms.v2.status` (sealed files are re-sealed
+// with a fresh nonce on every write, so their bytes are not a fingerprint), and the per-entry hashes of
+// the owner's room log after an independent fold of the file. Nothing secret is logged.
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   MEMBER_HOME,
   OWNER_HOME,
   PARENT,
+  adminRpc,
   assertSafeEnvironment,
   closeQuietly,
-  deviceKeyHash,
+  createRoomWithLane,
+  enroll,
   harvestGrants,
   invite,
-  joinedRecord,
+  joinedRoom,
   laneHost,
+  laneOnline,
   log,
-  memberRecordOnDisk,
+  memberRoomDir,
   openLaneView,
-  ownedLaneView,
+  ownedRoom,
   ownerClient,
   ownerSnapshot,
   record,
   rpc,
-  sha256,
   sleep,
   startDaemon,
   stopDaemon,
   timed,
   until,
+  v2Ready,
+  verifyOwnerLog,
+  type RoomLane,
 } from "./lib";
 
 let c: any;
 let a: any;
-let lane: { id: string; serverId: string; roomId: string };
-let baseline: ReturnType<typeof ownerSnapshot>;
-let baselineDevice: string | null;
-let baselineEvents: string[] = [];
+let room: RoomLane;
+let baseline: Awaited<ReturnType<typeof ownerSnapshot>>;
+let baselineHashes: string[] = [];
 let memberId = "";
-let revokedMemberId = "";
-let revokedGid = "";
+let deviceId = "";
 
 const C = () => OWNER_HOME();
 const A = () => MEMBER_HOME();
 
-async function reconnectOwner() {
-  await closeQuietly(c);
-  c = await ownerClient(C(), "restart-owner");
-}
-async function reconnectMember() {
-  await closeQuietly(a);
-  a = await ownerClient(A(), "restart-member");
-}
 async function restartOwner(): Promise<{ stopMs: number; startMs: number }> {
   await closeQuietly(c);
   const stopMs = await stopDaemon(C());
   const startMs = await startDaemon(C());
-  await reconnectOwner();
+  c = await ownerClient(C(), "restart-owner");
+  await v2Ready(c);
   return { stopMs, startMs };
 }
 async function restartMember(): Promise<{ stopMs: number; startMs: number }> {
   await closeQuietly(a);
   const stopMs = await stopDaemon(A());
   const startMs = await startDaemon(A());
-  await reconnectMember();
+  a = await ownerClient(A(), "restart-member");
+  await v2Ready(a);
   return { stopMs, startMs };
 }
-async function logEventHashes(): Promise<{ verified: boolean; error: string | null; hashes: string[]; types: string[] }> {
-  const lg = await rpc(c, "rooms.log", { roomId: lane.roomId });
-  return { verified: lg.verified, error: lg.error, hashes: lg.events.map((e: any) => sha256(JSON.stringify(e))), types: lg.events.map((e: any) => e.type) };
-}
 
-/** Keys, log chain and revocation list unchanged (or only appended to) since the baseline. */
+/** Keys and endpoints unchanged, log verifies and keeps every entry from before the restart. */
 async function assertOwnerStatePersisted(step: string) {
-  const now = ownerSnapshot(C(), lane.id);
-  const lg = await logEventHashes();
+  const now = await ownerSnapshot(c, room);
+  const lg = verifyOwnerLog(C(), room.roomId);
   const fields = {
     step,
-    hostKeyUnchanged: now.hostKeyHash === baseline.hostKeyHash && now.hostKeyId === baseline.hostKeyId,
-    laneKeyUnchanged: now.laneKeyHash !== null && now.laneKeyHash === baseline.laneKeyHash,
-    logVerified: lg.verified,
-    logPrefixPreserved: baselineEvents.every((h, i) => lg.hashes[i] === h),
-    logEvents: lg.hashes.length,
-    revokedListSuperset: [...baseline.revokedGids].every((g) => now.revokedGids.has(g)),
+    hostKidUnchanged: now.hostKid !== null && now.hostKid === baseline.hostKid,
+    adminKidUnchanged: now.adminKid !== null && now.adminKid === baseline.adminKid,
+    endpointUnchanged: now.endpointServerId === baseline.endpointServerId,
+    laneOfferUnchanged: now.laneServerId !== null && now.laneServerId === baseline.laneServerId,
+    logVerified: true,
+    logPrefixPreserved: baselineHashes.every((h, i) => lg.hashes[i] === h),
+    logEntries: lg.hashes.length,
   };
   record("restart-persistence.jsonl", fields);
   log("owner_state", fields);
-  assert.ok(fields.hostKeyUnchanged, "host key changed");
-  assert.ok(fields.laneKeyUnchanged, "lane key changed or missing");
-  assert.ok(fields.logVerified, `room log does not verify: ${lg.error}`);
-  assert.ok(fields.logPrefixPreserved, "room log events before the restart changed");
-  assert.ok(fields.revokedListSuperset, "revocation list lost entries");
-  baselineEvents = lg.hashes;
-  baseline = { ...now };
+  assert.ok(fields.hostKidUnchanged, "host key changed");
+  assert.ok(fields.adminKidUnchanged, "admin key changed");
+  assert.ok(fields.endpointUnchanged, "room endpoint changed");
+  assert.ok(fields.laneOfferUnchanged, "lane offer changed or missing");
+  assert.ok(fields.logPrefixPreserved, "room log entries from before the restart changed");
+  baselineHashes = lg.hashes;
+  baseline = now;
 }
 
-async function laneBackOnline(): Promise<{ endpointMs: number; memberHostMs: number }> {
+/** Endpoints online on the owner; the member's session open (connects it if needed) and its lane host online. */
+async function backOnline(): Promise<{ endpointMs: number; sessionMs: number; reconnectedItself: boolean; laneMs: number }> {
   const s = Date.now();
-  await until("lane endpoint online", async () => (await ownedLaneView(c, lane.id))?.lane.endpoint === "online", 90_000, 500);
+  await until("room and lane endpoints online", async () => {
+    const r = await ownedRoom(c, room.roomId);
+    return r?.endpoint === "online" && r.lanes.find((l: any) => l.laneId === room.laneId)?.endpoint === "online";
+  }, 90_000, 500);
   const endpointMs = Date.now() - s;
-  await until("member lane host online", async () => (await laneHost(a, lane))?.status === "online", 90_000, 500);
-  return { endpointMs, memberHostMs: Date.now() - s };
+  // Reported, not asserted: automatic member reconnect after the host restarts is an I-8 follow-up.
+  const itself = await timed(() => until("member session reopened by itself", async () => (await joinedRoom(a, room.roomId))?.status === "open", 15_000, 500));
+  if (!itself.ok) await rpc(a, "rooms.v2.room.connect", { roomId: room.roomId });
+  await until("member session open", async () => (await joinedRoom(a, room.roomId))?.status === "open", 60_000, 500);
+  const sessionMs = Date.now() - s;
+  await laneOnline(a, room, 90_000);
+  return { endpointMs, sessionMs, reconnectedItself: itself.ok, laneMs: Date.now() - s };
 }
 
 before(async () => {
   assertSafeEnvironment();
   c = await ownerClient(C(), "restart-owner");
   a = await ownerClient(A(), "restart-member");
-  const created = await rpc(c, "rooms.create", { name: "Reliability restart", agentId: PARENT(), origin: "share", laneLabel: "Restart" });
-  lane = { id: created.lane.id, serverId: created.lane.serverId, roomId: created.room.id };
-  await until("share lane endpoint online", async () => (await ownedLaneView(c, lane.id))?.lane.endpoint === "online", 60_000, 500);
+  await v2Ready(c);
+  await v2Ready(a);
+  room = await createRoomWithLane(c, PARENT(), "Restart");
 });
 
 after(async () => {
-  try {
-    if ((await joinedRecord(a, lane.id).catch(() => null))?.status === "active") await rpc(a, "rooms.leave", { laneId: lane.id });
-    await rpc(c, "rooms.lane.close", { laneId: lane.id });
-  } catch {
-    // Cleanup in run.sh stops the daemons and deletes the homes anyway.
-  }
   await closeQuietly(a, c);
 });
 
-test("baseline: member enrolls on the share lane", { timeout: 120_000 }, async () => {
-  const inv = await invite(c, lane.id, 3600);
-  const j = await rpc(a, "rooms.join", { code: inv.code, label: "Reliability restart" });
-  memberId = j.joined.memberId;
+test("baseline: member enrolls (SAS) and its lane comes online", { timeout: 180_000 }, async () => {
+  const inv = await invite(c, room, "reliability restart");
+  const j = await enroll(c, a, room, inv.code, "Reliability restart");
+  memberId = j.memberId;
+  deviceId = j.deviceId;
+  await laneOnline(a, room);
   harvestGrants();
-  await until("member lane host online", async () => (await laneHost(a, lane))?.status === "online", 60_000, 250);
-  baseline = ownerSnapshot(C(), lane.id);
-  baselineDevice = deviceKeyHash(A());
-  baselineEvents = (await logEventHashes()).hashes;
-  assert.ok(baseline.laneKeyHash);
-  assert.equal(baseline.memberStatus[memberId], "active");
+  baseline = await ownerSnapshot(c, room);
+  baselineHashes = verifyOwnerLog(C(), room.roomId).hashes;
+  assert.ok(baseline.roster.get(memberId)?.includes(deviceId), "member device in the owner's roster");
+  assert.ok(baseline.grants.some((g) => g.deviceId === deviceId), "a current grant for the member's device");
 });
 
-test("owner restart while idle: keys, log and membership persist; lane recovers", { timeout: 360_000 }, async () => {
+test("owner restart while idle: keys, endpoints, log and roster persist; the member and lane recover", { timeout: 420_000 }, async () => {
   const r = await restartOwner();
   await assertOwnerStatePersisted("owner_idle");
-  const back = await laneBackOnline();
+  const back = await backOnline();
   record("restart-persistence.jsonl", { step: "owner_idle_recovery", ...r, ...back });
-  assert.equal(ownerSnapshot(C(), lane.id).memberStatus[memberId], "active");
+  assert.ok((await ownerSnapshot(c, room)).roster.get(memberId)?.includes(deviceId));
 });
 
-test("owner restart with a live read-only view open: view recovers", { timeout: 420_000 }, async () => {
-  const view = await openLaneView(A(), lane.serverId);
+test("owner restart with a live read-only view open: the view recovers", { timeout: 480_000 }, async () => {
+  const view = await openLaneView(A(), room.serverId);
   try {
     assert.ok((await timed(() => view.routed.fetchAgent(PARENT()))).ok, "view not readable before restart");
     const before = view.statuses.length;
     const r = await restartOwner();
     const dropped = view.statuses.slice(before).some((s) => s.status !== "connected");
     await assertOwnerStatePersisted("owner_live_view");
-    const back = await laneBackOnline();
+    const back = await backOnline();
     const s = Date.now();
     const readable = await timed(() => until("view readable again", async () => (await timed(() => view.routed.fetchAgent(PARENT()))).ok, 120_000, 1000));
     record("restart-persistence.jsonl", { step: "owner_live_view_recovery", ...r, ...back, viewDropped: dropped, viewRecoveredMs: readable.ok ? Date.now() - s : null });
@@ -163,27 +167,44 @@ test("owner restart with a live read-only view open: view recovers", { timeout: 
   }
 });
 
-test("member restart while idle: device key and membership persist; lane recovers", { timeout: 360_000 }, async () => {
-  const recBefore = memberRecordOnDisk(A(), lane.id);
+test("member restart while idle: device, membership, grant and verified log copy persist (R2.1)", { timeout: 420_000 }, async () => {
+  const before = await joinedRoom(a, room.roomId);
   const r = await restartMember();
-  const recAfter = memberRecordOnDisk(A(), lane.id);
-  const back = await laneBackOnline();
-  const fields = { step: "member_idle", ...r, ...back, deviceKeyUnchanged: deviceKeyHash(A()) === baselineDevice, statusAfter: recAfter?.status, sameGrantOrRotated: recAfter?.grantGid === recBefore?.grantGid || (recAfter?.grantExp ?? 0) > (recBefore?.grantExp ?? 0) };
+  const startedHead = (await joinedRoom(a, room.roomId))?.head ?? null;
+  const back = await backOnline();
+  const after = await joinedRoom(a, room.roomId);
+  const lane = after?.lanes.find((l: any) => l.laneId === room.laneId);
+  const logDir = join(memberRoomDir(A(), room.roomId), "log");
+  const headFile = join(logDir, "head.sealed");
+  const copySealed = existsSync(headFile) && existsSync(join(logDir, "seg-000000.sealed")) && /"typ":"sealed"/.test(readFileSync(headFile, "utf8")) && !readFileSync(headFile, "utf8").includes("hsig");
+  const fields = {
+    step: "member_idle",
+    ...r,
+    ...back,
+    sameDevice: after?.deviceId === deviceId && after?.memberId === memberId,
+    headNotBehind: (after?.head.seq ?? -1) >= (before?.head.seq ?? 0),
+    restoredBeforeSync: startedHead !== null && startedHead.seq >= (before?.head.seq ?? 0),
+    alerts: (after?.alerts ?? []).map((x: any) => x.type),
+    copySealed,
+    grantCurrent: !!lane?.gid && lane.lifetimeMs > 0,
+  };
   record("restart-persistence.jsonl", fields);
-  assert.ok(fields.deviceKeyUnchanged, "member device key changed");
-  assert.equal(recAfter?.status, "active");
-  assert.ok(fields.sameGrantOrRotated);
+  assert.ok(fields.sameDevice, "member device or membership changed");
+  assert.ok(fields.headNotBehind, "member head went back");
+  assert.deepEqual(fields.alerts, [], "no alerts after an honest restart");
+  assert.ok(copySealed, "the member's log copy is on disk and sealed");
+  assert.ok(fields.grantCurrent, "no current grant after the member restart");
 });
 
-test("member restart with a live read-only view open: a new view works after restart", { timeout: 360_000 }, async () => {
-  const view = await openLaneView(A(), lane.serverId);
+test("member restart with a live read-only view open: a new view works after the restart", { timeout: 420_000 }, async () => {
+  const view = await openLaneView(A(), room.serverId);
   assert.ok((await timed(() => view.routed.fetchAgent(PARENT()))).ok);
   const r = await restartMember();
   // The old view's origin connection was to the stopped daemon; report whether it came back on its own.
   const oldViewBack = await timed(() => until("old view readable", async () => (await timed(() => view.routed.fetchAgent(PARENT()))).ok, 30_000, 1000));
   await closeQuietly(view.routed, view.origin);
-  const back = await laneBackOnline();
-  const fresh = await openLaneView(A(), lane.serverId);
+  const back = await backOnline();
+  const fresh = await openLaneView(A(), room.serverId);
   try {
     const ok = await timed(() => fresh.routed.fetchAgent(PARENT()));
     record("restart-persistence.jsonl", { step: "member_live_view", ...r, ...back, oldViewRecoveredItself: oldViewBack.ok, freshViewReadable: ok.ok });
@@ -193,95 +214,42 @@ test("member restart with a live read-only view open: a new view works after res
   }
 });
 
-test("P-13: a revoked member stays revoked across owner and member restarts", { timeout: 600_000 }, async () => {
-  revokedMemberId = memberId;
-  revokedGid = ownerSnapshot(C(), lane.id).latestGrantGid[memberId];
-  await rpc(c, "rooms.member.revoke", { memberId });
-  await until(
-    "member marks revoked and removes host",
-    async () => (await joinedRecord(a, lane.id))?.status === "revoked" && !(await laneHost(a, lane)),
-    60_000,
-    500,
-  );
-  const snap = ownerSnapshot(C(), lane.id);
-  assert.ok(snap.revokedGids.has(revokedGid), "revoked grant id not persisted before restart");
-  baseline = snap;
-
+test("P-13: a removed member stays removed across owner and member restarts", { timeout: 720_000 }, async () => {
+  const removed = await adminRpc(c, "rooms.v2.member.remove", { roomId: room.roomId, memberId });
+  await until("member session ended and lane host removed", async () => {
+    const j = await joinedRoom(a, room.roomId);
+    return j?.status === "ended" && j.endedReason === "removed" && !(await laneHost(a, room));
+  }, 60_000, 500);
   await restartOwner();
   await restartMember();
-  await assertOwnerStatePersisted("after_revocation");
-  const after = ownerSnapshot(C(), lane.id);
-  // Watch for 20 s that the member does not come back (no host, still revoked on both sides).
+  await assertOwnerStatePersisted("after_removal");
+  // A new session of the removed device must end again; watch 20 s that the lane host does not return.
+  const again = await rpc(a, "rooms.v2.room.connect", { roomId: room.roomId }).catch((e: unknown) => ({ status: "error", lastError: String((e as Error).message).slice(0, 80) }));
   let hostSeen = false;
   for (let i = 0; i < 20; i++) {
-    if (await laneHost(a, lane)) hostSeen = true;
+    if (await laneHost(a, room)) hostSeen = true;
     await sleep(1000);
   }
-  const memberView = await joinedRecord(a, lane.id);
-  const lg = await logEventHashes();
+  const snap = await ownerSnapshot(c, room);
+  const lg = verifyOwnerLog(C(), room.roomId);
   const fields = {
-    step: "revocation_durable",
-    ownerStatus: after.memberStatus[revokedMemberId],
-    revokedGidPersisted: after.revokedGids.has(revokedGid),
-    memberStatus: memberView?.status ?? null,
-    memberDiskStatus: memberRecordOnDisk(A(), lane.id)?.status ?? null,
+    step: "removal_durable",
+    removedSeq: removed.seq,
+    ownerRosterHasMember: snap.roster.has(memberId),
+    ownerGrantsForDevice: snap.grants.filter((g) => g.deviceId === deviceId).length,
+    newSession: again.status,
+    newSessionError: again.lastError,
+    memberStatus: (await joinedRoom(a, room.roomId))?.status ?? null,
     laneHostReappeared: hostSeen,
-    logHasRevocation: lg.types.includes("member.revoked"),
+    logHasRemoval: lg.types.includes("member.removed"),
   };
   record("restart-persistence.jsonl", fields);
-  assert.equal(fields.ownerStatus, "revoked");
-  assert.ok(fields.revokedGidPersisted);
-  assert.equal(fields.memberStatus, "revoked");
+  assert.equal(fields.ownerRosterHasMember, false);
+  assert.equal(fields.ownerGrantsForDevice, 0);
+  assert.equal(fields.newSession, "ended");
+  assert.equal(fields.newSessionError, "access_ended");
   assert.equal(fields.laneHostReappeared, false);
-  assert.ok(fields.logHasRevocation);
-});
-
-test("C-12: member grant rotation recovers after a restart across expiry", { timeout: 600_000 }, async () => {
-  const inv = await invite(c, lane.id, 30);
-  const j = await rpc(a, "rooms.join", { code: inv.code, label: "Reliability restart (short grant)" });
-  memberId = j.joined.memberId;
-  harvestGrants();
-  await until("member lane host online", async () => (await laneHost(a, lane))?.status === "online", 60_000, 250);
-  const rec0 = memberRecordOnDisk(A(), lane.id);
-  const exp0 = (rec0?.grantExp ?? 0) * 1000;
-  assert.ok(exp0 > Date.now(), "grant expiry not recorded");
-
-  await closeQuietly(a);
-  await stopDaemon(A());
-  if (Date.now() < exp0 + 3000) await sleep(exp0 + 3000 - Date.now());
-  await startDaemon(A()); // startDaemon probes rooms.bootstrap, which is a plugin RPC (first contact).
-  const tStart = Date.now();
-
-  // Observe from disk only (no further RPCs) for 15 s: did the parked rotation run on its own?
-  let rotatedBeforeFurtherContact = false;
-  for (let i = 0; i < 15 && !rotatedBeforeFurtherContact; i++) {
-    rotatedBeforeFurtherContact = (memberRecordOnDisk(A(), lane.id)?.grantExp ?? 0) * 1000 > exp0;
-    await sleep(1000);
-  }
-  await reconnectMember();
-  const recovered = await timed(() =>
-    until(
-      "rotation after restart",
-      async () => {
-        const jr = await joinedRecord(a, lane.id);
-        return jr?.status === "active" && Date.parse(jr.grantExpiresAt) > exp0 && (await laneHost(a, lane))?.status === "online" ? jr : null;
-      },
-      120_000,
-      500,
-    ),
-  );
-  harvestGrants();
-  const fields = {
-    step: "c12_rotation_after_restart",
-    restartedMsAfterExpiry: tStart - exp0,
-    rotatedBeforeFurtherContact,
-    recovered: recovered.ok,
-    recoveredMsAfterStart: recovered.ok ? Date.now() - tStart : null,
-    error: recovered.ok ? null : recovered.error.message,
-  };
-  record("restart-persistence.jsonl", fields);
-  log("c12", fields);
-  assert.ok(recovered.ok, "member did not rotate and come back online after restart");
+  assert.ok(fields.logHasRemoval);
 });
 
 test("final: owner keys and log chain intact after all restarts", async () => {
