@@ -21,14 +21,16 @@ import {
   roomsV2LinkCreate,
   roomsV2RoomConnect,
   roomsV2RoomDisconnect,
+  roomsV2RoomLeave,
   type JoinedRoomV2View,
   type JoiningV2View,
   type MlsV2View,
 } from "../shared/rpc-v2";
 import { Badge, Button, ConfirmButton, errorText, relativeTime, type Styles } from "./ui";
-import { SasDigits } from "./v2-dialogs";
+import { SasDigits, TypedConfirm } from "./v2-dialogs";
+import { ActivityListV2, AlertNoticesV2, NameEditorV2 } from "./v2-activity";
 import { STATUS_V2_KEY } from "./v2-owner";
-import { alertText, memberErrorText, shortId } from "./v2-text";
+import { memberErrorText, nameWithId, shortId } from "./v2-text";
 
 type Joining = z.infer<typeof JoiningV2View>;
 type Joined = z.infer<typeof JoinedRoomV2View>;
@@ -136,6 +138,18 @@ export function JoiningCardV2({ view, theme, styles }: { view: Joining; theme: P
         <>
           <Text style={styles.body}>Read this code to the room owner by voice or in person:</Text>
           <SasDigits theme={theme} sas={view.sas} />
+          {view.ownerFingerprints.length ? (
+            <View style={styles.codeBox}>
+              <Text style={styles.small}>Owner fingerprint{view.ownerFingerprints.length > 1 ? "s (admin keys)" : " (admin key)"} (unverified until the codes match):</Text>
+              {view.ownerFingerprints.slice(0, 3).map((f) => (
+                <Text key={f} selectable style={styles.mono}>
+                  {f}
+                </Text>
+              ))}
+              {view.ownerFingerprints.length > 3 ? <Text style={styles.small}>and {view.ownerFingerprints.length - 3} more admin key(s).</Text> : null}
+              <Text style={styles.small}>If the owner reads you the owner fingerprint shown on their room card, compare it too.</Text>
+            </View>
+          ) : null}
           {view.terms ? (
             <Text style={styles.small}>
               Role {view.terms.role}, {view.terms.lanes.length} lane(s), room "{view.roomName}" (unverified until the codes match).
@@ -184,14 +198,23 @@ export function JoinedCardV2({ view, mls, theme, styles }: { view: Joined; mls: 
   const rekey = useRpc(roomsV2DeviceRekey);
   const linkCreate = useRpc(roomsV2LinkCreate);
   const linkConfirm = useRpc(roomsV2LinkConfirm);
+  const leave = useRpc(roomsV2RoomLeave);
   const [linkCode, setLinkCode] = useState<{ code: string; exp: number } | null>(null);
   const refresh = () => void qc.invalidateQueries({ queryKey: STATUS_V2_KEY });
   const fail = (e: unknown) => toast.error(errorText(e));
   const roomId = view.roomId;
   const c = theme.colors;
   const alerts = [...view.alerts, ...(mls?.alerts ?? [])];
-  const seen = new Set<string>();
-  const uniqueAlerts = alerts.filter((a) => (seen.has(a.type) ? false : (seen.add(a.type), true)));
+  const [showActivity, setShowActivity] = useState(false);
+  const nameOf = new Map(view.names.map((n) => [n.memberId, n]));
+  // R3.3: a name is untrusted text; the short member id always follows it, and look-alikes are flagged.
+  const who = (memberId: string | undefined) => {
+    if (!memberId) return "Someone";
+    if (memberId === view.memberId) return "You";
+    const n = nameOf.get(memberId);
+    return `${nameWithId(n?.name, memberId)}${n?.collision ? " [same name as another member]" : ""}`;
+  };
+  const others = view.names.filter((n) => n.memberId !== view.memberId);
   const myRequests = view.deviceRequests.filter((d) => d.status === "pending");
   const ended = view.status === "ended";
   const statusLabel = ended ? (view.endedReason === "removed" ? "Removed" : view.endedReason === "room_closed" ? "Room closed" : "Ended") : view.status === "open" ? "Connected" : view.status === "connecting" ? "Connecting" : "Not connected";
@@ -199,7 +222,8 @@ export function JoinedCardV2({ view, mls, theme, styles }: { view: Joined; mls: 
     <View style={styles.card}>
       <View style={styles.between}>
         <View style={{ flexShrink: 1, gap: 2 }}>
-          <Text style={styles.h2}>Room {shortId(roomId)}</Text>
+          <Text style={styles.h2}>{view.roomName ? `${view.roomName} (${shortId(roomId)})` : `Room ${shortId(roomId)}`}</Text>
+          {view.roomDescription ? <Text style={styles.small}>{view.roomDescription}</Text> : null}
           <Text style={styles.small}>
             You are member {shortId(view.memberId)} · this device {shortId(view.deviceId)} · log at seq {view.head.seq}
           </Text>
@@ -207,15 +231,7 @@ export function JoinedCardV2({ view, mls, theme, styles }: { view: Joined; mls: 
         <Badge theme={theme} label={statusLabel} tone={view.status === "open" ? "ok" : ended ? "muted" : "warn"} />
       </View>
 
-      {uniqueAlerts.map((a) => {
-        const t = alertText(a.type);
-        return (
-          <View key={a.type} style={[styles.codeBox, { borderLeftWidth: 3, borderLeftColor: t.tone === "danger" ? c.statusDanger : t.tone === "warn" ? c.statusWarning : c.border }]}>
-            <Text style={styles.body}>{t.text}</Text>
-            <Text style={styles.small}>At log position {a.seq}.</Text>
-          </View>
-        );
-      })}
+      <AlertNoticesV2 roomId={roomId} alerts={alerts} sendingStopped={view.sendingStopped} theme={theme} styles={styles} />
       {view.conflict ? (
         <View style={[styles.codeBox, { borderLeftWidth: 3, borderLeftColor: c.statusDanger }]}>
           <Text style={styles.body}>Your devices disagree about a new device. Automatic device approvals are paused until an admin resolves it. Tell an admin which devices are yours.</Text>
@@ -257,7 +273,7 @@ export function JoinedCardV2({ view, mls, theme, styles }: { view: Joined; mls: 
       ))}
       {view.lanes.length ? <Text style={styles.small}>Each lane appears as a host under this daemon. It is read-only.</Text> : null}
       {view.lastError && !ended ? <Text style={styles.small}>{memberErrorText(view.lastError)}</Text> : null}
-      {ended ? <Text style={styles.small}>This room no longer gives this device access. A lane host entry may stay in your app's host list until you remove it.</Text> : null}
+      {ended ? <Text style={styles.small}>This room no longer gives this device access. Rooms removes its lane hosts from this daemon's host list.</Text> : null}
 
       {!ended ? (
         <View style={styles.row}>
@@ -340,8 +356,64 @@ export function JoinedCardV2({ view, mls, theme, styles }: { view: Joined; mls: 
           </Text>
         ) : null,
       )}
+      {!ended ? <NameEditorV2 roomId={roomId} kind="member" current={nameOf.get(view.memberId)?.name ?? null} theme={theme} styles={styles} /> : null}
+      {others.length ? (
+        <Text style={styles.small}>
+          Members: {others.map((n) => who(n.memberId)).join(", ")}
+        </Text>
+      ) : null}
+      <Button theme={theme} label={showActivity ? "Hide activity" : `Activity (${view.activity.length})`} onPress={() => setShowActivity((v) => !v)} />
+      {showActivity ? <ActivityListV2 items={view.activity} who={who} theme={theme} styles={styles} /> : null}
       <Text style={styles.small}>{LOST_DEVICE_GUIDANCE}</Text>
-      <Text style={styles.small}>Leaving a room is not available in this build yet; ask an admin to remove you.</Text>
+      {view.hosted ? null : (
+        <LeaveRoom
+          theme={theme}
+          styles={styles}
+          ended={ended}
+          devices={view.memberDevices ?? null}
+          lanes={view.lanes.length}
+          onConfirm={() =>
+            leave({ roomId, confirm: "leave" }).then((r) => {
+              toast.show(r.statement === "member.left" ? "You left the room" : r.statement === "device.removed" ? "This device left the room" : "Room removed from this device", { variant: "success" });
+              if (r.hostsRemaining.length) toast.error(`${r.hostsRemaining.length} lane host(s) could not be removed yet. Rooms retries; see the notice at the top.`);
+              refresh();
+            })
+          }
+        />
+      )}
+    </View>
+  );
+}
+
+/**
+ * R3.1: Leave, with a typed confirmation. The text depends on how many active devices the member has
+ * in the room: the only device signs `member.left`; one of several leaves alone (`device.removed`).
+ */
+function LeaveRoom(props: { theme: PluginTheme; styles: Styles; ended: boolean; devices: number | null; lanes: number; onConfirm(): Promise<unknown> }) {
+  const { theme, styles, ended, devices, lanes } = props;
+  const others = devices !== null && devices > 1 ? devices - 1 : 0;
+  return (
+    <View style={styles.row}>
+      <TypedConfirm
+        theme={theme}
+        styles={styles}
+        variant={ended ? "secondary" : "danger"}
+        label={ended ? "Remove from this device" : others ? "Leave on this device" : "Leave room"}
+        title={ended ? "Remove this room from this device" : others ? "Leave the room on this device" : "Leave the room"}
+        word="leave"
+        onConfirm={props.onConfirm}
+      >
+        {ended ? (
+          <Text style={styles.body}>This device no longer has access. Its keys and saved copy of this room are deleted here.</Text>
+        ) : others ? (
+          <Text style={styles.body}>
+            Only this device leaves. Your other {others} device(s) stay in the room. To leave the room entirely, leave on each device. The room log records that this device left.
+          </Text>
+        ) : (
+          <Text style={styles.body}>You leave the room. Every member sees that you left. To come back you need a new invite.</Text>
+        )}
+        {!ended ? <Text style={styles.body}>{lanes ? `${lanes} lane host(s) are removed from this daemon's host list. ` : ""}This device's keys and saved copy of the room are deleted.</Text> : null}
+      </TypedConfirm>
     </View>
   );
 }

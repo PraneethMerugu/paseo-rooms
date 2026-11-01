@@ -305,6 +305,25 @@ export function describeAdminAction(ctx: DescribeContext, a: AdminActionV2): Des
         subject: JSON.stringify([l.offer.serverId, l.status]),
       };
     }
+    case "lane.close": {
+      // R3.2 (room-log-v2 4.4): `lane.closed` is final; a new lane gets a new laneId.
+      const l = auth.lanes[a.laneId] ?? fail("Unknown lane");
+      if (l.status === "closed") fail("The lane is already closed");
+      const users = Object.values(st.members).filter((m) => m.memberId !== ctx.ownMemberId && m.lanes.includes(a.laneId)).length;
+      return {
+        ...base,
+        title: `Close lane ${laneName(ctx, a.laneId)}`,
+        details: [
+          "The lane endpoint stops now: open views are cut and every grant for this lane stops working.",
+          `${users} member(s) have this lane. Their daemons remove the lane from their host list.`,
+          "The agent itself stays on this daemon and keeps running. The closing is recorded in the room log.",
+        ],
+        current: `Lane status: ${l.status}.`,
+        warning: "A closed lane cannot be reopened. To share the agent again, create a new lane and invite members to it.",
+        typeToConfirm: "close",
+        subject: JSON.stringify([l.status, l.offer.serverId]),
+      };
+    }
     case "room.close.propose": {
       if (auth.closed) fail("The room is already closed");
       // Keys 6.8: with one lineage no admin can confirm; the room is closed with the recovery key.

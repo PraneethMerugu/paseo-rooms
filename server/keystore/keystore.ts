@@ -300,3 +300,53 @@ async function openInner(o: OpenKeyStoreOptions, log: NonNullable<OpenKeyStoreOp
   if ("unavailable" in r) return useFallback("fallback", r.unavailable);
   return r;
 }
+
+/** What "Leave all rooms and delete keys" did with the KEK (R2.6). Never key material. */
+export interface KeyStoreDeletion {
+  backend: BackendName | null;
+  /** `deleted`: the entry or file is gone; `absent`: there was none; `kept`: the operator's file (never written by the plugin); `failed`: see `message`. */
+  kek: "deleted" | "absent" | "kept" | "failed";
+  message: string | null;
+}
+
+/**
+ * R2.6: deletes the KEK from the backend keystore/meta.json records (the native keyring entry, the
+ * fallback file), then meta.json. The operator's KEK file is never touched. Uses the same backend
+ * selection as `openKeyStore` (tests inject `native`; the e2e and tests use the file keystore, so
+ * the user's keyring is never read or written by them). Never throws for keystore errors.
+ */
+export async function deleteKeyStore(o: OpenKeyStoreOptions): Promise<KeyStoreDeletion> {
+  const platform = o.platform ?? process.platform;
+  const protection = o.protection ?? defaultProtection();
+  const timeoutMs = o.timeoutMs ?? KEYSTORE_TIMEOUT_MS;
+  const kdir = keystoreDir(o.dataDir);
+  const metaPath = nodePath.join(kdir, "meta.json");
+  let meta: KeystoreMeta | null;
+  try {
+    meta = readMeta(o.dataDir, protection);
+  } catch (e) {
+    return { backend: null, kek: "failed", message: `keystore/meta.json could not be read: ${String((e as Error)?.message ?? e).slice(0, 160)}` };
+  }
+  const fallbackPath = nodePath.join(kdir, FALLBACK_FILE);
+  if (!meta) {
+    // No record: at most an orphaned fallback file from an interrupted first start.
+    const had = fs.existsSync(fallbackPath);
+    fs.rmSync(fallbackPath, { force: true });
+    return { backend: had ? "fallback-file" : null, kek: had ? "deleted" : "absent", message: null };
+  }
+  const done = (kek: KeyStoreDeletion["kek"], message: string | null = null): KeyStoreDeletion => {
+    if (kek !== "failed") fs.rmSync(metaPath, { force: true });
+    (o.log ?? (() => undefined))("keystore_deleted", { backend: meta.backend, kek });
+    return { backend: meta.backend, kek, message };
+  };
+  try {
+    if (meta.backend === "operator-file") return done("kept", `The KEK file named by ${ENV_KEK_FILE} belongs to the operator and was not deleted.`);
+    if (meta.backend === "fallback-file") return done((await fallbackFileBackend(fallbackPath, meta.kekId, protection).delete(timeoutMs)) ? "deleted" : "absent");
+    if (meta.backend.startsWith("cli:") || meta.backend !== nativeBackendName(platform)) return done("failed", `Keystore backend ${meta.backend} cannot be reached here; remove its entry by hand.`);
+    const n = (o.native ?? (() => defaultNative(o.paseoHome, platform)))();
+    if (!n.ok || n.backend.name !== meta.backend) return done("failed", `The ${meta.backend} keyring cannot be reached${n.ok ? "" : `: ${n.detail}`}. Remove its "paseo-rooms" entry by hand.`);
+    return done((await n.backend.delete(timeoutMs)) ? "deleted" : "absent");
+  } catch (e) {
+    return done("failed", `The KEK could not be deleted from ${meta.backend}: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
+  }
+}

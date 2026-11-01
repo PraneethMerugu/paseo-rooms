@@ -115,9 +115,17 @@ export function epochAuth(groupId: Uint8Array, epoch: number, authenticator: Uin
 
 // ---- application payloads (room-log-v2.md 4.5) ----
 
-/** Inner payloads used here. `chat.message` carries text only until the M2 chat spec fixes its fields. */
+/**
+ * Inner payloads used here. `chat.message` carries text only until the M2 chat spec fixes its fields.
+ * `room.profile` and `member.profile` (R3.3) are display-only, untrusted text: the receiver sanitizes
+ * them again (server/member/room-book.ts) and never uses them for identity or authorization.
+ * `room.profile.rev` is not in room-log-v2 4.5: it orders re-announcements after a rename (recorded
+ * in the plan's Follow-ups).
+ */
 export const AppPayload = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("chat.message"), text: z.string().min(1).max(16_000) }),
+  z.strictObject({ kind: z.literal("room.profile"), name: z.string().min(1).max(400), description: z.string().max(2000), rev: z.number().int().min(0).max(2 ** 31) }),
+  z.strictObject({ kind: z.literal("member.profile"), memberId: MemberId, label: z.string().min(1).max(400) }),
   z.strictObject({
     kind: z.literal("log.witness"),
     witness: z.strictObject({ v: z.literal(2), typ: z.literal("log-witness"), roomId: RoomId, deviceId: DeviceId, head: Pos, roster: Pos }),

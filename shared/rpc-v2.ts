@@ -72,6 +72,7 @@ export const AdminActionV2 = z.discriminatedUnion("kind", [
   KeyRevokeIn.extend({ kind: z.literal("admin.key.revoke") }),
   RoomIdIn.extend({ kind: z.literal("endpoint.rotate") }),
   LaneRotateIn.extend({ kind: z.literal("lane.rotate") }),
+  LaneRotateIn.extend({ kind: z.literal("lane.close") }),
   RoomIdIn.extend({ kind: z.literal("room.close.propose") }),
   ProposalIn.extend({ kind: z.literal("room.close.confirm") }),
   RoomIdIn.extend({ kind: z.literal("recovery.create") }),
@@ -178,12 +179,39 @@ export const LaneV2View = z.object({
 /** Current grants by (device, lane): ids and times only, never tokens. */
 export const GrantV2View = z.object({ deviceId: z.string(), laneId: z.string(), gid: z.string(), iat: z.number().int(), exp: z.number().int() });
 
+/**
+ * One activity notice (room-log-v2 4.6; R3.5), derived from this device's verified fold: ids, types and
+ * setting values only. `type` is the entry type, or `uncertified_key`.
+ */
+export const ActivityV2Item = z.object({
+  seq: z.number().int(),
+  hts: z.number().int(),
+  type: z.string(),
+  alert: z.boolean(),
+  memberId: z.string().optional(),
+  deviceId: z.string().optional(),
+  laneId: z.string().optional(),
+  value: z.string().optional(),
+  changes: z.array(z.object({ setting: z.string(), from: z.string(), to: z.string() })).optional(),
+  sole: z.boolean().optional(),
+  marked: z.number().int().optional(),
+});
+
+/** A member's display name from `member.profile` (R3.3): untrusted text; `collision` when another member's name looks the same. */
+export const MemberNameV2View = z.object({ memberId: z.string(), name: z.string().nullable(), collision: z.boolean() });
+
+/** A room alert as this device shows it; `acked`: acknowledged on this device (R3.5). */
+const AlertV2 = z.object({ type: z.string(), seq: z.number().int(), acked: z.boolean() });
+
 /** One roster entry as the owner's member list shows it. `label`: self-reported at enrollment, if known here. */
 export const RosterMemberV2View = z.object({
   memberId: z.string(),
   role: z.string(),
   lanes: z.array(z.string()),
   label: z.string().nullable(),
+  /** R3.3: the display name from `member.profile` (MLS), and whether it looks like another member's. */
+  displayName: z.string().nullable(),
+  nameCollision: z.boolean(),
   /** This daemon's own member entry (the creator). */
   self: z.boolean(),
   devices: z.array(z.object({ deviceId: z.string(), kind: z.enum(["person", "gateway"]), since: z.number().int().nullable(), connected: z.boolean() })),
@@ -236,6 +264,13 @@ export const OwnedRoomV2View = z.object({
   }),
   /** Room-log 4.6 alerts: a host key, the endpoint or a lane offer left uncertified by a re-fold. */
   uncertified: z.array(z.object({ subject: z.string(), id: z.string() })),
+  /** R3.3: the room name and description from `room.profile` (MLS), null until one is set. */
+  roomName: z.string().nullable(),
+  roomDescription: z.string().nullable(),
+  /** R3.6: display fingerprint of this daemon's admin key, which a joining member sees as the owner fingerprint. */
+  adminFingerprint: z.string().nullable(),
+  /** R3.5: newest first, from the owner device's own fold of the log. */
+  activity: z.array(ActivityV2Item),
 });
 
 /** The member's side of a join (enrollment-v2.md 6.4, 7.3). */
@@ -244,6 +279,8 @@ export const JoiningV2View = z.object({
   state: z.enum(["keys", "pending", "confirmed", "held", "admitted", "registered", "failed"]),
   roomName: z.string(),
   sas: z.string().nullable(),
+  /** Enrollment 6.4 (R3.6): display fingerprints of the room's admin keys the pre-admission chain certified. */
+  ownerFingerprints: z.array(z.string()),
   terms: z.object({ role: z.string(), lanes: z.array(z.string()) }).nullable(),
   expiresAt: z.number().int().nullable(),
   failure: z.string().nullable(),
@@ -259,7 +296,15 @@ export const JoinedRoomV2View = z.object({
   head: Head,
   lastError: z.string().nullable(),
   endedReason: z.string().nullable(),
-  alerts: z.array(z.object({ type: z.string(), seq: z.number().int() })),
+  alerts: z.array(AlertV2),
+  /** Room-log 6.6: fork, truncation or invalid_entry stopped sending; acknowledging an alert does not change it. */
+  sendingStopped: z.boolean(),
+  /** R3.3: room name, description and members' display names from MLS (null or empty until set). */
+  roomName: z.string().nullable(),
+  roomDescription: z.string().nullable(),
+  names: z.array(MemberNameV2View),
+  /** R3.5: newest first, from this device's verified fold. */
+  activity: z.array(ActivityV2Item),
   registration: z.string().nullable(),
   /** Device links created on this device. */
   links: z.array(LinkV2View),
@@ -270,6 +315,10 @@ export const JoinedRoomV2View = z.object({
   /** This member's held device requests: the "Was this you?" prompt (Not me = rooms.v2.device.veto). */
   deviceRequests: z.array(DeviceRequestV2View),
   conflict: z.boolean(),
+  /** R3.1: active devices of this member in the verified roster (1: Leave signs `member.left`; more: only this device leaves). */
+  memberDevices: z.number().int().nullable().optional(),
+  /** This daemon hosts the room (the creator's own device): it cannot leave it. */
+  hosted: z.boolean().optional(),
   lanes: z.array(
     z.object({
       laneId: z.string(),
@@ -299,7 +348,18 @@ export const MlsV2View = z.object({
   disabled: z.string().nullable(),
   canSend: z.boolean(),
   messages: z.number().int(),
-  alerts: z.array(z.object({ type: z.string(), seq: z.number().int() })),
+  alerts: z.array(AlertV2),
+});
+
+/** R3.7: a routed lane host that could not be removed from this daemon's host list yet. */
+export const StaleHostV2View = z.object({
+  roomId: z.string(),
+  laneId: z.string(),
+  registrationId: z.string(),
+  label: z.string(),
+  reason: z.enum(["access_ended", "lane_closed", "lane_removed", "left", "data_deleted"]),
+  since: z.number().int(),
+  lastError: z.string().nullable(),
 });
 
 export const roomsV2Status = defineRpc({
@@ -345,6 +405,8 @@ export const roomsV2Status = defineRpc({
     owned: z.array(OwnedRoomV2View),
     joining: z.array(JoiningV2View),
     joined: z.array(JoinedRoomV2View),
+    /** R3.7: routed lane hosts this daemon could not remove yet (ids and labels only). */
+    staleHosts: z.array(StaleHostV2View).optional(),
     /** This daemon's member device in each room's MLS group (I-13): counts and states only, no content. */
     mls: z.array(MlsV2View),
     /** Only on an e2e test home with the test clock switch. */
@@ -471,6 +533,24 @@ export const roomsV2RoomConnect = defineRpc({
   output: z.object({ status: JoinedRoomV2View.shape.status, lastError: z.string().nullable() }),
 });
 
+/**
+ * R3.1: leave a joined room. The member's only active device signs `member.left`; with other active
+ * devices, this device signs `device.removed {reason: "self"}` and the membership stays with them
+ * (identity-model 6.2, room-log-v2 4.3). A room whose access already ended is forgotten locally
+ * (`statement: null`). Then the lane hosts are removed and this device's keys and data for the room
+ * are deleted. `confirm` is the word the person typed (not an admin action: no confirmToken).
+ */
+export const roomsV2RoomLeave = defineRpc({
+  name: "rooms.v2.room.leave",
+  input: RoomIdIn.extend({ confirm: z.literal("leave") }),
+  output: z.object({
+    statement: z.enum(["member.left", "device.removed"]).nullable(),
+    seq: z.number().int().nullable(),
+    hostsRemoved: z.number().int(),
+    hostsRemaining: z.array(StaleHostV2View),
+  }),
+});
+
 export const roomsV2RoomDisconnect = defineRpc({
   name: "rooms.v2.room.disconnect",
   input: RoomIdIn,
@@ -573,6 +653,37 @@ export const roomsV2EndpointRotate = defineRpc({ name: "rooms.v2.endpoint.rotate
 /** Admin: rotates a lane offer (keys 4.7). */
 export const roomsV2LaneRotate = defineRpc({ name: "rooms.v2.lane.rotate", input: LaneRotateIn.extend(Confirmed), output: Seq.extend({ serverId: z.string() }) });
 
+/** Admin: closes a lane (R3.2, `lane.closed`): its endpoint stops, its grants stop working; final. */
+export const roomsV2LaneClose = defineRpc({ name: "rooms.v2.lane.close", input: LaneRotateIn.extend(Confirmed), output: Seq });
+
+// ------------------------------------------------------------------------------ data hygiene (R2.6, R3.7)
+
+/** R3.7: retries removing the routed lane hosts this daemon could not remove before. */
+export const roomsV2HostsCleanup = defineRpc({
+  name: "rooms.v2.hosts.cleanup",
+  input: Empty,
+  output: z.object({ removed: z.number().int(), remaining: z.array(StaleHostV2View) }),
+});
+
+/**
+ * R2.6 "Leave all rooms and delete keys": leaves every joined room (forgets those it cannot reach),
+ * removes this plugin's lane hosts, deletes the KEK (keyring entry or fallback file) and the whole
+ * plugin-data/rooms folder. Rooms this daemon hosts stop for good and need `deleteHosted: true`.
+ * Afterwards Rooms stays stopped (`data_deleted`) until the daemon restarts. `confirm` is the typed word.
+ */
+export const roomsV2DataDelete = defineRpc({
+  name: "rooms.v2.data.delete",
+  input: z.object({ confirm: z.literal("delete"), deleteHosted: z.boolean().optional() }),
+  output: z.object({
+    left: z.array(z.object({ roomId: z.string(), statement: z.enum(["member.left", "device.removed"]).nullable(), error: z.string().nullable() })),
+    hostedDeleted: z.array(z.string()),
+    hostsRemoved: z.number().int(),
+    hostsRemaining: z.array(StaleHostV2View),
+    keystore: z.object({ backend: z.string().nullable(), kek: z.enum(["deleted", "absent", "kept", "failed"]), message: z.string().nullable() }),
+    dataDeleted: z.boolean(),
+  }),
+});
+
 /** Admin: proposes closing the room (keys 6.8). */
 export const roomsV2CloseProposed = defineRpc({ name: "rooms.v2.room.close.propose", input: RoomIdIn.extend(Confirmed), output: Seq.extend({ proposal: z.string(), earliest: z.number().int() }) });
 
@@ -602,4 +713,31 @@ export const roomsV2RecoveryAct = defineRpc({
   }),
   /** `recovery`: the new recovery code of a `rotate`, offered once like at creation. */
   output: Seq.extend({ freshAdminKid: z.string().optional(), recovery: RecoveryOfferV2.optional() }),
+});
+
+/**
+ * R3.3: sets the room name (an admin of the room) or this member's display name. Both travel only
+ * inside the room's MLS group (room.profile, member.profile): the host never sees them. Display-only,
+ * untrusted text; sanitized on both sides. Not admin statements, so no confirmation token.
+ */
+export const roomsV2RoomProfileSet = defineRpc({
+  name: "rooms.v2.room.profile.set",
+  input: RoomIdIn.extend({ name: z.string().min(1).max(200), description: z.string().max(1000).optional() }),
+  output: Seq,
+});
+
+export const roomsV2MemberProfileSet = defineRpc({
+  name: "rooms.v2.member.profile.set",
+  input: RoomIdIn.extend({ displayName: z.string().min(1).max(200) }),
+  output: Seq,
+});
+
+/**
+ * R3.5: acknowledges alerts on this device (their notice is hidden; the activity feed keeps them). It
+ * changes nothing an alert stopped: sending stays stopped after a fork, truncation or invalid entry.
+ */
+export const roomsV2AlertsAck = defineRpc({
+  name: "rooms.v2.alerts.ack",
+  input: RoomIdIn.extend({ alerts: z.array(z.object({ type: z.string().regex(/^[a-z][a-z_.-]{0,39}$/), seq: z.number().int() })).min(1).max(64) }),
+  output: Ok.extend({ acked: z.number().int() }),
 });

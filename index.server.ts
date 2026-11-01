@@ -45,6 +45,13 @@ import {
   roomsV2RecoveryConfirm,
   roomsV2RecoveryAct,
   roomsV2AdminPrepare,
+  roomsV2LaneClose,
+  roomsV2RoomLeave,
+  roomsV2HostsCleanup,
+  roomsV2DataDelete,
+  roomsV2RoomProfileSet,
+  roomsV2MemberProfileSet,
+  roomsV2AlertsAck,
   type AdminActionKind,
   type AdminActionV2,
 } from "./shared/rpc-v2";
@@ -144,6 +151,10 @@ export default function contribute(server: PluginServerContext) {
     return { ok: true as const };
   });
   handle(roomsV2DeviceVeto, (i) => rt.vetoDevice(i.roomId, i.ref));
+  // R3.3, R3.5: names over MLS (the host never sees them) and alert acknowledgements on this device.
+  handle(roomsV2RoomProfileSet, (i) => rt.setRoomProfile(i.roomId, i.name, i.description));
+  handle(roomsV2MemberProfileSet, (i) => rt.setMemberProfile(i.roomId, i.displayName));
+  handle(roomsV2AlertsAck, (i) => rt.ackAlerts(i.roomId, i.alerts));
   handleAdmin(roomsV2DeviceApprove, "device.approve", (i) => rt.approveDevice(i.roomId, i.ref));
   handleAdmin(roomsV2ConflictResolve, "device.conflict.resolve", (i) => rt.resolveConflict(i.roomId, i.memberId));
   // DEVELOPMENT-ONLY unsigned chat path (until R3.4's sender signature): registered only on a marked
@@ -162,6 +173,12 @@ export default function contribute(server: PluginServerContext) {
   handleAdmin(roomsV2AdminKeyRevoke, "admin.key.revoke", (i) => rt.revokeAdminKey(i.roomId, i.kid, i.fromSeq));
   handleAdmin(roomsV2EndpointRotate, "endpoint.rotate", (i) => rt.rotateEndpoint(i.roomId));
   handleAdmin(roomsV2LaneRotate, "lane.rotate", (i) => rt.rotateLane(i.roomId, i.laneId));
+  // R3.2, R3.1, R3.7, R2.6: close a lane (admin token), leave a room and delete all data (typed word
+  // checked by the input schema; member actions, not admin statements), retry stale lane hosts.
+  handleAdmin(roomsV2LaneClose, "lane.close", (i) => rt.closeLane(i.roomId, i.laneId));
+  handle(roomsV2RoomLeave, (i) => rt.leaveRoom(i.roomId));
+  handle(roomsV2HostsCleanup, () => rt.cleanUpStaleHosts());
+  handle(roomsV2DataDelete, (i) => rt.deleteAllData({ deleteHosted: i.deleteHosted === true }));
   handleAdmin(roomsV2CloseProposed, "room.close.propose", (i) => rt.proposeClose(i.roomId));
   handleAdmin(roomsV2CloseConfirm, "room.close.confirm", (i) => rt.confirmClose(i.roomId, i.proposal));
   handleAdmin(roomsV2RecoveryCreate, "recovery.create", (i) => rt.createRecoveryKey(i.roomId));

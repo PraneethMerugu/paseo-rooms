@@ -564,3 +564,25 @@ test("admin hold clock: the hold runs on the admin daemon's own clock from first
   again.observe(st);
   assert.equal(again.firstSeen(ref), undefined);
 });
+
+test("R3.1: a device of a member with two active devices leaves alone (device.removed, self); the other device stays", async () => {
+  const env = await linkEnv();
+  try {
+    const { owner, phone } = env;
+    const { roomId, room, req, memberId } = await linkPhone(owner, phone);
+    owner.advanceTestClock(72 * HOUR + 1000);
+    await until("approved", () => room().deviceRequests[0].status === "approved", 5000);
+    const b = () => phone.status().joined.find((j) => j.roomId === roomId);
+    await until("B open and synced with two devices", () => b()?.status === "open" && b()?.memberDevices === 2, 5000);
+    const res = await phone.leaveRoom(roomId);
+    assert.equal(res.statement, "device.removed", "one of several devices removes only itself");
+    const m = owner.ownedHostState(roomId).members[memberId];
+    assert.deepEqual(m.devices.map((d) => d.deviceId), [owner.status().joined.find((j) => j.roomId === roomId)!.deviceId], "A stays; the membership stays");
+    assert.ok(!m.devices.some((d) => d.deviceId === req.deviceId));
+    assert.equal(b(), undefined);
+    // A is the creator's own device on the hosting daemon: a host does not leave its own room.
+    await assert.rejects(owner.leaveRoom(roomId), /host cannot leave/);
+  } finally {
+    await env.cleanup();
+  }
+});

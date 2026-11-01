@@ -8,9 +8,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Text, View } from "react-native";
 import { roomsMigrationDeleteKeys, roomsMigrationDismiss, roomsPermissionsFix } from "../shared/rpc";
-import { roomsV2LaneCreate, roomsV2RoomCreate, roomsV2Status } from "../shared/rpc-v2";
+import { roomsV2DataDelete, roomsV2HostsCleanup, roomsV2LaneCreate, roomsV2RoomCreate, roomsV2Status } from "../shared/rpc-v2";
 import { Button, commandCenterHint, errorText, Section, Segmented, useStyles, type Styles } from "./ui";
-import { RecoveryCodeModal, useAdminConfirm, type RecoveryOffer } from "./v2-dialogs";
+import { RecoveryCodeModal, TypedConfirm, useAdminConfirm, type RecoveryOffer } from "./v2-dialogs";
 import { JoinedCardV2, JoinFormV2, JoiningCardV2 } from "./v2-member";
 import { OwnedRoomCardV2, STATUS_V2_KEY, type OwnedV2 } from "./v2-owner";
 import { keystoreText, shortId, WINDOWS_DURABILITY } from "./v2-text";
@@ -71,6 +71,7 @@ export function RoomsV2Screen({ theme, layout, navigation }: PluginScreenProps) 
       ) : null}
 
       {s ? <About s={s} theme={theme} styles={styles} /> : null}
+      {s?.state === "ready" || s?.error === "data_deleted" ? <DeleteAllData s={s} theme={theme} styles={styles} /> : null}
     </ScrollView>
   );
 }
@@ -128,7 +129,12 @@ function RuntimeNotices({ s, theme, styles }: { s: Status; theme: PluginTheme; s
           />
         </View>
       ) : null}
-      {s.state === "error" && !s.permissionProblems?.length && !ksText ? (
+      {s.staleHosts?.length ? <StaleHostsNotice s={s} theme={theme} styles={styles} /> : null}
+      {s.state === "error" && s.error === "data_deleted" ? (
+        <View style={box("warn")}>
+          <Text style={styles.body}>Rooms data and keys were deleted on this daemon. Rooms stays stopped until the daemon restarts; it then starts empty. To uninstall, remove the plugin now.</Text>
+        </View>
+      ) : s.state === "error" && !s.permissionProblems?.length && !ksText ? (
         <View style={box("danger")}>
           <Text style={styles.body}>Rooms could not start: {s.error ?? "unknown error"}</Text>
         </View>
@@ -275,6 +281,110 @@ function CreateRoomButton({ theme, styles }: { theme: PluginTheme; styles: Style
       ) : null}
       <RecoveryCodeModal theme={theme} styles={styles} offer={offer?.offer ?? null} context={`Recovery key for room ${shortId(offer?.roomId)}.`} onClosed={() => setOffer(null)} />
     </>
+  );
+}
+
+/** R3.7: routed lane hosts the plugin could not remove from this daemon's host list. */
+function StaleHostsNotice({ s, theme, styles }: { s: Status; theme: PluginTheme; styles: Styles }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const cleanup = useRpc(roomsV2HostsCleanup);
+  const [busy, setBusy] = useState(false);
+  const hosts = s.staleHosts ?? [];
+  return (
+    <View style={[styles.codeBox, { borderLeftWidth: 3, borderLeftColor: theme.colors.statusWarning, gap: 6 }]}>
+      <Text style={styles.body}>
+        {hosts.length} lane host(s) from rooms you left or lanes that closed are still in this daemon's host list. They no longer connect. Rooms retries removing them.
+      </Text>
+      {hosts.slice(0, 6).map((h) => (
+        <Text key={h.registrationId} style={styles.small}>
+          {h.label} · {h.reason.replace(/_/g, " ")}
+          {h.lastError === "no_api" ? " · Paseo was not reachable from Rooms yet" : h.lastError ? ` · ${h.lastError}` : ""}
+        </Text>
+      ))}
+      <Text style={styles.small}>If they stay, disable them in Paseo's host list. Paseo lets only Rooms itself delete them, so remove them here before you remove the plugin.</Text>
+      <Button
+        theme={theme}
+        label="Retry now"
+        busy={busy}
+        onPress={() => {
+          setBusy(true);
+          void cleanup({})
+            .then((r) => (r.remaining.length ? toast.error(`${r.remaining.length} host(s) could not be removed yet.`) : toast.show("Lane hosts removed", { variant: "success" })))
+            .catch((e) => toast.error(errorText(e)))
+            .finally(() => {
+              setBusy(false);
+              void qc.invalidateQueries({ queryKey: STATUS_V2_KEY });
+            });
+        }}
+      />
+    </View>
+  );
+}
+
+/**
+ * R2.6 "Leave all rooms and delete keys": the typed confirmation lists what happens. Hosted rooms need
+ * an extra choice, because they stop for good and their members lose access.
+ */
+function DeleteAllData({ s, theme, styles }: { s: Status; theme: PluginTheme; styles: Styles }) {
+  const qc = useQueryClient();
+  const del = useRpc(roomsV2DataDelete);
+  const [open, setOpen] = useState(false);
+  const [hostedToo, setHostedToo] = useState(false);
+  const [result, setResult] = useState<Awaited<ReturnType<typeof del>> | null>(null);
+  const joined = s.joined.length + s.joining.filter((j) => !s.joined.some((x) => x.roomId === j.roomId)).length;
+  const hosted = s.owned.length;
+  const backend = s.keystore?.backend ?? "unknown";
+  return (
+    <Section styles={styles} title="Remove Rooms from this daemon" trailing={<Button theme={theme} label={open ? "Hide" : "Show"} onPress={() => setOpen((v) => !v)} />}>
+      {open && s.state === "ready" ? (
+        <View style={{ gap: 8 }}>
+          <Text style={styles.small}>
+            Before you remove the plugin, leave your rooms and delete the keys here. Removing the plugin alone leaves the room keys, the keyring entry and the lane hosts behind (see the README).
+          </Text>
+          {hosted > 0 ? (
+            <View style={styles.row}>
+              <Button theme={theme} variant={hostedToo ? "danger" : "secondary"} label={hostedToo ? `Also delete ${hosted} hosted room(s): yes` : `Also delete ${hosted} hosted room(s)`} onPress={() => setHostedToo((v) => !v)} />
+              <Text style={[styles.small, { flexShrink: 1 }]}>Required while this daemon hosts rooms.</Text>
+            </View>
+          ) : null}
+          <TypedConfirm
+            theme={theme}
+            styles={styles}
+            label="Leave all rooms and delete keys"
+            title="Leave all rooms and delete keys"
+            word="delete"
+            onConfirm={() =>
+              del({ confirm: "delete", ...(hostedToo ? { deleteHosted: true } : {}) }).then((r) => {
+                setResult(r);
+                void qc.invalidateQueries({ queryKey: STATUS_V2_KEY });
+              })
+            }
+          >
+            <Text style={styles.body}>This daemon leaves {joined} joined room(s). Each owner sees that you left. Rooms that cannot be reached now are only forgotten here; their owners still list you.</Text>
+            <Text style={styles.body}>Every lane host Rooms added to this daemon's host list is removed.</Text>
+            <Text style={styles.body}>The room key in {backend} and every Rooms file on this daemon are deleted. This cannot be undone.</Text>
+            {hosted > 0 ? (
+              <Text style={[styles.body, { color: theme.colors.statusDanger }]}>
+                {hostedToo ? `${hosted} room(s) hosted here stop for good. Their members lose access and the rooms cannot be recovered.` : `This daemon hosts ${hosted} room(s). Choose "Also delete hosted rooms" first, or the request is refused.`}
+              </Text>
+            ) : null}
+          </TypedConfirm>
+        </View>
+      ) : null}
+      {result ? (
+        <View style={[styles.codeBox, { gap: 4 }]}>
+          <Text style={styles.body}>
+            Left {result.left.filter((l) => l.statement).length} room(s), forgot {result.left.filter((l) => !l.statement).length}. Removed {result.hostsRemoved} lane host(s).
+          </Text>
+          {result.hostsRemaining.length ? <Text style={styles.small}>{result.hostsRemaining.length} lane host(s) could not be removed. Disable them in Paseo's host list.</Text> : null}
+          <Text style={styles.small}>
+            Room key: {result.keystore.kek}
+            {result.keystore.message ? ` (${result.keystore.message})` : ""}. Rooms files deleted: {result.dataDeleted ? "yes" : "no"}.
+          </Text>
+        </View>
+      ) : null}
+    </Section>
   );
 }
 

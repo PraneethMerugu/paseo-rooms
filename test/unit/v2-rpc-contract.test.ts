@@ -29,7 +29,11 @@ test("I-14 contracts: every admin action kind has exactly one action RPC, and it
   assert.deepEqual(withToken.sort(), ADMIN_KINDS.map((k) => `rooms.v2.${k}`).sort());
   for (const c of V2.filter((x) => withToken.includes(x.name))) assert.equal(c.input.safeParse({ roomId: `room_${"a".repeat(32)}` }).success, false, `${c.name} without a token`);
   // Member-side and code-based calls take no token.
-  for (const name of ["rooms.v2.device.rekey", "rooms.v2.device.veto", "rooms.v2.recovery.act", "rooms.v2.join.reject", "rooms.v2.invite.revoke", "rooms.v2.link.confirm"]) assert.ok(!withToken.includes(name), name);
+  for (const name of ["rooms.v2.device.rekey", "rooms.v2.device.veto", "rooms.v2.recovery.act", "rooms.v2.join.reject", "rooms.v2.invite.revoke", "rooms.v2.link.confirm", "rooms.v2.room.leave", "rooms.v2.data.delete", "rooms.v2.hosts.cleanup"]) assert.ok(!withToken.includes(name), name);
+  // R3.1, R2.6: the typed word is part of the input (the dialog's confirmation), not an admin token.
+  assert.equal(v2.roomsV2RoomLeave.input.safeParse({ roomId: `room_${"a".repeat(32)}` }).success, false);
+  assert.equal(v2.roomsV2RoomLeave.input.safeParse({ roomId: `room_${"a".repeat(32)}`, confirm: "leave" }).success, true);
+  assert.equal(v2.roomsV2DataDelete.input.safeParse({ confirm: "yes" }).success, false);
   assert.equal(new Set(V2.map((c) => c.name)).size, V2.length, "names unique");
 });
 
@@ -153,6 +157,20 @@ test("I-14 contracts through the server entry: handlers, shapes, tokens, stale_b
     assert.equal(room.keys.recoveryKid, created.recovery.kid);
     assert.deepEqual(room.keys.recoveryProposals, []);
     assert.equal(room.policy.deviceAddApproval, "same-person");
+    // R3.3, R3.5, R3.6 through the entry: the room name is sent inside the owner's MLS group (not in
+    // the host log), the activity comes from the owner device's fold, acknowledgements are kept.
+    assert.equal(room.roomName, null);
+    assert.match(room.adminFingerprint ?? "", /^[a-z2-7]{4}(-[a-z2-7]{4}){7}$/);
+    assert.ok(room.activity.some((a) => a.type === "member.admitted" && a.memberId === room.roster[0].memberId), JSON.stringify(room.activity));
+    const named = await call(v2.roomsV2RoomProfileSet, { roomId, name: "  Bench   A  " });
+    await call(v2.roomsV2MemberProfileSet, { roomId, displayName: "Owner" });
+    const sNamed = (await call(v2.roomsV2Status, {})).owned.find((r) => r.roomId === roomId)!;
+    assert.equal(sNamed.roomName, "Bench A");
+    assert.equal(sNamed.roster[0].displayName, "Owner");
+    assert.ok(sNamed.head.seq >= named.seq);
+    await assert.rejects(call(v2.roomsV2RoomProfileSet, { roomId, name: String.fromCharCode(0x200b) }), /1 to 64 visible characters/);
+    assert.deepEqual(await call(v2.roomsV2AlertsAck, { roomId, alerts: [{ type: "fork", seq: 1 }] }), { ok: true, acked: 1 });
+    assert.deepEqual(await call(v2.roomsV2AlertsAck, { roomId, alerts: [{ type: "fork", seq: 1 }] }), { ok: true, acked: 0 });
     const skipped = await call(v2.roomsV2RoomCreate, {});
     assert.equal(skipped.recovery, null, "the RPC default is skip");
     assert.match(skipped.recoverySkippedWarning ?? "", /cannot be recovered/);

@@ -25,6 +25,10 @@
 //   `rotateLaneOnRemove = "always"`) must rotate.
 // - Project names (13.2): shown only when `policy.projectNames == "lane-owner"` and the lane's
 //   `showNames`; otherwise the neutral label. Viewer errors carry an error reference (13.1).
+// - Closing (R3.2): once `lane.closed` is in the log, `sync` stops the endpoint (its links and views
+//   are cut; the grants were dropped by HostGrants before the append) and deletes the lane's endpoint
+//   key from keys.sealed: a closed lane never reopens (room-log-v2 4.4). The binding stays for the
+//   owner's view ("Agents from closed rooms").
 import { randomBytes } from "node:crypto";
 import nodePath from "node:path";
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -86,6 +90,8 @@ export class LaneService {
   private stopped = false;
   /** Lanes whose agent is gone: no endpoint is started again in this process (C-13). */
   private readonly gone = new Set<string>();
+  /** Closed lanes whose endpoint key is already deleted (checked once per process). */
+  private readonly keysForgotten = new Set<string>();
 
   constructor(private readonly o: LaneServiceOptions) {
     this.bindings = this.readBindings();
@@ -199,6 +205,7 @@ export class LaneService {
       }
       ep.setProjectNamesVisible(namesShown(s, laneId));
     }
+    this.forgetClosedLaneKeys();
     for (const b of this.bindings) {
       const l = s.auth.lanes[b.laneId];
       if (!l || l.status === "closed" || s.auth.closed || this.endpoints.has(b.laneId) || this.gone.has(b.laneId)) continue;
@@ -207,6 +214,30 @@ export class LaneService {
       this.endpoints.set(b.laneId, ep);
       this.served.set(b.laneId, l.offer.serverId);
       if (this.o.autostart !== false) void ep.start();
+    }
+  }
+
+  /** R3.2 teardown: the endpoint keys (current and staged) of closed lanes are deleted. */
+  private forgetClosedLaneKeys(): void {
+    const s = this.o.host.state;
+    const closed = Object.entries(s.auth.lanes).filter(([id, l]) => l.status === "closed" && !this.keysForgotten.has(id)).map(([id]) => id);
+    if (closed.length === 0) return;
+    const keys = readHostKeys(this.o.dataDir, this.o.kek, this.roomId);
+    if (!keys) return;
+    const lanes = { ...keys.lanes };
+    const next = { ...(keys.lanesNext ?? {}) };
+    let changed = false;
+    for (const id of closed) {
+      if (lanes[id] || next[id]) changed = true;
+      delete lanes[id];
+      delete next[id];
+    }
+    try {
+      if (changed) writeHostKeys(this.o.dataDir, this.o.kek, { ...keys, lanes, ...(keys.lanesNext ? { lanesNext: next } : {}) });
+      for (const id of closed) this.keysForgotten.add(id);
+      if (changed) log("v2_lane_keys_deleted", { roomId: this.roomId, lanes: closed.length });
+    } catch (e) {
+      log("v2_lane_keys_delete_failed", { roomId: this.roomId, error: String((e as Error)?.message ?? e).slice(0, 160) });
     }
   }
 

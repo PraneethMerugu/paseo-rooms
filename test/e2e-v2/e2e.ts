@@ -242,6 +242,13 @@ async function main() {
   const laneUp = await attempt(() => until("lane endpoint online", async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.lanes.find((l: any) => l.laneId === laneId)?.endpoint === "online", 30_000));
   check("lane created (lane.created in the log) and its endpoint online on the relay", laneUp.ok, laneUp.ok ? { laneId } : { error: laneUp.error });
   const so2 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
+  // Room 2 (section 9b, R3.1 and R3.2): created now, while the owner's TEST-ONLY clock still equals the
+  // wall clock, with two lanes of the same shared agent. A member joins it only in 9b.
+  const room2 = (await rpc(o, "rooms.v2.room.create", {})).roomId as string;
+  const owned2 = async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === room2);
+  await until("room 2 endpoint online", async () => (await owned2())?.endpoint === "online", 30_000);
+  const l1 = await adminRpc(o, "rooms.v2.lane.create", { roomId: room2, agentId: agent.id, label: "Close me" });
+  const l2 = await adminRpc(o, "rooms.v2.lane.create", { roomId: room2, agentId: agent.id, label: "Keep me" });
   check("grant lifetime is the development short value (switch on the host only)", so2?.grantTtlS === GRANT_TTL_S, { grantTtlS: so2?.grantTtlS });
   const invite = await adminRpc(o, "rooms.v2.invite.create", { roomId, lanes: [laneId], note: "for the e2e member", roomName: "E2E room" });
   const code: string = invite.code;
@@ -316,6 +323,23 @@ async function main() {
   const groupOf = async (c: any) => (await rpc(c, "rooms.v2.status", {})).mls.find((r: any) => r.roomId === roomId);
   const aGroup = await attempt(() => until("A in the room group", async () => ((await groupOf(m))?.inGroup ? Date.now() - t1 : null), 55_000, 100));
   check("prompt Add: A is in the room group well under the 60 s repair delay after admission", aGroup.ok && aGroup.value < 20_000, aGroup.ok ? { ms: aGroup.value, repairDelayMs: 60_000 } : { error: aGroup.error });
+  // R3.3: the owner (an admin) names the room and A sets its display name; both travel only inside the
+  // room group. Random markers: the scan at the end looks for them in the host's files and logs.
+  const roomNameMark = `E2E Bench ${randomUUID().slice(0, 8)}`;
+  const aNameMark = `E2E Sam ${randomUUID().slice(0, 8)}`;
+  const named = await attempt(async () => {
+    await rpc(o, "rooms.v2.room.profile.set", { roomId, name: roomNameMark });
+    // A may send once its group epoch is confirmed (the owner's witness, within about a second).
+    return until("A sent its display name", async () => (await attempt(() => rpc(m, "rooms.v2.member.profile.set", { roomId, displayName: aNameMark }))).ok || null, 20_000, 500);
+  });
+  const namesSeen = await attempt(() => until("names delivered", async () => {
+    const aView = (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+    const row = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.roster.find((x: any) => x.memberId === aView?.memberId);
+    return aView?.roomName === roomNameMark && row?.displayName === aNameMark ? { aView, row } : null;
+  }, 20_000, 250));
+  check("R3.3: the room name reaches member A and A's display name reaches the owner (MLS room.profile, member.profile)", named.ok && namesSeen.ok, named.ok ? (namesSeen.ok ? { collision: namesSeen.value.row.nameCollision } : { error: namesSeen.error }) : { error: named.error });
+  const aActivity = namesSeen.ok ? (namesSeen.value.aView.activity as any[]) : [];
+  check("R3.5: A's activity feed (its own fold) shows its admission and the lane", aActivity.some((x) => x.type === "member.admitted" && x.memberId === (namesSeen.ok ? namesSeen.value.aView.memberId : null)) && aActivity.some((x) => x.type === "lane.created" && x.laneId === laneId), { types: aActivity.map((x) => x.type).slice(0, 12) });
   const ownerView = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
   const memberJoined = (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
   check("owner sees the member in the roster and the invite used", ownerView?.members === 2 && ownerView.invites[0]?.state === "used" && ownerView.joinRequests[0]?.memberId === memberJoined?.memberId, { members: ownerView?.members, invite: ownerView?.invites[0]?.state });
@@ -546,6 +570,15 @@ async function main() {
   check("MLS: A's epoch (two-leaf group) is confirmed by the one other leaf", aJoinState === "confirmed", { join: aJoinState });
   const bJoinState = (await mlsOf(m2))?.join;
   check("MLS: B's epoch is confirmed by the witnesses of two other leaves", bJoinState === "confirmed", { join: bJoinState });
+  // R3.3: B joined after both names were sent and cannot read earlier epochs; it learns them from the
+  // re-announcements after the commit that added it.
+  const bNames = await attempt(() => until("B learned the names", async () => {
+    const j = (await rpc(m2, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === roomId);
+    return j?.roomName === roomNameMark && j.names.some((n: any) => n.name === aNameMark) ? j : null;
+  }, 20_000, 250));
+  check("R3.3: device B, added later, learns the room name and the member's display name from re-announcements", bNames.ok, bNames.ok ? {} : { error: bNames.error });
+  const bActivity = bNames.ok ? (bNames.value.activity as any[]) : [];
+  check("R3.5: B's activity feed shows its own device add approved", bActivity.some((x) => x.type === "device.add.approved" && x.deviceId === (bNames.ok ? bNames.value.deviceId : null)), { types: bActivity.map((x) => x.type).slice(0, 12) });
   const mark = (w: string) => `e2e-mls-${w}-${randomUUID()}`;
   const alpha = mark("alpha");
   const bravo = mark("bravo");
@@ -666,6 +699,74 @@ async function main() {
   const [aAfter, bAfter] = await Promise.all([m, m2].map(mlsOf));
   const [aTexts, bTexts] = await Promise.all([m, m2].map(textsOf));
   check("MLS: the removed devices cannot read the next message and stay at the old epoch", !aTexts.includes(charlie) && !bTexts.includes(charlie) && aAfter.epoch < ownerAfter.epoch && bAfter.epoch < ownerAfter.epoch, { aEpoch: aAfter?.epoch, bEpoch: bAfter?.epoch, ownerEpoch: ownerAfter?.epoch });
+  // ------------------------------------------------------------ 9b. close a lane and leave a room (R3.2, R3.1, R3.7)
+  // A second room on the owner with two lanes of the shared agent; device A joins it (SAS compared as
+  // above) and registers both lanes as routed hosts. The owner closes lane 1: an open view through it
+  // is cut, its grant leaves the allowlist, and A removes that routed host while lane 2 stays. Then A,
+  // the member's only device, leaves (member.left): the owner's roster drops it, A removes the routed
+  // host of lane 2 and deletes its keys and data for the room; room 1 on A is untouched.
+  // Room 2 and its lanes were created in step 2, before the TEST-ONLY clock moved: grants carry the
+  // wall clock and must not predate the host key's `validFrom` (the genesis hts).
+  await until("room 2 lanes online", async () => (await owned2())?.lanes.every((l: any) => l.endpoint === "online"), 30_000);
+  const invite2 = await adminRpc(o, "rooms.v2.invite.create", { roomId: room2, lanes: [l1.laneId, l2.laneId], note: "R3 e2e", roomName: "E2E room 2" });
+  await rpc(m, "rooms.v2.join.start", { code: invite2.code, label: "E2E member laptop", ...(LIVE ? {} : { trustRelay: true }) });
+  const join2 = async () => (await rpc(m, "rooms.v2.status", {})).joining.find((r: any) => r.roomId === room2);
+  const sas2 = await until("room 2 member SAS", async () => (await join2())?.sas, 30_000);
+  const card2 = await until("room 2 owner SAS", async () => (await owned2())?.joinRequests[0]?.sas && (await owned2()).joinRequests[0], 30_000);
+  if (sas2 !== card2.sas) throw new Error("SAS mismatch in room 2: refusing to confirm");
+  await rpc(m, "rooms.v2.join.confirm", { roomId: room2, match: true });
+  await until("room 2 member_ok", async () => (await owned2())?.joinRequests[0]?.state === "member_ok", 30_000);
+  await adminRpc(o, "rooms.v2.join.admit", { roomId: room2, pendingId: card2.pendingId });
+  const hostOf = (laneId: string) => origin.listHosts().then((d: any) => d.hosts.find((h: any) => h.source?.key === laneId));
+  const both = await attempt(() => until("room 2: both lanes online on the member", async () => (await hostOf(l1.laneId))?.status === "online" && (await hostOf(l2.laneId))?.status === "online", 60_000, 250));
+  check("room 2: A joined and both lanes are routed hosts on the member", both.ok, both.ok ? {} : { error: both.error });
+  const joined2 = async () => (await rpc(m, "rooms.v2.status", {})).joined.find((r: any) => r.roomId === room2);
+  const memberId2 = (await joined2())?.memberId;
+  const lane1ServerId = (await owned2()).lanes.find((l: any) => l.laneId === l1.laneId).serverId;
+  const rid = randomUUID();
+  const view1: any = new DaemonClient({ url: "ws://routed-host/ws", clientId: rid, clientType: "mobile", appVersion: "0.13.2", transportFactory: createHostChannelTransport(origin, lane1ServerId, rid, null) } as any);
+  const v1Status: Array<{ at: number; status: string }> = [];
+  view1.subscribeConnectionStatus((x: any) => v1Status.push({ at: Date.now(), status: x.status }));
+  const v1 = await attempt(() => until("view through lane 1", async () => (await attempt(() => view1.connect())).ok, 30_000, 1000));
+  check("room 2: a routed view through lane 1 is open before the close", v1.ok && (await attempt(() => view1.fetchAgent(agent.id))).ok);
+  const nClose = await attempt(() => rpc(o, "rooms.v2.lane.close", { roomId: room2, laneId: l1.laneId }));
+  check("R3.2: closing a lane without a confirmation token is refused", !nClose.ok, { error: nClose.ok ? null : nClose.error });
+  const prepClose = await rpc(o, "rooms.v2.admin.prepare", { action: { kind: "lane.close", roomId: room2, laneId: l1.laneId } });
+  check("R3.2: the close dialog asks to type close", prepClose.description.typeToConfirm === "close", { title: prepClose.description.title });
+  const vBefore = v1Status.length;
+  const tClose = Date.now();
+  const closed = await rpc(o, "rooms.v2.lane.close", { roomId: room2, laneId: l1.laneId, confirmToken: prepClose.confirmToken });
+  const viewCut = await attempt(() => until("lane 1 view cut", () => v1Status.slice(vBefore).find((x) => x.status !== "connected"), 10_000, 5));
+  check("R3.2: closing the lane cuts its open view at once", viewCut.ok && viewCut.value.at - tClose < 2000, viewCut.ok ? { cutAfterMs: viewCut.value.at - tClose, seq: closed.seq } : { error: viewCut.error });
+  await view1.close().catch(() => undefined);
+  const o2 = await owned2();
+  const ol1 = o2.lanes.find((l: any) => l.laneId === l1.laneId);
+  check("R3.2: owner shows lane 1 closed, no link, no grant for it; lane 2 open with its grant", ol1?.status === "closed" && ol1.links === 0 && !o2.grants.some((g: any) => g.laneId === l1.laneId) && o2.grants.some((g: any) => g.laneId === l2.laneId) && o2.persistError === null, { status: ol1?.status, grants: o2.grants.map((g: any) => g.laneId === l1.laneId ? "l1" : "l2") });
+  const reclose = await attempt(() => adminRpc(o, "rooms.v2.lane.close", { roomId: room2, laneId: l1.laneId }));
+  check("R3.2: a closed lane cannot be closed again", !reclose.ok && /already closed/.test(reclose.error), { error: reclose.ok ? null : reclose.error });
+  const l1Gone = await attempt(() => until("lane 1 host removed on the member", async () => !(await hostOf(l1.laneId)) && (await hostOf(l2.laneId))?.status === "online", 20_000, 250));
+  check("R3.7: the member removes the routed host of the closed lane; lane 2's host stays online", l1Gone.ok, l1Gone.ok ? {} : { error: l1Gone.error });
+  const memberLanes2 = (await joined2())?.lanes.map((l: any) => l.laneId) ?? [];
+  check("R3.7: the member's view lists only lane 2", memberLanes2.length === 1 && memberLanes2[0] === l2.laneId, { lanes: memberLanes2.length });
+  const badLeave = await attempt(() => rpc(m, "rooms.v2.room.leave", { roomId: room2 }));
+  check("R3.1: leaving without the typed word is refused", !badLeave.ok, { error: badLeave.ok ? null : badLeave.error.slice(0, 80) });
+  await until("A synced in room 2", async () => (await joined2())?.memberDevices === 1, 15_000);
+  const left = await attempt(() => rpc(m, "rooms.v2.room.leave", { roomId: room2, confirm: "leave" }));
+  check("R3.1: A (the member's only device) leaves with member.left; both lane hosts were handled", left.ok && left.value.statement === "member.left" && left.value.hostsRemaining.length === 0, left.ok ? { seq: left.value.seq, hostsRemoved: left.value.hostsRemoved } : { error: left.error });
+  const ownerAfterLeave = await until("owner roster without the member", async () => {
+    const r = await owned2();
+    return r && !r.roster.some((x: any) => x.memberId === memberId2) && r.sessions.length === 0 && r.grants.length === 0 ? r : null;
+  }, 15_000).catch(() => null);
+  check("R3.1: the owner's roster drops the member; no session and no grant remain in room 2", !!ownerAfterLeave, { members: ownerAfterLeave?.members });
+  const l2Gone = await attempt(() => until("lane 2 host removed", async () => !(await hostOf(l2.laneId)), 20_000, 250));
+  check("R3.1: the member removed the routed host of lane 2 (no lane host of room 2 is left)", l2Gone.ok, l2Gone.ok ? {} : { error: l2Gone.error });
+  const sAfter = await rpc(m, "rooms.v2.status", {});
+  const dir2 = join(MEMBER, "plugin-data", "rooms", "member", "rooms", room2);
+  check("R3.1: room 2 is gone from the member's status and its member data folder is deleted; room 1 stays", !sAfter.joined.some((r: any) => r.roomId === room2) && !sAfter.joining.some((r: any) => r.roomId === room2) && !existsSync(dir2) && sAfter.joined.some((r: any) => r.roomId === roomId) && (sAfter.staleHosts ?? []).length === 0, { staleHosts: (sAfter.staleHosts ?? []).length });
+  const ownerLog2 = (await owned2())?.head.seq;
+  log("room2_done", { ownerHead: ownerLog2 });
+  ROOM2 = room2;
+
   await origin.close().catch(() => undefined);
 
   // ------------------------------------------------------------ 8. files, logs and relay evidence
@@ -722,6 +823,29 @@ async function main() {
     for (const x of [alpha, bravo, charlie]) if (text.includes(x.slice(8))) markerHits.push("relay-log");
   }
   const hostFiles = files(join(OWNER, "plugin-data", "rooms", "host"));
+  // R3.3: the room name and the display name appear in no host file, no log and no plugin file in
+  // plaintext. The room name is expected only in a member's Paseo hosts.json (the lane host label).
+  const nameHits: string[] = [];
+  const hostNameHits: string[] = [];
+  for (const [label, home] of [["owner", OWNER], ["member", MEMBER], ["member2", MEMBER2]] as const) {
+    for (const f of files(home)) {
+      if (/node_modules|\/plugins\//.test(f)) continue;
+      const text = readFileSync(f).toString("latin1");
+      const rel = f.slice(home.length + 1);
+      if (text.includes(aNameMark)) nameHits.push(`${label}:${rel}:display`);
+      if (text.includes(roomNameMark) && !(label !== "owner" && /(^|\/)hosts\.json$/.test(rel))) nameHits.push(`${label}:${rel}:room`);
+    }
+  }
+  for (const f of hostFiles) {
+    const text = readFileSync(f).toString("latin1");
+    if (text.includes(roomNameMark) || text.includes(aNameMark)) hostNameHits.push(f.slice(OWNER.length + 1));
+  }
+  if (RELAY_LOG && existsSync(RELAY_LOG)) {
+    const text = readFileSync(RELAY_LOG).toString("latin1");
+    if (text.includes(roomNameMark) || text.includes(aNameMark)) nameHits.push("relay-log");
+  }
+  check("R3.3: no room name or display name in plaintext in any host file (log, bodies, delivery state)", hostNameHits.length === 0 && hostFiles.length > 0, { found: hostNameHits, hostFilesScanned: hostFiles.length });
+  check("R3.3: names in no other file or log either (the room name only in a member's hosts.json lane label)", nameHits.length === 0, { found: [...new Set(nameHits)] });
   check("MLS: no message text in any file of any home or the relay log (host files included)", markerHits.length === 0 && hostFiles.some((f) => /mls\.sealed$/.test(f)), { found: [...new Set(markerHits)], hostFilesScanned: hostFiles.length });
   const badModes = Object.entries(modes).filter(([k, v]) => (k.endsWith("rooms") || k.endsWith("/") ? v !== "700" : v !== "600"));
   check("plugin data modes: every directory 0700 and every file 0600 (sealed files included)", badModes.length === 0, { bad: badModes, checked: Object.keys(modes).length });
@@ -746,6 +870,22 @@ async function main() {
   check("room log: hash chain, host and statement signatures verify by an independent fold of the owner's file", logCheck.ok && logCheck.value.head.seq === ownerHead?.seq && logCheck.value.head.hash === ownerHead?.hash, logCheck.ok ? { entries: logCheck.value.entries, headSeq: logCheck.value.head.seq } : { error: logCheck.error });
   for (const t of ["member.admitted", "lane.created", "grant.issued", "host.key.rotated", "device.added", "member.removed", "mls.commit"])
     check(`room log has ${t}`, logCheck.ok && (logCheck.value.types[t] ?? 0) > 0, logCheck.ok ? {} : { error: "no log" });
+  // Room 2 (R3.1, R3.2): the same independent fold accepts lane.closed (admin) and member.left (the device).
+  const host2 = join(OWNER, "plugin-data", "rooms", "host", ROOM2);
+  const log2 = await attempt(async () => {
+    const fold = RoomLogFold.fromGenesis(new Uint8Array(readFileSync(join(host2, "genesis.json"))));
+    const bodies = readFileSync(join(host2, "log", "bodies.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const entries = readFileSync(join(host2, "log", "entries.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const types: Record<string, number> = {};
+    for (const e of entries) {
+      const b = bodies.find((x: any) => x.seq === e.entry.seq);
+      fold.append(e, b ? new Uint8Array(Buffer.from(b.body, "base64url")) : undefined);
+      types[e.entry.type] = (types[e.entry.type] ?? 0) + 1;
+    }
+    return { head: fold.head, types };
+  });
+  const head2 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === ROOM2)?.head;
+  check("room 2 log: verifies by an independent fold and holds lane.closed and member.left", log2.ok && log2.value.head.hash === head2?.hash && (log2.value.types["lane.closed"] ?? 0) === 1 && (log2.value.types["member.left"] ?? 0) === 1, log2.ok ? { types: { closed: log2.value.types["lane.closed"], left: log2.value.types["member.left"] } } : { error: log2.error });
   if (!LIVE && RELAY_LOG && existsSync(RELAY_LOG)) {
     const lines = readFileSync(RELAY_LOG, "utf8");
     check("traffic went through the local fake relay", /v2:server\(control\)/.test(lines) && /v2:client\(conn_/.test(lines) && /v2:server\(conn_/.test(lines));
@@ -802,6 +942,8 @@ async function main() {
 }
 
 const AGENT_IDS: string[] = [];
+/** The second room (R3.1, R3.2): its log is checked for lane.closed and member.left. */
+let ROOM2 = "";
 
 /** Archives the agents this run created (best effort); the daemons are stopped and the homes deleted afterwards. */
 async function archiveAgent(): Promise<void> {

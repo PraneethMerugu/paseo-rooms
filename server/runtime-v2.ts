@@ -27,6 +27,16 @@
 //
 // Lane agents (C-13): when a lane's agent is archived (hook agent.archived) or found archived or
 // missing at start, its lane endpoint stops at once and this daemon's admin key signs `lane.closed`.
+// An admin also closes a lane by hand (R3.2, `rooms.v2.lane.close`).
+//
+// Leaving and data hygiene (R3.1, R3.7, R2.6): a member leaves a room with `member.left` from its only
+// active device, or with `device.removed {reason: "self"}` from one of several (room-log-v2 4.3); the
+// lane hosts are removed through Paseo's hosts API and the device's keys and data for the room are
+// deleted. Lane hosts of a closed lane, of a lane the member no longer has, and of a room whose access
+// ended are removed the same way; what cannot be removed now is kept in member/stale-hosts.json,
+// retried, and shown. "Leave all rooms and delete keys" leaves every room, removes every lane host of
+// this plugin, deletes the KEK through the KeyStore and the plugin-data/rooms folder, and leaves the
+// runtime stopped (`data_deleted`).
 //
 // Device links (I-11): a member's active device creates a `prl2.` link code, answers the host's
 // `link.request` with its own nonce, compares the SAS on its own screen and signs `device.added`
@@ -86,7 +96,7 @@ import type { PendingView, InviteView } from "./host/enrollment";
 import { isDevInsecureRelay, memberRelayUseTls, relayKey } from "./host/invites";
 import { endpointKeyFromHost, movedEndpointKeys, RoomEndpoint } from "./host/room-endpoint";
 import { genesisPath, RoomHost } from "./host/room-host";
-import { ENV_KEYSTORE, openKeyStore, type Kek, type KeyStoreStatus } from "./keystore/keystore";
+import { deleteKeyStore, ENV_KEYSTORE, openKeyStore, type Kek, type KeyStoreDeletion, type KeyStoreStatus, type OpenKeyStoreOptions } from "./keystore/keystore";
 import { log, logError } from "./log";
 import { HostGrants } from "./host/grants";
 import { LaneService } from "./host/lane-service";
@@ -101,12 +111,16 @@ import { MemberEnrollment, type JoinView } from "./member/enroll-client";
 import { EnrollmentJournal } from "./member/enrollment-journal";
 import { checkInvite, DEFAULT_TRUSTED_RELAYS, laneHostLabel, requireRelayTrust, type InvitePreview } from "./member/invite-check";
 import { LaneRegistrar, type HostsApi } from "./member/lane-registration";
+import { mergeStale, readStaleHosts, removeHosts, writeStaleHosts, type HostsRemover, type StaleHost } from "./member/stale-hosts";
 import { RoomClient } from "./member/room-client";
 import { SealedLogCopy } from "./member/log-copy";
 import { RoomLogFold } from "./authority/fold";
 import { MlsDelivery } from "./host/mls-delivery";
 import { mlsAdapter, type MlsAdapter } from "./mls/adapter";
-import { MlsMember, type MlsTimings } from "./mls/member";
+import { MlsMember, type MlsProfileEvent, type MlsTimings } from "./mls/member";
+import type { AppPayload } from "./mls/formats";
+import { ActivityFeed } from "./member/activity";
+import { RoomBook, ROOM_DESCRIPTION_MAX, ROOM_NAME_MAX, MEMBER_NAME_MAX, SealedRoomBookStore, sanitizeDisplayText } from "./member/room-book";
 import { SealedMlsStore } from "./mls/sealed-store";
 import { writePrivateFile } from "./platform/durable";
 import { resolvePaseoHome } from "./platform/home";
@@ -118,7 +132,7 @@ import { defaultProtection, ProtectionError, type FileProtection, type Protectio
 import { b64u, b64uDecode } from "./proto/b64u";
 import { isValidLabel } from "./proto/enroll";
 import { isId, isRoomId } from "./proto/ids";
-import { ed25519PrivateKeyFromSeed, rawPublicKey, x25519PrivateKeyFromSecret } from "./proto/keys";
+import { ed25519PrivateKeyFromSeed, fingerprintOfKid, rawPublicKey, x25519PrivateKeyFromSecret } from "./proto/keys";
 import { rjcsParse } from "./proto/rjcs";
 import type { RelayAddress } from "./transport/relay-server";
 
@@ -213,6 +227,10 @@ export class RoomsRuntimeV2 {
   /** MLS (I-13): the adapter, and this daemon's member device of each room it is in (owned or joined). */
   private mlsLib: MlsAdapter | null = null;
   readonly mlsMembers = new Map<string, MlsMember>();
+  /** R3.3: names (room.profile, member.profile) and alert acknowledgements of each room, sealed at rest. */
+  private readonly books = new Map<string, RoomBook>();
+  /** R3.5: activity notices of each room from this daemon's own verified fold (owner or member device). */
+  private readonly feeds = new Map<string, ActivityFeed>();
   /** Admin daemon: automatic approvals that failed, retried after this time (by request bodyHash). */
   private readonly approveRetryAt = new Map<string, number>();
   /** Admin daemon: rekey approvals in flight (the admin route is asynchronous), by request bodyHash. */
@@ -241,6 +259,11 @@ export class RoomsRuntimeV2 {
   /** Migration from M1 (migration.md section 2): the record, once read at start. */
   private migration: MigrationRecord | null = null;
   private hostsCleanup: Promise<void> | null = null;
+  /** The options the KeyStore was opened with (R2.6 deletes the KEK through the same backend). */
+  private keystoreOpts: OpenKeyStoreOptions | null = null;
+  /** R3.7: next retry of stale lane host removals, and whether one runs. */
+  private staleRetryAt = 0;
+  private staleBusy = false;
 
   constructor(
     env: NodeJS.ProcessEnv = process.env,
@@ -350,7 +373,7 @@ export class RoomsRuntimeV2 {
       if (o.host.state.auth.closed) continue;
       for (const l of o.lanes.lanes()) {
         if (l.status === "closed" || !l.agentId) continue;
-        out.push({ agentId: l.agentId, laneId: l.laneId, roomId: o.host.roomId, roomName: `Room ${o.host.roomId.slice(5, 11)}`, connectedMembers: l.links });
+        out.push({ agentId: l.agentId, laneId: l.laneId, roomId: o.host.roomId, roomName: this.bookIfOpen(o.host.roomId)?.room?.name ?? `Room ${o.host.roomId.slice(5, 11)}`, connectedMembers: l.links });
       }
     }
     return out;
@@ -454,13 +477,14 @@ export class RoomsRuntimeV2 {
     }
     this.cleanUpV1Hosts();
     const explicitFile = this.env[ENV_KEYSTORE] === "fallback-file" || this.env[ENV_KEYSTORE] === "operator-file";
-    const status = await openKeyStore({
+    this.keystoreOpts = {
       dataDir: this.dataDir,
       paseoHome: this.paseoHome,
       env: this.env,
       log,
       ...(explicitFile ? { native: () => ({ ok: false as const, reason: "not_probed", detail: "an explicit file keystore is configured" }) } : {}),
-    });
+    };
+    const status = await openKeyStore(this.keystoreOpts);
     this.keystore = status;
     if (status.state !== "ready") throw new Error(`keystore ${status.state}`);
     this.kek = status.kek;
@@ -492,8 +516,9 @@ export class RoomsRuntimeV2 {
       }
     }
     this.endedWatch = setInterval(() => {
-      for (const [roomId, j] of this.joined) if (j.client.status === "ended" && this.schedulers.has(roomId)) this.stopLanes(roomId);
+      for (const [roomId, j] of this.joined) if (j.client.status === "ended" && this.schedulers.has(roomId)) void this.stopLanes(roomId);
       for (const roomId of this.joined.keys()) this.followRotation(roomId);
+      this.retryStaleHosts();
     }, 1000);
     (this.endedWatch as { unref?: () => void }).unref?.();
     this.state = "ready";
@@ -613,15 +638,19 @@ export class RoomsRuntimeV2 {
       timings: this.mlsTimings(),
       blocked: () => host.isStopped,
       onAlert: (a) => log("mls_member_alert", { roomId, type: a.type, seq: a.seq }),
+      onProfile: (e) => this.onProfile(roomId, e),
+      announce: () => this.announcements(roomId, memberId, () => host.state),
     });
     this.mlsMembers.set(roomId, member);
     endpoint.onLocalPush(deviceId, (f) => void member.onPush(f));
     const fold = RoomLogFold.fromGenesis(host.genesis);
+    const activity = this.feedOf(roomId);
     const feed = () => {
       for (const r of host.entries(fold.head.seq + 1)) {
         const before = fold.state;
         fold.append(r.signed, r.body);
         member.ingest(r.signed, before, fold.state);
+        activity.push(r.signed, before, fold.state);
         // Prompt Add (MLS 4.4; round 9, item 5): devices this daemon's admin key just admitted.
         const kid = o.signer?.kid;
         if (kid && r.signed.entry.cls === "stmt") {
@@ -664,6 +693,8 @@ export class RoomsRuntimeV2 {
       },
       timings: this.mlsTimings(),
       onAlert: (a) => log("mls_member_alert", { roomId, type: a.type, seq: a.seq }),
+      onProfile: (e) => this.onProfile(roomId, e),
+      announce: () => this.announcements(roomId, memberId, () => this.joined.get(roomId)?.client.state ?? null),
     });
     this.mlsMembers.set(roomId, member);
     // A rekey requested before a restart: its next key again (its packages are in the sealed record).
@@ -677,6 +708,103 @@ export class RoomsRuntimeV2 {
     }
     member.start();
     return member;
+  }
+
+  // ------------------------------------------------------------------------------ names and activity (R3.3, R3.5)
+
+  /** The names book of a room, opened on first use (null before the keystore is ready). */
+  private bookIfOpen(roomId: string): RoomBook | null {
+    const have = this.books.get(roomId);
+    if (have || !this.kek) return have ?? null;
+    const book = new RoomBook(roomId, new SealedRoomBookStore({ dataDir: this.dataDir, kek: this.kek, roomId }));
+    if (book.problem) log("room_book_reset", { roomId, problem: book.problem });
+    this.books.set(roomId, book);
+    return book;
+  }
+
+  private bookOf(roomId: string): RoomBook {
+    const b = this.bookIfOpen(roomId);
+    if (!b) throw new Error("Rooms is not ready");
+    return b;
+  }
+
+  private feedOf(roomId: string): ActivityFeed {
+    let f = this.feeds.get(roomId);
+    if (!f) this.feeds.set(roomId, (f = new ActivityFeed()));
+    return f;
+  }
+
+  /** A profile from another device of the room group; the book decides (admin for the room name, own id for a display name). */
+  private onProfile(roomId: string, e: MlsProfileEvent): void {
+    try {
+      const r = this.bookOf(roomId).apply({ seq: e.seq, from: e.from, payload: e.payload });
+      if (r === "refused") log("room_profile_refused", { roomId, kind: e.payload.kind, seq: e.seq, fromDevice: e.from.deviceId });
+    } catch (err) {
+      logError("room_book_save_failed", err, { roomId });
+    }
+  }
+
+  /** What this device re-announces after an Add (R3.3): the room name if its member is an admin, its own display name. */
+  private announcements(roomId: string, memberId: string, state: () => Readonly<RoomState> | null): AppPayload[] {
+    const book = this.bookIfOpen(roomId);
+    if (!book) return [];
+    const out: AppPayload[] = [];
+    const r = book.room;
+    if (r && state()?.members[memberId]?.role === "admin") out.push({ kind: "room.profile", name: r.name, description: r.description, rev: r.rev });
+    const n = book.memberName(memberId);
+    if (n) out.push({ kind: "member.profile", memberId, label: n });
+    return out;
+  }
+
+  /** This daemon's member and its verified roster in a room (the owner's own device for an owned room). */
+  private selfIn(kek: Kek, roomId: string): { memberId: string; state: Readonly<RoomState> } {
+    const o = this.owned.get(roomId);
+    if (o) return { memberId: this.ownMemberId(kek, roomId), state: o.host.state };
+    const j = this.joined.get(roomId);
+    if (!j || j.client.head.seq < 0) throw new Error("Not a member of that room on this daemon");
+    return { memberId: j.memberId, state: j.client.state };
+  }
+
+  /** R3.3: sends `room.profile` in the room group (admins only). The host never sees the name. */
+  async setRoomProfile(roomId: string, name: string, description?: string): Promise<{ seq: number }> {
+    const kek = await this.ready();
+    const m = this.mlsMembers.get(roomId);
+    if (!m) throw new Error("No MLS group member for that room on this daemon");
+    const self = this.selfIn(kek, roomId);
+    if (self.state.members[self.memberId]?.role !== "admin") throw new Error("Only an admin of the room can change its name");
+    const clean = sanitizeDisplayText(name, ROOM_NAME_MAX);
+    if (!clean) throw new Error(`The room name must have 1 to ${ROOM_NAME_MAX} visible characters`);
+    const desc = sanitizeDisplayText(description ?? "", ROOM_DESCRIPTION_MAX) ?? "";
+    const book = this.bookOf(roomId);
+    const payload = { kind: "room.profile" as const, name: clean, description: desc, rev: (book.room?.rev ?? -1) + 1 };
+    const r = await m.sendProfile(payload);
+    book.apply({ seq: r.seq, from: { memberId: self.memberId, role: "admin" }, payload });
+    log("room_profile_sent", { roomId, seq: r.seq, rev: payload.rev });
+    return { seq: r.seq };
+  }
+
+  /** R3.3: sends this member's `member.profile` (display name) in the room group. */
+  async setMemberProfile(roomId: string, displayName: string): Promise<{ seq: number }> {
+    const kek = await this.ready();
+    const m = this.mlsMembers.get(roomId);
+    if (!m) throw new Error("No MLS group member for that room on this daemon");
+    const self = this.selfIn(kek, roomId);
+    const clean = sanitizeDisplayText(displayName, MEMBER_NAME_MAX);
+    if (!clean) throw new Error(`The display name must have 1 to ${MEMBER_NAME_MAX} visible characters`);
+    const payload = { kind: "member.profile" as const, memberId: self.memberId, label: clean };
+    const r = await m.sendProfile(payload);
+    this.bookOf(roomId).apply({ seq: r.seq, from: { memberId: self.memberId, role: self.state.members[self.memberId]?.role ?? "" }, payload });
+    log("member_profile_sent", { roomId, seq: r.seq });
+    return { seq: r.seq };
+  }
+
+  /** R3.5: hides alert notices on this device. Sending stays stopped where an alert stopped it (room-log 6.6). */
+  async ackAlerts(roomId: string, alerts: readonly { type: string; seq: number }[]): Promise<{ ok: true; acked: number }> {
+    await this.ready();
+    if (!this.owned.has(roomId) && !this.joined.has(roomId) && !this.mlsMembers.has(roomId)) throw new Error("Unknown room");
+    const acked = this.bookOf(roomId).ack(alerts, Date.now());
+    log("room_alerts_acknowledged", { roomId, acked });
+    return { ok: true, acked };
   }
 
   /** Sends a chat message in the room group (development RPC; the chat UI is M2). */
@@ -698,7 +826,8 @@ export class RoomsRuntimeV2 {
   private mlsView() {
     return [...this.mlsMembers.entries()].map(([roomId, m]) => {
       const v = m.view();
-      return { roomId, inGroup: v.inGroup, epoch: v.epoch, cursor: v.cursor, leaves: v.leaves.length, join: v.join?.status ?? null, stalled: v.stalled !== null, disabled: v.disabled, canSend: v.canSend, messages: m.messages.length, alerts: m.alerts.slice(-16).map((a) => ({ type: a.type, seq: a.seq })) };
+      const book = this.bookIfOpen(roomId);
+      return { roomId, inGroup: v.inGroup, epoch: v.epoch, cursor: v.cursor, leaves: v.leaves.length, join: v.join?.status ?? null, stalled: v.stalled !== null, disabled: v.disabled, canSend: v.canSend, messages: m.messages.length, alerts: m.alerts.slice(-16).map((a) => ({ type: a.type, seq: a.seq, acked: book?.isAcked(a.type, a.seq) ?? false })) };
     });
   }
 
@@ -770,7 +899,7 @@ export class RoomsRuntimeV2 {
         endpoint: endpoint.status,
         sessions: endpoint.sessions().map((s) => ({ memberId: s.memberId, deviceId: s.deviceId })),
         members: Object.keys(host.state.members).length,
-        roster: rosterView(host.state, endpoint, signer?.memberId ?? null),
+        roster: rosterView(host.state, endpoint, signer?.memberId ?? null, this.bookIfOpen(host.roomId)),
         policy: {
           deviceAddApproval: host.state.auth.policy.deviceAddApproval,
           soleDeviceChange: host.state.auth.policy.soleDeviceChange,
@@ -801,8 +930,13 @@ export class RoomsRuntimeV2 {
           recoveryProposals: Object.entries(host.state.auth.pendingRecovery).filter(([, p]) => !p.used).map(([ref, p]) => ({ ref, kid: p.kid, exp: p.exp })),
         },
         uncertified: host.uncertifiedAlerts(),
+        roomName: this.bookIfOpen(host.roomId)?.room?.name ?? null,
+        roomDescription: this.bookIfOpen(host.roomId)?.room?.description || null,
+        adminFingerprint: signer ? fingerprintOfKid(signer.kid) : null,
+        activity: this.feeds.get(host.roomId)?.items(50) ?? [],
       })),
       mls: this.mlsView(),
+      staleHosts: this.state === "ready" ? readStaleHosts(this.dataDir) : [],
       joining: [...this.joining.values()].map((e) => joinView(e.view())),
       joined: [...this.joined.entries()].map(([roomId, j]) => ({
         roomId,
@@ -812,7 +946,12 @@ export class RoomsRuntimeV2 {
         head: j.client.head,
         lastError: j.client.lastError,
         endedReason: j.client.endedReason,
-        alerts: j.client.alerts.map((a) => ({ type: a.type, seq: a.seq })),
+        alerts: j.client.alerts.map((a) => ({ type: a.type, seq: a.seq, acked: this.bookIfOpen(roomId)?.isAcked(a.type, a.seq) ?? false })),
+        sendingStopped: j.client.sendingStopped,
+        roomName: this.bookIfOpen(roomId)?.room?.name ?? null,
+        roomDescription: this.bookIfOpen(roomId)?.room?.description || null,
+        names: j.client.head.seq >= 0 ? (this.bookIfOpen(roomId)?.names(Object.keys(j.client.state.members).sort()) ?? []) : [],
+        activity: this.feeds.get(roomId)?.items(50) ?? [],
         registration: this.registrars.get(roomId)?.status ?? null,
         links: this.linkers.get(roomId)?.view() ?? [],
         // I-12: this device's own rekey, if one is open (ids and times only).
@@ -824,6 +963,8 @@ export class RoomsRuntimeV2 {
         // The member's own pending device requests: the "Was this you?" prompt with Not me (6.3).
         deviceRequests: j.client.status === "open" || j.client.head.seq >= 0 ? deviceRequestsView(j.client.state, j.memberId) : [],
         conflict: j.client.head.seq >= 0 ? j.client.state.conflicts[j.memberId] !== undefined : false,
+        memberDevices: j.client.head.seq >= 0 ? (j.client.state.members[j.memberId]?.devices.length ?? 0) : null,
+        hosted: this.owned.has(roomId),
         lanes: [...(this.schedulers.get(roomId)?.entries() ?? [])].map(([laneId, sc]) => {
           const regId = this.joining.get(roomId)?.journal.e.registrations[laneId] ?? null;
           const reg = regId ? this.registrations.get(regId) : undefined;
@@ -1294,6 +1435,18 @@ export class RoomsRuntimeV2 {
     return o.lanes.createLane({ agentId: agent.id, workspaceId: agent.workspaceId, label: i.label ?? "Live", owner, submit: (data) => void this.adminSubmit(i.roomId, "lane.created", data) });
   }
 
+  /**
+   * R3.2: closes a lane (`lane.closed`, final). Grants for the lane are dropped and pushed to its
+   * endpoint before the append (grants-v2 7.1); the endpoint stops and its key is deleted after it.
+   */
+  async closeLane(roomId: string, laneId: string): Promise<{ seq: number }> {
+    await this.ready();
+    const l = this.ownedRoom(roomId).host.state.auth.lanes[laneId];
+    if (!l) throw new Error("Unknown lane");
+    if (l.status === "closed") throw new Error("The lane is already closed");
+    return this.reducing(roomId, () => ({ seq: this.adminSubmit(roomId, "lane.closed", { laneId }).receipt.entry.seq }));
+  }
+
   /** Owner-only full error text of a lane (grants-v2 13.1); never crosses a lane endpoint. */
   async laneErrors(roomId: string, laneId: string) {
     await this.ready();
@@ -1413,9 +1566,13 @@ export class RoomsRuntimeV2 {
             this.schedulerFor(roomId, laneId).armNew(g);
             return g.connection;
           },
-          label: (laneId) => laneHostLabel({ verifiedName: null, roomId }, laneId),
+          label: (laneId) => laneHostLabel({ verifiedName: this.bookIfOpen(roomId)?.room?.name ?? null, roomId }, laneId),
           record: (laneId, registrationId) => j.registration(laneId, registrationId),
           done: () => j.registered(),
+          skip: (laneId: string) => {
+            const c = this.joined.get(roomId)?.client;
+            return !!c && c.head.seq >= 0 && laneLost(c.state, j.e.memberId!, laneId) !== null;
+          },
           ...(this.tuning.retryMs ? { setTimer: (f: () => void, ms: number) => setTimeout(f, Math.min(ms, this.tuning.retryMs![0] ?? ms)) } : {}),
         },
         lanes,
@@ -1501,7 +1658,7 @@ export class RoomsRuntimeV2 {
     if (!hosts) throw Object.assign(new Error("no Paseo API yet"), { code: "no_api" });
     const g = await this.issueConnection(roomId, laneId);
     const metadata = { "rooms.roomId": roomId, "rooms.laneId": laneId, "rooms.role": "lane" };
-    await hosts.update(registrationId, { connection: g.connection, label: laneHostLabel({ verifiedName: null, roomId }, laneId), metadata, enabled: true });
+    await hosts.update(registrationId, { connection: g.connection, label: laneHostLabel({ verifiedName: this.bookIfOpen(roomId)?.room?.name ?? null, roomId }, laneId), metadata, enabled: true });
     return { gid: g.gid, iat: g.iat, exp: g.exp };
   }
 
@@ -1734,6 +1891,7 @@ export class RoomsRuntimeV2 {
       }
       log("room_endpoint_rotated_seen", { roomId, seq: signed.entry.seq });
     }
+    if (t === "lane.closed" || t === "member.lanes.changed") this.dropLostLanes(roomId, after);
     if (t === "lane.offer.rotated") {
       for (const [laneId, l] of Object.entries(after.auth.lanes)) {
         if (before.auth.lanes[laneId]?.offer.serverId === l.offer.serverId) continue;
@@ -1771,6 +1929,7 @@ export class RoomsRuntimeV2 {
       store: new SealedLogCopy({ dataDir: this.dataDir, kek, roomId, genesisHash: v.genesisHash }),
       onIngest: (s, b, a) => {
         if (mls && !this.owned.has(roomId)) mls.ingest(s, b, a);
+        if (!this.owned.has(roomId)) this.feedOf(roomId).push(s, b, a);
         this.onMemberEntry(roomId, s, b, a);
       },
     });
@@ -1816,18 +1975,229 @@ export class RoomsRuntimeV2 {
       const e = client.state.auth.endpoint;
       if (e.serverId !== v.genesis.body.endpoint.serverId || j.endpoint) j.setEndpoint({ serverId: e.serverId, dh: e.dh.pub, relay: { host: e.relay.host, port: e.relay.port } });
     }
-    if (client.status === "ended" && this.schedulers.has(roomId)) this.stopLanes(roomId);
+    if (client.status === "ended" && this.schedulers.has(roomId)) void this.stopLanes(roomId);
     return { status: client.status, lastError: client.lastError };
   }
 
-  /** Access ended: stop rotating and remove our lane registrations (their grants no longer work). */
-  private stopLanes(roomId: string): void {
+  /**
+   * Access ended (or the member leaves): stop rotating and remove our lane registrations (their grants
+   * no longer work). What cannot be removed now goes to the stale-host list (R3.7).
+   */
+  private stopLanes(roomId: string, reason: StaleHost["reason"] = "access_ended"): Promise<{ removed: number; remaining: StaleHost[] }> {
     for (const sc of this.schedulers.get(roomId)?.values() ?? []) sc.stop();
     this.schedulers.delete(roomId);
     this.registrars.get(roomId)?.stop();
     const regs = this.joining.get(roomId)?.journal.e.registrations ?? {};
-    const hosts = this.paseo?.hosts as unknown as { remove?(id: string): Promise<unknown> } | undefined;
-    for (const id of Object.values(regs)) void hosts?.remove?.(id).catch((e) => logError("lane_host_remove_failed", e, { roomId }));
+    return this.removeLaneHosts(roomId, Object.entries(regs).map(([laneId, registrationId]) => ({ laneId, registrationId })), reason);
+  }
+
+  // ------------------------------------------------------------------------------ member: leaving and lane hosts (R3.1, R3.7)
+
+  /**
+   * R3.7: the verified log closed a lane or removed it from this member's lanes. Its grant schedule
+   * stops, the registrar forgets it, and its host entry is removed (or kept as stale and shown).
+   */
+  private dropLostLanes(roomId: string, st: Readonly<RoomState>): void {
+    const joined = this.joined.get(roomId);
+    const j = this.joining.get(roomId)?.journal;
+    if (!joined || !j || this.owned.has(roomId) || !st.members[joined.memberId]) return;
+    const byLane = this.schedulers.get(roomId);
+    const laneIds = new Set([...Object.keys(j.e.registrations), ...(byLane?.keys() ?? [])]);
+    for (const laneId of laneIds) {
+      const reason = laneLost(st, joined.memberId, laneId);
+      if (!reason) continue;
+      byLane?.get(laneId)?.stop();
+      byLane?.delete(laneId);
+      this.registrars.get(roomId)?.drop(laneId);
+      const registrationId = j.e.registrations[laneId];
+      if (!registrationId) continue;
+      try {
+        j.dropRegistration(laneId);
+      } catch (e) {
+        logError("lane_registration_drop_failed", e, { roomId, laneId });
+      }
+      void this.removeLaneHosts(roomId, [{ laneId, registrationId }], reason);
+    }
+  }
+
+  private hostsRemover(): HostsRemover | null {
+    const h = this.paseo?.hosts as unknown as Partial<HostsRemover> | undefined;
+    return h && typeof h.remove === "function" ? (h as HostsRemover) : null;
+  }
+
+  /** Removes lane host registrations through Paseo; failures (or no PaseoApi yet) are kept as stale. */
+  private async removeLaneHosts(roomId: string, regs: { laneId: string; registrationId: string }[], reason: StaleHost["reason"]): Promise<{ removed: number; remaining: StaleHost[] }> {
+    if (regs.length === 0) return { removed: 0, remaining: [] };
+    const since = Date.now();
+    const entries = regs.map((r) => ({ roomId, laneId: r.laneId, registrationId: r.registrationId, label: laneHostLabel({ verifiedName: null, roomId }, r.laneId), reason, since, lastError: null }));
+    const r = await removeHosts(this.hostsRemover(), entries);
+    for (const id of r.removed) this.registrations.delete(id);
+    if (reason !== "data_deleted") this.updateStale(r.removed, r.remaining);
+    log("lane_hosts_removed", { roomId, reason, removed: r.removed.length, remaining: r.remaining.length, error: r.remaining[0]?.lastError ?? null });
+    return { removed: r.removed.length, remaining: r.remaining };
+  }
+
+  /** member/stale-hosts.json: drop the removed ids, add (or refresh) the remaining entries. */
+  private updateStale(removed: readonly string[], add: readonly StaleHost[]): void {
+    try {
+      const before = readStaleHosts(this.dataDir);
+      const next = mergeStale(before.filter((h) => !removed.includes(h.registrationId)), add);
+      if (add.length > 0 || next.length !== before.length) writeStaleHosts(this.dataDir, next, this.protection);
+    } catch (e) {
+      logError("stale_hosts_save_failed", e);
+    }
+  }
+
+  /** R3.7 "Retry": removes the stale lane hosts now. */
+  async cleanUpStaleHosts(): Promise<{ removed: number; remaining: StaleHost[] }> {
+    await this.ready();
+    const cur = readStaleHosts(this.dataDir);
+    if (cur.length === 0) return { removed: 0, remaining: [] };
+    const r = await removeHosts(this.hostsRemover(), cur);
+    this.updateStale(r.removed, r.remaining);
+    return { removed: r.removed.length, remaining: readStaleHosts(this.dataDir) };
+  }
+
+  /** Every 30 s at most, while a PaseoApi is attached and stale entries exist. */
+  private retryStaleHosts(): void {
+    if (this.stopping || this.state !== "ready" || !this.paseo || this.staleBusy || Date.now() < this.staleRetryAt) return;
+    this.staleRetryAt = Date.now() + 30_000;
+    if (readStaleHosts(this.dataDir).length === 0) return;
+    this.staleBusy = true;
+    void this.cleanUpStaleHosts()
+      .catch((e) => logError("stale_hosts_retry_failed", e))
+      .finally(() => {
+        this.staleBusy = false;
+      });
+  }
+
+  /**
+   * R3.1: leaves a joined room. The member's only active device signs `member.left`; one of several
+   * signs `device.removed {reason: "self"}` (room-log-v2 4.3: a device removes only itself, and the
+   * last device leaves with member.left). A room whose access already ended, or a join that never
+   * completed, is forgotten here only. Then lane hosts are removed and the room's member data deleted.
+   */
+  async leaveRoom(roomId: string): Promise<{ statement: "member.left" | "device.removed" | null; seq: number | null; hostsRemoved: number; hostsRemaining: StaleHost[] }> {
+    await this.ready();
+    if (this.owned.has(roomId)) throw new Error("This daemon hosts that room. The host cannot leave its own room.");
+    const e = this.joining.get(roomId);
+    if (!this.joined.has(roomId) && !e) throw new Error("This daemon is not a member of that room");
+    let statement: "member.left" | "device.removed" | null = null;
+    let seq: number | null = null;
+    const admitted = e ? e.journal.state === "admitted" || e.journal.state === "registered" : true;
+    if (!admitted) {
+      // A join in progress: cancel it (the host closes the attempt); nothing was admitted.
+      if (e!.journal.state !== "failed") await e!.cancel().catch((err) => logError("join_cancel_failed", err, { roomId }));
+    } else if (this.joined.get(roomId)?.client.status !== "ended") {
+      if (this.joined.get(roomId)?.client.status !== "open") await this.connect(roomId).catch(() => undefined);
+      const j = this.joined.get(roomId);
+      const c = j?.client;
+      if (!j || !c || (c.status !== "open" && c.status !== "ended")) throw new Error("The room cannot be reached right now. Nothing was changed. Reconnect and try again.");
+      if (c.status === "open") {
+        const me = c.state.members[j.memberId];
+        if (!me?.devices.some((d) => d.deviceId === j.deviceId)) throw new Error("This device is not in the room's member list yet. Try again after the room has synced.");
+        statement = me.devices.length === 1 ? "member.left" : "device.removed";
+        try {
+          const linker = this.linkerOf(roomId);
+          seq = (statement === "member.left" ? await linker.submitOwn("member.left", { memberId: j.memberId }) : await linker.submitOwn("device.removed", { memberId: j.memberId, deviceId: j.deviceId, reason: "self" })).seq;
+        } catch (err) {
+          throw new Error(`${statement} refused: ${(err as { code?: string }).code ?? "error"}. Nothing was changed.`);
+        }
+      }
+    }
+    const hosts = await this.forgetRoom(roomId, statement ? "left" : "access_ended");
+    log("room_left", { roomId, statement, seq, hostsRemoved: hosts.removed, hostsRemaining: hosts.remaining.length });
+    return { statement, seq, hostsRemoved: hosts.removed, hostsRemaining: hosts.remaining };
+  }
+
+  /** Local teardown of a joined room: lanes, session, MLS member, linker, journal and member/rooms/<roomId>. */
+  private async forgetRoom(roomId: string, reason: StaleHost["reason"]): Promise<{ removed: number; remaining: StaleHost[] }> {
+    const hosts = await this.stopLanes(roomId, reason);
+    this.registrars.delete(roomId);
+    this.joined.get(roomId)?.client.close();
+    this.joined.delete(roomId);
+    const mls = this.mlsMembers.get(roomId);
+    if (mls && !this.owned.has(roomId)) {
+      mls.stop();
+      this.mlsMembers.delete(roomId);
+      await Promise.race([mls.idle().catch(() => undefined), new Promise<void>((r) => (setTimeout(r, 2000) as { unref?: () => void }).unref?.())]);
+    }
+    this.linkers.delete(roomId);
+    this.joining.get(roomId)?.close();
+    this.joining.delete(roomId);
+    this.rekeyPublished.delete(roomId);
+    this.reconnectAt.delete(roomId);
+    for (const k of [...this.authRetryAt.keys()]) if (k.startsWith(`${roomId} `)) this.authRetryAt.delete(k);
+    if (reason !== "data_deleted") fs.rmSync(memberRoomDir(this.dataDir, roomId), { recursive: true, force: true });
+    return hosts;
+  }
+
+  /**
+   * R2.6 "Leave all rooms and delete keys" (the user's typed confirmation): leaves every joined room
+   * (a room that cannot be reached is forgotten here; its owner still lists the member), removes every
+   * lane host this plugin registered, stops the runtime, deletes the KEK through the KeyStore and the
+   * plugin-data/rooms folder. Rooms this daemon hosts stop for good: refused unless `deleteHosted`.
+   */
+  async deleteAllData(i: { deleteHosted: boolean }): Promise<{
+    left: { roomId: string; statement: "member.left" | "device.removed" | null; error: string | null }[];
+    hostedDeleted: string[];
+    hostsRemoved: number;
+    hostsRemaining: StaleHost[];
+    keystore: KeyStoreDeletion;
+    dataDeleted: boolean;
+  }> {
+    await this.requireVerifiedTree();
+    const hosted = [...this.owned.keys()];
+    if (hosted.length && !i.deleteHosted) throw new Error(`This daemon hosts ${hosted.length} room(s). Deleting the keys stops them for good and their members lose access. Confirm deleting hosted rooms too.`);
+    const left: { roomId: string; statement: "member.left" | "device.removed" | null; error: string | null }[] = [];
+    let hostsRemoved = 0;
+    for (const roomId of new Set([...this.joining.keys(), ...this.joined.keys()])) {
+      if (this.owned.has(roomId)) continue;
+      try {
+        const r = await this.leaveRoom(roomId);
+        left.push({ roomId, statement: r.statement, error: null });
+        hostsRemoved += r.hostsRemoved;
+      } catch (e) {
+        const r = await this.forgetRoom(roomId, "data_deleted");
+        hostsRemoved += r.removed;
+        left.push({ roomId, statement: null, error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
+    }
+    // Every lane host of this plugin, including stale ones and ones no journal knows any more.
+    let todo: StaleHost[] = readStaleHosts(this.dataDir).map((h) => ({ ...h, reason: "data_deleted" as const }));
+    const api = this.paseo?.hosts as unknown as Partial<HostsApi> | undefined;
+    if (api?.list) {
+      try {
+        const dir = await api.list();
+        for (const h of dir.hosts) {
+          if (h.source?.id !== `plugin:${PLUGIN_ID}` || todo.some((x) => x.registrationId === h.registrationId)) continue;
+          const laneId = String(h.source.key ?? "");
+          todo.push({ roomId: "", laneId, registrationId: h.registrationId, label: laneId ? `Lane ${laneId.slice(5, 13)}` : "Rooms lane", reason: "data_deleted", since: Date.now(), lastError: null });
+        }
+      } catch (e) {
+        logError("hosts_list_failed", e);
+      }
+    }
+    const r = await removeHosts(this.hostsRemover(), todo);
+    hostsRemoved += r.removed.length;
+    todo = r.remaining;
+    await this.stop();
+    const keystore = await deleteKeyStore(this.keystoreOpts ?? { dataDir: this.dataDir, paseoHome: this.paseoHome, env: this.env, log, native: () => ({ ok: false as const, reason: "not_probed", detail: "keystore was not opened" }) });
+    let dataDeleted = false;
+    try {
+      fs.rmSync(this.dataDir, { recursive: true, force: true });
+      dataDeleted = true;
+    } catch (e) {
+      logError("data_delete_failed", e);
+    }
+    for (const m of [this.owned, this.joined, this.joining, this.registrars, this.schedulers, this.registrations, this.linkers, this.mlsMembers] as Map<string, unknown>[]) m.clear();
+    this.kek = null;
+    this.keystore = null;
+    this.migration = null;
+    this.state = "error";
+    this.error = "data_deleted";
+    log("rooms_data_deleted", { left: left.length, hosted: hosted.length, hostsRemoved, hostsRemaining: todo.length, kek: keystore.kek, dataDeleted });
+    return { left, hostedDeleted: hosted, hostsRemoved, hostsRemaining: todo, keystore, dataDeleted };
   }
 
   private deviceFor(kek: Kek, roomId: string, nextKeys = false): { genesis: RoomGenesis | Uint8Array; device: { publicKey: Uint8Array; secretKey: Uint8Array }; memberId: string; deviceId: string; relay(g: RoomGenesis): RelayAddress } {
@@ -1897,6 +2267,13 @@ export class RoomsRuntimeV2 {
   }
 }
 
+/** R3.7: why a member's lane host has to go (closed, or no longer among the member's lanes), or null. */
+export function laneLost(st: Readonly<RoomState>, memberId: string, laneId: string): "lane_closed" | "lane_removed" | null {
+  if (st.auth.lanes[laneId]?.status === "closed") return "lane_closed";
+  const m = st.members[memberId];
+  return m && !m.lanes.includes(laneId) ? "lane_removed" : null;
+}
+
 function readMigrationSafe(dataDir: string): MigrationRecord | null {
   try {
     return readMigration(dataDir);
@@ -1919,16 +2296,19 @@ function offerView(r: RecoveryKeyOffer): RecoveryOfferView {
   return { kid: r.kid, code: r.code, file: { name: r.fileName, text: r.fileText } };
 }
 
-/** The owner's member list: roles, lanes, devices (ids only) and the self-reported label from enrollment. */
-function rosterView(st: Readonly<RoomState>, endpoint: RoomEndpoint, selfMemberId: string | null) {
+/** The owner's member list: roles, lanes, devices (ids only), the self-reported label from enrollment and the MLS display name (R3.3). */
+function rosterView(st: Readonly<RoomState>, endpoint: RoomEndpoint, selfMemberId: string | null, book: RoomBook | null) {
   const online = new Set(endpoint.sessions().map((x) => x.deviceId));
   const pendings = endpoint.enrollment?.pendings() ?? [];
+  const names = new Map((book?.names(Object.keys(st.members).sort()) ?? []).map((n) => [n.memberId, n]));
   return Object.values(st.members)
     .map((m) => ({
       memberId: m.memberId,
       role: m.role,
       lanes: [...m.lanes],
       label: m.memberId === selfMemberId ? null : (pendings.find((p) => p.memberId === m.memberId && p.label)?.label ?? null),
+      displayName: names.get(m.memberId)?.name ?? null,
+      nameCollision: names.get(m.memberId)?.collision ?? false,
       self: m.memberId === selfMemberId,
       devices: m.devices.map((d) => ({ deviceId: d.deviceId, kind: d.kind, since: st.deviceSince[d.deviceId] ?? null, connected: online.has(d.deviceId) })),
     }))
@@ -1944,7 +2324,7 @@ function pendingView(p: PendingView) {
 }
 
 function joinView(v: JoinView) {
-  return { roomId: v.roomId, state: v.state, roomName: v.roomName, sas: v.sas, terms: v.terms, expiresAt: v.expiresAt, failure: v.failure, connection: v.connection, lastError: v.lastError };
+  return { roomId: v.roomId, state: v.state, roomName: v.roomName, sas: v.sas, ownerFingerprints: v.ownerFingerprints, terms: v.terms, expiresAt: v.expiresAt, failure: v.failure, connection: v.connection, lastError: v.lastError };
 }
 
 /** Device ids in the roster of `after` that `before` did not have (admissions and approved adds). */

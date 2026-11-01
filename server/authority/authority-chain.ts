@@ -57,6 +57,12 @@ export type AuthorityChainResult = {
   endpoint: { serverId: string; dh: { alg: string; kid: string; pub: string }; relay: { host: string; port: number; tls: true } };
   /** kids of every admin key the chain certified (genesis admins first). */
   adminKids: string[];
+  /**
+   * Display only (the owner fingerprint, enrollment 6.4; R3.6): admin keys after applying the chain's
+   * rotations, removals and revocations in order, genesis lineage first. Not a verification result:
+   * an omitted entry is not detectable here (see the header).
+   */
+  currentAdminKids: string[];
 };
 
 /** Host side: the chain from the stored log records. */
@@ -73,6 +79,7 @@ export function verifyAuthorityChain(genesisInput: RoomGenesis | unknown, chain:
   for (const a of g.genesis.body.admins) signers.set(a.kid, a.pub);
   if (g.genesis.body.recovery) signers.set(g.genesis.body.recovery.kid, g.genesis.body.recovery.pub);
   const adminKids = g.genesis.body.admins.map((a) => a.kid);
+  const current = [...adminKids];
   const hostKeys: { kid: string; pub: string; fromSeq: number; toSeq: number | null }[] = [{ kid: g.genesis.body.host.key.kid, pub: g.genesis.body.host.key.pub, fromSeq: 0, toSeq: null }];
   let endpoint = structuredClone(g.genesis.body.endpoint) as AuthorityChainResult["endpoint"];
   const bodies = new Map(chain.bodies.map((b) => [b.seq, b.body]));
@@ -120,10 +127,21 @@ export function verifyAuthorityChain(genesisInput: RoomGenesis | unknown, chain:
       } else {
         signers.set(newKid, newPub);
         if (sb.type !== "recovery.key.rotated") adminKids.push(newKid);
+        if (sb.type === "admin.added") current.push(newKid);
+        if (sb.type === "admin.key.rotated") {
+          const i = current.indexOf(d.change.old ?? "");
+          if (i >= 0) current[i] = newKid;
+          else current.push(newKid);
+        }
       }
+    }
+    if (sb.type === "admin.removed" || sb.type === "admin.key.revoked") {
+      const gone = (sb.data as { kid?: string }).kid;
+      const i = gone ? current.indexOf(gone) : -1;
+      if (i >= 0) current.splice(i, 1);
     }
     if (sb.type === "endpoint.rotated" && d.serverId && d.dh && d.relay) endpoint = { serverId: d.serverId, dh: d.dh, relay: d.relay };
   }
   if (last !== chain.seq) throw new AuthorityChainError("authority.seq does not name the last entry");
-  return { endpoint, adminKids };
+  return { endpoint, adminKids, currentAdminKids: current };
 }

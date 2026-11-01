@@ -72,6 +72,7 @@ export function memberErrorText(raw: string | null | undefined): string | null {
   const known: Record<string, string> = {
     not_authorized: "This device is not authorized in the room (removed or rekeyed).",
     removed: "You were removed from this room.",
+    left: "This device left the room.",
     room_closed: "The room is closed.",
     superseded: "Another session of this device replaced this one.",
     moved: "The room moved to a new endpoint; reconnecting.",
@@ -121,3 +122,112 @@ export function recoveryCheckGroup(code: string): string {
 
 export const WINDOWS_DURABILITY =
   "On Windows, Rooms cannot flush a folder after replacing a file, so a power loss right after a change may undo that change. Linux and macOS flush the folder.";
+
+/** An activity item as the status view carries it (shared/rpc-v2 ActivityV2Item). */
+export type ActivityLike = { type: string; alert: boolean; memberId?: string; deviceId?: string; laneId?: string; value?: string; changes?: { setting: string; from: string; to: string }[]; sole?: boolean; marked?: number };
+
+const POLICY_LABELS: Record<string, string> = {
+  minVersion: "minimum Rooms version",
+  sas: "join code check",
+  deviceAddApproval: "who approves new devices",
+  rotateLaneOnRemove: "lane keys after a removal",
+  recoveryEscrow: "recovery escrow",
+  soleDeviceChange: "changes from a member's only device",
+  projectNames: "project names for viewers",
+  grantTtl: "lane access lifetime (s)",
+  closeDelay: "closing delay (s)",
+};
+
+/**
+ * A display name next to its short member id (R3.3). Names are untrusted text chosen by each member:
+ * the id is always shown, so a copied name does not pass for someone else.
+ */
+export function nameWithId(name: string | null | undefined, memberId: string | null | undefined): string {
+  return name ? `${name} (${shortId(memberId)})` : `Member ${shortId(memberId)}`;
+}
+
+/** Room-log 4.6 notices (R3.5). `who` gives the person for a member id (name with id, or "You"). */
+export function activityText(a: ActivityLike, who: (memberId: string | undefined) => string): { text: string; tone: Tone } {
+  const p = who(a.memberId);
+  const dev = a.deviceId ? `device ${shortId(a.deviceId)}` : "a device";
+  const lane = a.laneId ? `lane ${shortId(a.laneId)}` : "a lane";
+  const sole = a.sole ? " It came from their only device in this room." : "";
+  const marked = a.marked ? ` ${a.marked} earlier entr${a.marked === 1 ? "y is" : "ies are"} now marked as having no effect.` : "";
+  const t = (text: string, tone: Tone = "muted") => ({ text: text + marked, tone });
+  switch (a.type) {
+    case "member.admitted":
+      return t(`${p} joined the room.`, "ok");
+    case "member.removed":
+      return t(`${p} was removed from the room.`, "warn");
+    case "member.left":
+      return t(`${p} left the room.`);
+    case "member.role.changed":
+      return t(`${p}'s role changed to ${a.value ?? "?"}.`, "warn");
+    case "member.device.replaced":
+      return t(`${p}'s devices were replaced by an admin (new ${dev}).`, "warn");
+    case "device.added":
+      return t(`${p} is adding ${dev}.${sole}`, "warn");
+    case "device.add.approved":
+      return t(`${p} added ${dev}.`, "ok");
+    case "device.add.vetoed":
+      return t(`A device of ${p} said "Not me" to ${dev}.`, "danger");
+    case "device.removed":
+      return t(`${p}'s ${dev} was removed.`, "warn");
+    case "device.rekeyed":
+      return t(`${p}'s ${dev} asked to change its keys.${sole}`, "warn");
+    case "device.rekey.vetoed":
+      return t(`A device of ${p} said "Not me" to the key change of ${dev}.`, "danger");
+    case "device.rekey.approved":
+      return t(`${p}'s ${dev} changed its keys.`);
+    case "device.conflict.resolved":
+      return t(`An admin resolved the device conflict of ${p}.`);
+    case "device.leaf.repair.requested":
+      return t(`${p}'s ${dev} asked to repair its membership in the room group.`);
+    case "room.policy.changed": {
+      const list = (a.changes ?? []).map((c) => `${POLICY_LABELS[c.setting] ?? c.setting}: ${c.from} to ${c.to}`).join("; ");
+      return t(`Room settings changed${list ? `: ${list}` : ""}.`, "warn");
+    }
+    case "room.close.proposed":
+      return t("An admin proposed closing this room.", "warn");
+    case "room.closed":
+      return t("The room was closed.", "warn");
+    case "admin.added":
+      return t("An admin key was added.", "warn");
+    case "admin.removed":
+      return t("An admin key was removed.", "warn");
+    case "admin.key.rotated":
+      return t("An admin rotated their key.");
+    case "admin.key.revoked":
+      return t("An admin key was revoked.", "danger");
+    case "recovery.key.proposed":
+      return t("A new recovery key was proposed.", "warn");
+    case "recovery.key.rotated":
+      return t("The room's recovery key changed.", "warn");
+    case "host.key.rotated":
+      return t("The host key was rotated.");
+    case "host.key.revoked":
+      return t("A host key was revoked.", "danger");
+    case "endpoint.rotated":
+      return t("The room endpoint key was rotated.");
+    case "lane.offer.rotated":
+      return t(`The key of ${lane} was rotated.`);
+    case "lane.created":
+      return t(`${lane[0].toUpperCase()}${lane.slice(1)} was shared${a.memberId ? ` by ${p}` : ""}.`, "ok");
+    case "lane.closed":
+      return t(`${lane[0].toUpperCase()}${lane.slice(1)} was closed.`);
+    case "lane.names.changed":
+      return t(`Project names in ${lane} are now ${a.value === "shown" ? "shown" : "hidden"}.`, "warn");
+    case "lane.degraded":
+      return t(`${lane[0].toUpperCase()}${lane.slice(1)} is not working (its agent or endpoint failed).`, "warn");
+    case "grant.suspected-theft":
+      return t("Lane access of a device was used from two places. It may be stolen.", "danger");
+    case "endpoint.evicted":
+      return t("The room endpoint was pushed off the relay repeatedly.", "danger");
+    case "mls.stalled":
+      return t("The room group stopped advancing.", "warn");
+    case "uncertified_key":
+      return t("A key of this room was set by a revoked admin key. An admin must replace it.", "warn");
+    default:
+      return t(`Room change (${a.type.replace(/[^a-z_.-]/gi, "").slice(0, 40)}).`);
+  }
+}

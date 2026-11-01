@@ -15,6 +15,8 @@
 //   post-admission fold over log.fetch accepted the admission entry (same seq and hash as in
 //   `enroll.admitted`). `waiting` retries with the backoff; `refused` (a different entry at that seq,
 //   or a fork, truncation or invalid entry alert) stops registration.
+// - R3.7: lanes that `skip()` names (closed, or no longer among the member's lanes in the fold) are
+//   not registered; `drop()` forgets the registration of a lane whose host entry was removed.
 import { log } from "../log";
 
 export const REGISTRATION_BACKOFF_MS: readonly number[] = [1000, 2000, 4000, 8000, 16000, 32000, 60000];
@@ -44,6 +46,8 @@ export interface LaneRegistrationDeps {
   done(): void;
   setTimer?(f: () => void, ms: number): unknown;
   clearTimer?(t: unknown): void;
+  /** R3.7: true for a lane that must not be registered (closed, or access removed). */
+  skip?(laneId: string): boolean;
 }
 
 export type AdmissionGate = "accepted" | "waiting" | "refused";
@@ -90,6 +94,11 @@ export class LaneRegistrar {
     this.timer = null;
   }
 
+  /** R3.7: the lane's host entry was removed; it is not registered again unless `skip` allows it. */
+  drop(laneId: string): void {
+    this.registered.delete(laneId);
+  }
+
   /** One pass over the lanes not yet registered; schedules a retry on failure. */
   async run(): Promise<void> {
     if (this.running || this.stopped) return;
@@ -104,8 +113,9 @@ export class LaneRegistrar {
         log("lane_registration_refused", { roomId: this.d.roomId, reason: "admission_not_in_fold" });
         return;
       }
-      if (gate === "waiting" && this.lanes.some((l) => !this.registered.has(l))) throw Object.assign(new Error("admission not yet in the fold"), { code: "admission_unverified" });
-      for (const laneId of this.lanes) {
+      const wanted = this.lanes.filter((l) => !this.d.skip?.(l));
+      if (gate === "waiting" && wanted.some((l) => !this.registered.has(l))) throw Object.assign(new Error("admission not yet in the fold"), { code: "admission_unverified" });
+      for (const laneId of wanted) {
         if (this.registered.has(laneId)) continue;
         const hosts = this.d.hosts();
         if (!hosts) throw Object.assign(new Error("no Paseo API yet"), { code: "no_api" });

@@ -50,7 +50,7 @@ import { rjcs } from "../proto/rjcs";
 import { sign } from "../proto/tbs";
 import { AUTHORITY_EXTENSION_TYPE, MLS_MESSAGE_MAX_BYTES, MLS_SUITE, type MlsAdapter, type MlsClientConfig, type MlsKeyPackage, type MlsPrivateKeyPackage, type MlsState } from "./adapter";
 import { checkCredential, MlsAuthService, referenceRosterOf, type ReferenceRoster } from "./auth-service";
-import { authorityExtension, encodeAad, epochAuth, mlsGroupId, parseAad, parseAppPayload, signMlsIdentity, type MlsAad } from "./formats";
+import { AppPayload, authorityExtension, encodeAad, epochAuth, mlsGroupId, parseAad, parseAppPayload, signMlsIdentity, type MlsAad } from "./formats";
 import { checkCommit, continuity, parseLeaves, pendingChanges, rosterEquality, type Leaf, type OpenRepair, type RuleRefusal } from "./roster-rule";
 
 export type MlsAlertType =
@@ -66,6 +66,8 @@ export type MlsAlertType =
 
 export type MlsAlert = { type: MlsAlertType; seq: number; at: number; detail?: string; peer?: { memberId: string; deviceId: string } };
 export type MlsMessage = { seq: number; epoch: number; from: { memberId: string; deviceId: string } | null; text: string };
+/** A `room.profile` or `member.profile` (R3.3), with the sender's leaf and its role in the verified roster at delivery. */
+export type MlsProfileEvent = { seq: number; epoch: number; from: { memberId: string; deviceId: string; role: string }; payload: Extract<AppPayload, { kind: "room.profile" | "member.profile" }> };
 
 /** One room session's request channel (room-client.ts, or the owner's local endpoint). Rejects with `{code, fields}`. */
 export interface MlsLink {
@@ -148,6 +150,13 @@ export interface MlsMemberOptions {
   /** Admin-signed `device.rekey.approved` for the admin route (4.4); only on an admin daemon. */
   onAlert?(a: MlsAlert): void;
   onMessage?(m: MlsMessage): void;
+  /** Profile payloads of other devices, once the state that consumed them is written (R3.3). */
+  onProfile?(e: MlsProfileEvent): void;
+  /**
+   * Payloads to re-announce in the group after a commit with an Add and after this device joins
+   * (R3.3): a joiner cannot read messages from before its epoch. Asked at send time.
+   */
+  announce?(): AppPayload[];
 }
 
 type Queued = { signed: SignedEntry; before: Readonly<RoomState>; after: Readonly<RoomState> };
@@ -175,6 +184,11 @@ export class MlsMember {
   readonly groupKey: string;
   readonly alerts: MlsAlert[] = [];
   readonly messages: MlsMessage[] = [];
+  /** Profile payloads received (newest 200), for tests and the runtime's names book. */
+  readonly profiles: MlsProfileEvent[] = [];
+  /** Settable after construction (tests); the runtime passes them as options. */
+  onProfile: ((e: MlsProfileEvent) => void) | null;
+  announce: (() => AppPayload[]) | null;
   private rec: MemberRecord;
   private state: MlsState | null = null;
   private readonly auth = new MlsAuthService();
@@ -193,6 +207,8 @@ export class MlsMember {
   /** Eligible devices to try now: armed at admission and when the device publishes KeyPackages. */
   private readonly promptArmed = new Set<string>();
   private witnessAt: number | null = null;
+  /** Profile re-announcement (R3.3): after a commit with an Add, and after this device joined. */
+  private announceAt: number | null = null;
   private anchorsSeen = new Map<number, Set<string>>();
   private retryAt = 0;
   private refreshRetryAt = 0;
@@ -204,6 +220,7 @@ export class MlsMember {
   private pumpStuck = false;
   private sawGroupCommit = false;
   private deliverAfterSave: MlsMessage[] = [];
+  private profilesAfterSave: MlsProfileEvent[] = [];
   private device: { sigPub: string; sigKey: KeyObject };
   private nextDevice: { sigPub: string; sigKey: KeyObject } | null = null;
   private readonly now: () => number;
@@ -214,6 +231,8 @@ export class MlsMember {
     this.now = o.now ?? Date.now;
     this.random = o.random ?? Math.random;
     this.device = o.device;
+    this.onProfile = o.onProfile ?? null;
+    this.announce = o.announce ?? null;
     this.groupId = mlsGroupId(o.genesisHash, 0, o.scope ?? null);
     this.groupKey = b64u(this.groupId);
     this.config = o.adapter.config(this.auth);
@@ -321,6 +340,22 @@ export class MlsMember {
   }
 
   /**
+   * Sends a `room.profile` or `member.profile` (R3.3), checked against the payload schema. The device
+   * does not process its own message, so the caller applies it locally with the returned `seq`.
+   */
+  async sendProfile(p: Extract<AppPayload, { kind: "room.profile" | "member.profile" }>): Promise<{ seq: number }> {
+    const parsed = AppPayload.safeParse(p);
+    if (!parsed.success || (parsed.data.kind !== "room.profile" && parsed.data.kind !== "member.profile")) throw new MlsMemberError("refused", "not a profile payload");
+    await this.idle();
+    await this.maintain({ removalsOnly: true });
+    return this.locked(async () => {
+      const why = this.canSendReason();
+      if (why) throw new MlsMemberError(why === "no_group" ? "no_group" : why === "stalled" ? "stalled" : why === "unconfirmed" ? "unconfirmed" : "blocked", `cannot send: ${why}`);
+      return this.sendPayload(rjcs(parsed.data, 64 * 1024));
+    });
+  }
+
+  /**
    * One maintenance pass: create the group (creator), publish KeyPackages, commit pending changes,
    * send a due witness, time out the joiner check. Safe to call often.
    */
@@ -350,6 +385,7 @@ export class MlsMember {
       if (this.state && this.o.adapter.isActive(this.state) && !this.rec.stalled) {
         await this.commitPending(opts.removalsOnly === true);
         if (!opts.removalsOnly) await this.dueWitness();
+        if (!opts.removalsOnly) await this.dueAnnounce();
         if (!opts.removalsOnly) await this.dueRefresh();
       }
       this.checkJoinTimeout();
@@ -519,12 +555,22 @@ export class MlsMember {
       this.save();
     } catch (e) {
       this.deliverAfterSave = [];
+      this.profilesAfterSave = [];
       throw e;
     }
     for (const m of this.deliverAfterSave.splice(0)) {
       this.messages.push(m);
       if (this.messages.length > 500) this.messages.shift();
       this.o.onMessage?.(m);
+    }
+    for (const p of this.profilesAfterSave.splice(0)) {
+      this.profiles.push(p);
+      if (this.profiles.length > 200) this.profiles.shift();
+      try {
+        this.onProfile?.(p);
+      } catch (e) {
+        log("mls_profile_hook_failed", { roomId: this.o.roomId, error: String((e as Error)?.message ?? e).slice(0, 120) });
+      }
     }
     const link = this.o.link();
     if (link) await link.request({ t: "msg.ack", seq: q.signed.entry.seq, epoch: this.epoch ?? 0 }).catch(() => undefined);
@@ -553,6 +599,7 @@ export class MlsMember {
       if (this.pendingOwn.refresh) this.rec.refresh = { at: this.now(), sent: 0 };
       // The committer holds the new epoch too and witnesses it like every other device (5.1).
       if (this.pendingOwn.adds > 0) this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
+      if (this.pendingOwn.adds > 0) this.announceAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
       this.pendingOwn = null;
       this.rec.stalled = null;
       return;
@@ -638,6 +685,7 @@ export class MlsMember {
     }
     this.state = result.newState;
     if (v.adds > 0) this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
+    if (v.adds > 0) this.announceAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
   }
 
   private async onApplication(q: Queued, body: Uint8Array, peek: Extract<ReturnType<MlsAdapter["peek"]>, { wireformat: "mls_private_message" }>): Promise<void> {
@@ -669,6 +717,11 @@ export class MlsMember {
     if (payload?.kind === "chat.message") {
       // Shown once the state that consumed it is written (8.2): a crash before the write shows it once, later.
       this.deliverAfterSave.push({ seq: e.seq, epoch: peek.epoch, from: { memberId: sender.memberId, deviceId: sender.deviceId }, text: payload.text });
+    }
+    if (payload?.kind === "room.profile" || payload?.kind === "member.profile") {
+      // The sender's role in the verified roster now (room.profile needs an admin; room-book.ts decides).
+      const role = cur.members[sender.memberId]?.role ?? "";
+      this.profilesAfterSave.push({ seq: e.seq, epoch: peek.epoch, from: { memberId: sender.memberId, deviceId: sender.deviceId, role }, payload });
     }
   }
 
@@ -787,6 +840,8 @@ export class MlsMember {
     this.save();
     await ack();
     log("mls_joined", { roomId: this.o.roomId, seq: e.seq, epoch, lastResort: kp.lastResort });
+    // R3.3: tell the group this device's profile once it may send (after the joiner check).
+    this.announceAt = this.now();
     if (kp.lastResort) this.retryAt = 0;
     return "joined";
   }
@@ -943,6 +998,31 @@ export class MlsMember {
       await this.sendPayload(rjcs({ kind: "log.witness", witness, sig }));
     } catch (e) {
       log("mls_witness_failed", { roomId: this.o.roomId, code: (e as { code?: string }).code ?? "error" });
+    }
+  }
+
+  /**
+   * R3.3: re-announce profiles (the runtime's `announce`) after a commit with an Add, so a joiner, which
+   * cannot read earlier epochs, learns the room name and members' display names. Waits while the device
+   * may not send (a joiner until its epoch is confirmed); the payloads are taken at send time.
+   */
+  private async dueAnnounce(): Promise<void> {
+    if (this.announceAt === null || this.now() < this.announceAt || !this.state || !this.latest || !this.announce) return;
+    if (this.canSendReason() !== null) return;
+    this.announceAt = null;
+    let list: AppPayload[];
+    try {
+      list = this.announce();
+    } catch {
+      return;
+    }
+    for (const p of list.slice(0, 4)) {
+      if (p.kind !== "room.profile" && p.kind !== "member.profile") continue;
+      try {
+        await this.sendPayload(rjcs(p, 64 * 1024));
+      } catch (e) {
+        log("mls_announce_failed", { roomId: this.o.roomId, kind: p.kind, code: (e as { code?: string }).code ?? "error" });
+      }
     }
   }
 

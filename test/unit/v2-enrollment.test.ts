@@ -25,7 +25,7 @@ import { generateNoiseKeyPair, type NoiseKeyPair } from "../../server/noise/hand
 import { b64u, b64uDecode } from "../../server/proto/b64u";
 import { computeSas, enrollSigned, enrollTokenMac, sasCommitOf, signEnroll, tokenKeyOf, verifyEnrollSig } from "../../server/proto/enroll";
 import { inviteRef } from "../../server/proto/ids";
-import { ed25519PrivateKeyFromSeed, rawPublicKey } from "../../server/proto/keys";
+import { ed25519PrivateKeyFromSeed, fingerprintOfKid, kid as kidOf, rawPublicKey } from "../../server/proto/keys";
 import { rjcsParse, rjcsText } from "../../server/proto/rjcs";
 import { hkdf, sign, tbs } from "../../server/proto/tbs";
 import { memberRelayAddress } from "../../server/runtime-v2";
@@ -350,6 +350,12 @@ test("enroll.pending discloses only the genesis and the authority-key chain: no 
     const m2 = memberJoin(env, third.code, "third");
     await until("third member SAS", () => m2.view().sas);
     assert.equal(m2.journal.state, "pending", "the member accepted the minimal chain");
+    // R3.6 (enrollment 6.4): the SAS screen shows the owner fingerprints, genesis admin first.
+    const genesisAdmin = (pending.genesis as any).body.admins[0].kid as string;
+    const newKid = kidOf("ed25519", rawPublicKey(newAdmin));
+    assert.deepEqual(r.currentAdminKids, [genesisAdmin, newKid]);
+    assert.deepEqual(m2.view().ownerFingerprints, [fingerprintOfKid(genesisAdmin), fingerprintOfKid(newKid)]);
+    assert.match(m2.view().ownerFingerprints[0], /^[a-z2-7]{4}( [a-z2-7]{4}){7}$|^[a-z2-7]{4}(-[a-z2-7]{4}){7}$/);
     assert.deepEqual(m2.journal.preAdmissionAnchors().map((a) => [a.source, a.signed.entry.type]), [["authority_chain", "admin.added"]]);
     // Tampering and non-chain entries are refused.
     const dec = (b: string) => b64uDecode(b, Math.floor((b.length * 6) / 8));
@@ -358,6 +364,14 @@ test("enroll.pending discloses only the genesis and the authority-key chain: no 
     const rec = env.room.host.entries(0).find((x) => x.signed.entry.type === "member.admitted")!;
     const smuggled = { seq: rec.signed.entry.seq, entries: [rec.signed], bodies: [{ seq: rec.signed.entry.seq, body: b64u(rec.body) }] };
     assert.throws(() => verifyAuthorityChain(pending.genesis, smuggled, dec), /outside the authority chain/);
+    // A removed admin key is no longer shown as an owner fingerprint (display only; the chain still verifies).
+    admin("admin.removed", { kid: newKid });
+    const fourth = env.en.createInvite({ note: "fourth" });
+    const s2 = await rawSession(env);
+    const pending2 = await s2.c.request(requestFrame(env, s2, { inviteId: fourth.inviteId, token: tokenOf(fourth.code) }));
+    const r2 = verifyAuthorityChain(pending2.genesis, pending2.authority as any, dec);
+    assert.deepEqual(r2.currentAdminKids, [genesisAdmin]);
+    assert.equal(r2.adminKids.length, 2, "certified keys are not narrowed");
   } finally {
     await env.cleanup();
   }
@@ -806,7 +820,7 @@ test("P-20: plaintext and IP-literal relays are refused; an unknown relay needs 
   assert.deepEqual(memberRelayAddress({ host: "relay.paseo.sh", port: 443 }, { PASEO_ROOMS_DEV_INSECURE_RELAY: "1", PASEO_ROOMS_RELAY_TLS: "false" }), { endpoint: "relay.paseo.sh:443", useTls: true });
   assert.deepEqual(memberRelayAddress({ host: "127.0.0.1", port: 6923 }, { PASEO_ROOMS_RELAY_TLS: "false" }), { endpoint: "127.0.0.1:6923", useTls: true });
   assert.deepEqual(memberRelayAddress({ host: "127.0.0.1", port: 6923 }, { PASEO_ROOMS_DEV_INSECURE_RELAY: "1" }), { endpoint: "127.0.0.1:6923", useTls: false });
-  assert.equal(laneHostLabel({ verifiedName: "Lab‮ analysis", roomId: "room_0123456789abcdef" }, "GPU box"), "Room lane: Lab analysis · GPU box");
+  assert.equal(laneHostLabel({ verifiedName: "Lab‮ analysis", roomId: "room_0123456789abcdef" }, "GPU box"), "Room lane: Lab analysis (room_01234567) · GPU box");
   assert.equal(laneHostLabel({ verifiedName: null, roomId: "room_0123456789abcdef" }), "Room lane: room_01234567");
 });
 

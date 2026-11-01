@@ -38,8 +38,8 @@ import { b64u, b64uDecode, b64uDecodeVar } from "../proto/b64u";
 import { computeSas, enrollSigned, enrollTokenMac, signEnroll } from "../proto/enroll";
 import { newDeviceKeyChange, signNewKey } from "../proto/device-link";
 import { inviteRef } from "../proto/ids";
-import { ed25519PrivateKeyFromSeed, rawPublicKey, x25519PrivateKeyFromSecret } from "../proto/keys";
-import { rjcs, rjcsText, RJCS_MAX_BYTES, RJCS_MAX_FRAME_BYTES } from "../proto/rjcs";
+import { ed25519PrivateKeyFromSeed, fingerprintOfKid, rawPublicKey, x25519PrivateKeyFromSecret } from "../proto/keys";
+import { rjcs, rjcsParse, rjcsText, RJCS_MAX_BYTES, RJCS_MAX_FRAME_BYTES } from "../proto/rjcs";
 import type { Frame } from "../transport/records";
 import type { RelayAddress } from "../transport/relay-server";
 import type { RoomSessionTimings } from "../transport/room-session";
@@ -120,6 +120,12 @@ export type JoinView = {
   roomName: string;
   /** "317 837" once computed. */
   sas: string | null;
+  /**
+   * Enrollment 6.4 (R3.6): display fingerprints (signatures-and-encoding 5.3) of the room's admin keys
+   * as the verified pre-admission chain leaves them, genesis lineage first; empty before `pending`.
+   * Unverified until the codes match, like the room name.
+   */
+  ownerFingerprints: string[];
   terms: { role: string; lanes: string[] } | null;
   expiresAt: number | null;
   failure: string | null;
@@ -136,6 +142,7 @@ export class MemberEnrollment {
   private stopped = false;
   private running: Promise<void> | null = null;
   private watchdog: ReturnType<typeof setInterval> | null = null;
+  private owners: { pendingId: string; fingerprints: string[] } | null = null;
 
   constructor(private readonly o: MemberEnrollmentOptions) {}
 
@@ -154,12 +161,32 @@ export class MemberEnrollment {
       state: e.state,
       roomName: e.invite.roomName,
       sas: e.sas ? `${e.sas.slice(0, 3)} ${e.sas.slice(3)}` : null,
+      ownerFingerprints: this.ownerFingerprints(),
       terms: e.terms,
       expiresAt: e.expiresAt,
       failure: e.failure,
       connection: this.connection,
       lastError: this.lastError,
     };
+  }
+
+  /**
+   * The owner fingerprints of the journaled `enroll.pending` (verified before it was journaled; the
+   * chain is verified again here, once per pending, so a damaged copy shows nothing rather than a guess).
+   */
+  private ownerFingerprints(): string[] {
+    const e = this.o.journal.e;
+    if (!e.pending || !e.pendingId) return [];
+    if (this.owners?.pendingId === e.pendingId) return this.owners.fingerprints;
+    let fingerprints: string[] = [];
+    try {
+      const p = rjcsParse(Buffer.from(e.pending, "utf8"), RJCS_MAX_FRAME_BYTES) as { genesis?: unknown; authority?: { seq: number; entries: unknown[]; bodies: { seq: number; body: string }[] } };
+      if (p.authority) fingerprints = verifyAuthorityChain(p.genesis, p.authority, (b) => new Uint8Array(b64uDecodeVar(b, RJCS_MAX_BYTES))).currentAdminKids.map(fingerprintOfKid).slice(0, 8);
+    } catch {
+      fingerprints = [];
+    }
+    this.owners = { pendingId: e.pendingId, fingerprints };
+    return fingerprints;
   }
 
   /** Runs from the journal state (also at plugin start). Resolves when this attempt settled. */

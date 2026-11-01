@@ -24,6 +24,7 @@ import {
   roomsV2JoinAdmit,
   roomsV2JoinReject,
   roomsV2LaneErrors,
+  roomsV2LaneClose,
   roomsV2LaneRotate,
   roomsV2MemberRemove,
   roomsV2MemberRole,
@@ -34,6 +35,7 @@ import {
 } from "../shared/rpc-v2";
 import { Badge, Button, ConfirmButton, Dot, errorText, relativeTime, Section, Segmented, type Styles } from "./ui";
 import { RecoveryCodeModal, SasDigits, useAdminConfirm, type RecoveryOffer } from "./v2-dialogs";
+import { ActivityListV2, NameEditorV2 } from "./v2-activity";
 import { shortId } from "./v2-text";
 
 export type OwnedV2 = z.infer<typeof OwnedRoomV2View>;
@@ -70,6 +72,7 @@ export function OwnedRoomCardV2({ view, theme, styles, compact }: { view: OwnedV
   const toast = useToast();
   const admin = useAdminConfirm(theme, styles);
   const [tab, setTab] = useState<"members" | "lanes" | "keys">("members");
+  const [showActivity, setShowActivity] = useState(false);
   const [recovery, setRecovery] = useState<RecoveryOffer | null>(null);
   const refresh = () => void qc.invalidateQueries({ queryKey: STATUS_V2_KEY });
   const roomId = view.roomId;
@@ -87,7 +90,10 @@ export function OwnedRoomCardV2({ view, theme, styles, compact }: { view: OwnedV
   const connected = actives.filter((m) => m.devices.some((d) => d.connected)).length;
   const labelOf = (memberId: string) => {
     const m = view.roster.find((x) => x.memberId === memberId);
-    return m?.self ? "You" : m?.label ? `${m.label} (${shortId(memberId)})` : `Member ${shortId(memberId)}`;
+    // R3.3: the MLS display name (untrusted, always with the id; look-alikes flagged), else the label from the join.
+    if (m?.self) return "You";
+    if (m?.displayName) return `${m.displayName} (${shortId(memberId)})${m.nameCollision ? " [same name as another member]" : ""}`;
+    return m?.label ? `${m.label} (${shortId(memberId)}, self-reported at join)` : `Member ${shortId(memberId)}`;
   };
   const openJoins = view.joinRequests.filter((j) => j.state !== "admitted" && j.state !== "closed" && j.kind === "invite");
   const pendingDevices = view.deviceRequests.filter((d) => d.status === "pending");
@@ -97,7 +103,7 @@ export function OwnedRoomCardV2({ view, theme, styles, compact }: { view: OwnedV
     <View style={styles.card}>
       <View style={styles.between}>
         <View style={{ flexShrink: 1, gap: 2 }}>
-          <Text style={styles.h2}>Room {shortId(roomId)}</Text>
+          <Text style={styles.h2}>{view.roomName ? `${view.roomName} (${shortId(roomId)})` : `Room ${shortId(roomId)}`}</Text>
           <Text style={styles.small}>
             {view.members} member(s) · {connected} connected · log at seq {view.head.seq}
           </Text>
@@ -251,6 +257,16 @@ export function OwnedRoomCardV2({ view, theme, styles, compact }: { view: OwnedV
       {tab === "members" ? <MembersTab view={view} theme={theme} styles={styles} admin={admin} refresh={refresh} labelOf={labelOf} /> : null}
       {tab === "lanes" ? <LanesTab view={view} theme={theme} styles={styles} admin={admin} refresh={refresh} /> : null}
       {tab === "keys" ? <KeysTab view={view} theme={theme} styles={styles} admin={admin} refresh={refresh} onRecovery={setRecovery} /> : null}
+
+      {!view.keys.closed ? (
+        <View style={{ gap: 6 }}>
+          {view.keys.adminKid ? <NameEditorV2 roomId={roomId} kind="room" current={view.roomName} theme={theme} styles={styles} /> : null}
+          <NameEditorV2 roomId={roomId} kind="member" current={view.roster.find((m) => m.self)?.displayName ?? null} theme={theme} styles={styles} />
+        </View>
+      ) : null}
+      {view.adminFingerprint ? <Text style={styles.small}>Your owner fingerprint (people joining see it next to their code): {view.adminFingerprint}</Text> : null}
+      <Button theme={theme} label={showActivity ? "Hide activity" : `Activity (${view.activity.length})`} onPress={() => setShowActivity((v) => !v)} />
+      {showActivity ? <ActivityListV2 items={view.activity} who={(id) => (id ? labelOf(id) : "Someone")} theme={theme} styles={styles} /> : null}
 
       {admin.element}
       <RecoveryCodeModal
@@ -430,6 +446,7 @@ function LanesTab({ view, theme, styles, admin, refresh }: TabProps) {
   const createInvite = useRpc(roomsV2InviteCreate);
   const revokeInvite = useRpc(roomsV2InviteRevoke);
   const rotateLane = useRpc(roomsV2LaneRotate);
+  const closeLane = useRpc(roomsV2LaneClose);
   const [role, setRole] = useState<Role>("watch");
   const [lanes, setLanes] = useState<string[]>([]);
   const [note, setNote] = useState("");
@@ -461,12 +478,18 @@ function LanesTab({ view, theme, styles, admin, refresh }: TabProps) {
                   label="Rotate lane"
                   onPress={() => admin.open({ kind: "lane.rotate", roomId, laneId: l.laneId }, (t) => rotateLane({ roomId, laneId: l.laneId, confirmToken: t }), { onDone: refresh, success: "Lane rotated" })}
                 />
+                <Button
+                  theme={theme}
+                  variant="danger"
+                  label="Close lane"
+                  onPress={() => admin.open({ kind: "lane.close", roomId, laneId: l.laneId }, (t) => closeLane({ roomId, laneId: l.laneId, confirmToken: t }), { onDone: refresh, success: "Lane closed" })}
+                />
                 <LaneErrorsV2 roomId={roomId} laneId={l.laneId} theme={theme} styles={styles} />
               </View>
             ) : null}
           </View>
         ))}
-        <Text style={styles.small}>Closing a lane is not available in this build yet.</Text>
+        {open.length ? <Text style={styles.small}>Closing a lane stops sharing that agent with the room. The agent keeps running on this daemon. A closed lane cannot be reopened.</Text> : null}
       </Section>
 
       <Section styles={styles} title="Invite someone">

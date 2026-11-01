@@ -408,6 +408,14 @@ export class EnrollmentJournal {
     this.update({ registrations: { ...this.st.enrollment.registrations, [laneId]: registrationId } });
   }
 
+  /** R3.7: a lane closed or no longer granted; its registration was removed (or handed to the stale-host list). */
+  dropRegistration(laneId: string): void {
+    this.expect("admitted", "registered");
+    if (!(laneId in this.st.enrollment.registrations)) return;
+    const { [laneId]: _gone, ...rest } = this.st.enrollment.registrations;
+    this.update({ registrations: rest });
+  }
+
   registered(): void {
     this.expect("admitted", "registered");
     if (this.state === "admitted") this.update({ state: "registered" });

@@ -79,11 +79,13 @@ export function requireRelayTrust(preview: InvitePreview, trustRelay: boolean): 
 
 /**
  * Lane host label (2.3, P-20): always "Room lane: " plus the room name, never an owner-chosen string
- * alone. The verified room name arrives with MLS (`room.profile`, I-13); until then the room id is used.
+ * alone. The room name arrives with MLS (`room.profile` from an admin, R3.3); until then the room id
+ * is used. With a name, the short room id follows it, so two rooms given the same name stay apart.
  */
 export function laneHostLabel(room: { verifiedName: string | null; roomId: string }, laneLabel?: string | null): string {
   const clean = (s: string, n: number) => s.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, "").trim().slice(0, n);
-  const name = room.verifiedName ? clean(room.verifiedName, 80) : room.roomId.slice(0, 13);
+  const id = room.roomId.slice(0, 13);
+  const name = room.verifiedName ? clean(room.verifiedName, 80) : "";
   const lane = laneLabel ? clean(laneLabel, 60) : "";
-  return `Room lane: ${name || room.roomId.slice(0, 13)}${lane ? ` · ${lane}` : ""}`;
+  return `Room lane: ${name ? `${name} (${id})` : id}${lane ? ` · ${lane}` : ""}`;
 }
