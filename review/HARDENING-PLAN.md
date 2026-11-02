@@ -200,3 +200,12 @@ After Spike A (`spikes/security/RESULTS.md`):
 3. **Proposal (c):** after admission, the member checks every pre-admission authority-chain entry against the fetched log; a mismatch is equivocation evidence.
 4. **Joiner confirmation:** a joiner's epoch is confirmed by matching anchors from min(2, number of other leaves) other leaves.
 5. **Prompt Add:** the admitting admin daemon adds a newly admitted device to the room group at once; the repair path is only the fallback.
+
+## Decisions, round 10 (user approved, 2026-11-02: "go with your recs")
+
+1. **Publishing:** a private GitHub repository first, with the plugin installed from Git; npm later. The user creates the repository. Nothing is pushed without the user's go-ahead.
+2. **Paseo version range:** `>=0.13.2 <0.14.0`, plus the R2.7 compatibility guard.
+3. **Pilot platforms:** Linux only for v0.2. macOS and Windows stay marked untested.
+5. **Attack harness:** draft the remaining modules (credential-negative and resource-stress) as reviewable test code against our own test daemons only. They are not run until the user approves.
+6. **Joiner witness:** joiners also send `log.witness` after processing their Welcome.
+7. **v2 UI check:** the user runs it with `ui-check/up-v2.sh` before a labmate installs the plugin.
