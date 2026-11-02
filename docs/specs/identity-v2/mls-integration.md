@@ -302,6 +302,27 @@ In a group of two leaves the committer's witness (below) confirms the joiner's e
 
 **Who witnesses.** "Every device that processes a commit containing an Add" includes the committer, which adopts its own commit without processing it (written in after I-13). Without the committer's witness a joiner of a two-leaf group would have no anchor at all.
 
+### 5.2 Chat messages: sender signature
+
+Added for product M2 chat (usability roadmap R3.4; plan follow-up "Sender attribution of MLS application messages"). ts-mls 1.6.4 does not return the sender of an application message; the adapter infers the sender leaf from which application ratchet advanced in the secret tree (section 5.1). Chat attribution must not rest on that inference alone, so every chat message carries a signature by the sender's device signing key inside the encrypted payload:
+
+```
+payload = RJCS({ kind: "chat.message", msg: ChatMessage, sig })
+ChatMessage = { v: 2, typ: "chat-message",
+                roomId, groupId: b64u(groupId), epoch,    // the group and epoch the message is encrypted in
+                memberId, deviceId,                        // the sender's leaf
+                ts,                                        // the sender's clock, unix ms (a claim)
+                text }                                     // 1 to 4000 UTF-16 code units, plain text
+sig = b64u(Sign(deviceSigKey, "chat-message", RJCS(msg)))
+```
+
+- **Sender.** The device signs with the key named as `deviceSig` in its own current leaf. A device whose leaf does not hold its current key (between a rekey approval and its Welcome) does not send.
+- **Receiver.** After decryption, the message is accepted only if `roomId`, `groupId` and `epoch` equal the receiving group and the epoch the message decrypted in, `memberId` and `deviceId` equal the inferred sender leaf, and `sig` verifies with that leaf's `deviceSig`; the leaf must also be in the current roster (section 9). Otherwise the message is dropped and **`chat_attribution_failed`** is raised with the inferred leaf as `peer` and the failing check (`wrong_room`, `wrong_group`, `wrong_epoch`, `wrong_sender`, `bad_signature`) as detail. It does not stop sending.
+- **What it adds.** A member that knows the epoch secrets cannot attribute a message to another member's device without that device's signing key, and a signed message replayed into another group or epoch is refused. Within one epoch, a sender's own message replayed by the host is already refused by MLS (generation reuse). The signature is visible only to group members; it is evidence among them, not towards the host.
+- **Storage and acknowledgement (8.2).** An accepted message is written to the device's sealed chat store before the group state that consumed it, and both before `msg.ack`. The store keeps one message per log position, so a crash between the writes re-delivers a message without duplicating it. Display order is the log position. Retention is local policy (implementation: at most 2,048 messages, about 8 MiB of text and 90 days per room).
+- **Rendering.** `text` is untrusted plain text. Receivers remove control characters other than newline and tab and bidi embedding, override and isolate characters, and never render it as markup.
+- Vector: `mls.chatMessage` (the signed object, its signature and the payload bytes). Earlier development builds sent `{kind: "chat.message", text}` without a signature; receivers refuse it (schema).
+
 ## 6. Delivery service on the host
 
 ### 6.1 Operations (room session, `enrollment-v2.md` section 4)

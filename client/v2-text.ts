@@ -33,6 +33,8 @@ export function alertText(type: string): { text: string; tone: Tone; stopsSendin
       return { text: "This device's room state is older than what the host last saw. It may be a restored copy; link the device again.", tone: "danger", stopsSending: true };
     case "welcome_refused":
       return { text: "This device could not join the room group from the invitation it received.", tone: "warn", stopsSending: false };
+    case "chat_attribution_failed":
+      return { text: "A chat message did not carry a valid signature of the device it came from, or was bound to another group state. It was not shown. Admins were told the sending device.", tone: "danger", stopsSending: false };
     case "host_fault":
       return { text: "The host sent the room group something invalid.", tone: "warn", stopsSending: false };
     default:

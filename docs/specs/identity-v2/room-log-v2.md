@@ -216,7 +216,7 @@ Application message payloads (inside MLS, invisible to the host) are RJCS object
 
 | `kind` | Content |
 |---|---|
-| `chat.message` | text, thread, mentions (M2 chat spec) |
+| `chat.message` | a `ChatMessage` signed by the sender's device (`mls-integration.md` section 5.2): text; threads and mentions later |
 | `member.profile` | `{ memberId, label }` (labels never appear in plaintext) |
 | `room.profile` | `{ name, description }` |
 | `lane.meta` | `{ laneId, label, origin, agentId, parentAgentId, contextItems, contextChars }` |

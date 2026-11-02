@@ -8,8 +8,9 @@
 // is a bearer secret: it is returned once to the caller and never logged. Device links (I-11): a
 // member device creates a `prl2.` link code (also a bearer secret, returned once), compares the SAS
 // with the new device and confirms; the new device joins with `rooms.v2.join.*`. Members veto, admins
-// approve held adds and resolve conflicts. `rooms.v2.mls.*` (I-13) send and read room group messages
-// for development; the chat UI is product milestone M2. `rooms.v2.test.clock.advance` is TEST-ONLY and registered
+// approve held adds and resolve conflicts. `rooms.v2.chat.*` (R3.4, product M2) send, list and mark
+// read the room's chat, which travels only inside the room's MLS group as messages signed by the
+// sender's device (mls-integration 5.2). `rooms.v2.test.clock.advance` is TEST-ONLY and registered
 // only on e2e test homes.
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
@@ -217,6 +218,13 @@ export const RosterMemberV2View = z.object({
   devices: z.array(z.object({ deviceId: z.string(), kind: z.enum(["person", "gateway"]), since: z.number().int().nullable(), connected: z.boolean() })),
 });
 
+/** R2.6: how "Also delete hosted rooms" can close a hosted room before deleting it (keys 6.8). */
+export const HostedClosurePlanV2 = z.object({
+  plan: z.enum(["already_closed", "confirm_proposal", "recovery_key", "none"]),
+  reason: z.enum(["recovery_code_required", "second_admin_required", "no_admin_key"]).nullable(),
+  message: z.string(),
+});
+
 export const OwnedRoomV2View = z.object({
   roomId: z.string(),
   serverId: z.string(),
@@ -236,6 +244,8 @@ export const OwnedRoomV2View = z.object({
   }),
   /** Independent admin lineages (room-log-v2 5.2): two or more need a second admin to confirm. */
   lineages: z.number().int(),
+  /** R2.6: whether "Also delete hosted rooms" can close this room first (keys 6.8), and why not. */
+  closeOnDelete: HostedClosurePlanV2.optional(),
   invites: z.array(InviteV2View),
   joinRequests: z.array(JoinRequestV2View),
   lanes: z.array(LaneV2View),
@@ -347,7 +357,9 @@ export const MlsV2View = z.object({
   stalled: z.boolean(),
   disabled: z.string().nullable(),
   canSend: z.boolean(),
+  /** Chat messages stored on this device for the room, and how many from others are unread (R3.4). */
   messages: z.number().int(),
+  unread: z.number().int().optional(),
   alerts: z.array(AlertV2),
 });
 
@@ -594,22 +606,64 @@ export const roomsV2ConflictResolve = defineRpc({
   output: z.object({ seq: z.number().int() }),
 });
 
-// ------------------------------------------------------------------------------ MLS (I-13)
+// ------------------------------------------------------------------------------ chat (R3.4, product M2)
 
-/** Development only: sends a `chat.message` in the room group (the chat UI is product milestone M2). */
-export const roomsV2MlsSend = defineRpc({
-  name: "rooms.v2.mls.send",
+/**
+ * Sends a chat message in the room group (mls-integration 5.2): plain text, signed by this device's key,
+ * encrypted for the room's current members. The host stores only ciphertext.
+ */
+export const roomsV2ChatSend = defineRpc({
+  name: "rooms.v2.chat.send",
   input: RoomIdIn.extend({ text: z.string().min(1).max(4000) }),
   output: z.object({ seq: z.number().int() }),
 });
 
-/** Development only: the messages this device decrypted in the room group since the daemon started. */
-export const roomsV2MlsMessages = defineRpc({
-  name: "rooms.v2.mls.messages",
-  input: RoomIdIn,
+/**
+ * One chat message as this device stored it. `verified`: the signature and its binding to the group,
+ * epoch and sending leaf checked out on receipt (`own` for this device's messages). `current`: the
+ * sending device is still in the verified roster. `hts`: host time of the entry; `ts`: the sender's clock.
+ * `text` is untrusted plain text: never render it as markup.
+ */
+export const ChatMessageV2View = z.object({
+  seq: z.number().int(),
+  hts: z.number().int(),
+  ts: z.number().int(),
+  memberId: z.string(),
+  deviceId: z.string(),
+  text: z.string(),
+  own: z.boolean(),
+  verified: z.enum(["verified", "own"]),
+  current: z.boolean(),
+});
+
+/** Newest `limit` messages before `before` (a log position), oldest first; names of their senders (R3.3). */
+export const roomsV2ChatList = defineRpc({
+  name: "rooms.v2.chat.list",
+  input: RoomIdIn.extend({ before: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(200).optional() }),
   output: z.object({
-    messages: z.array(z.object({ seq: z.number().int(), epoch: z.number().int(), from: z.object({ memberId: z.string(), deviceId: z.string() }).nullable(), text: z.string() })),
+    messages: z.array(ChatMessageV2View),
+    more: z.boolean(),
+    readSeq: z.number().int(),
+    unread: z.number().int(),
+    selfMemberId: z.string().nullable(),
+    names: z.array(MemberNameV2View),
+    /** Why this device cannot send now (`no_group`, `unconfirmed`, `blocked`, `ended`, ...), or null. */
+    cannotSend: z.string().nullable(),
   }),
+});
+
+/** Moves the read marker forward to `seq` (this device only). */
+export const roomsV2ChatRead = defineRpc({
+  name: "rooms.v2.chat.read",
+  input: RoomIdIn.extend({ seq: z.number().int().min(0) }),
+  output: z.object({ unread: z.number().int() }),
+});
+
+/** Unread chat messages per room on this device, for the sidebar row (cheap; no text). */
+export const roomsV2ChatUnread = defineRpc({
+  name: "rooms.v2.chat.unread",
+  input: Empty,
+  output: z.object({ total: z.number().int(), rooms: z.array(z.object({ roomId: z.string(), unread: z.number().int() })) }),
 });
 
 /** TEST-ONLY: registered only on e2e test homes (server/platform/test-clock.ts). */
@@ -668,8 +722,8 @@ export const roomsV2HostsCleanup = defineRpc({
 /**
  * R2.6 "Leave all rooms and delete keys": leaves every joined room (forgets those it cannot reach),
  * removes this plugin's lane hosts, deletes the KEK (keyring entry or fallback file) and the whole
- * plugin-data/rooms folder. Rooms this daemon hosts stop for good and need `deleteHosted: true`.
- * Afterwards Rooms stays stopped (`data_deleted`) until the daemon restarts. `confirm` is the typed word.
+ * plugin-data/rooms folder. Rooms this daemon hosts stop for good and need `deleteHosted: true`;
+ * each is first closed with `room.closed` where this daemon may (keys 6.8; `hostedClosed`). Afterwards Rooms stays stopped (`data_deleted`) until the daemon restarts. `confirm` is the typed word.
  */
 export const roomsV2DataDelete = defineRpc({
   name: "rooms.v2.data.delete",
@@ -677,6 +731,17 @@ export const roomsV2DataDelete = defineRpc({
   output: z.object({
     left: z.array(z.object({ roomId: z.string(), statement: z.enum(["member.left", "device.removed"]).nullable(), error: z.string().nullable() })),
     hostedDeleted: z.array(z.string()),
+    /** What was done about closing each hosted room before it was deleted (keys 6.8). */
+    hostedClosed: z.array(
+      z.object({
+        roomId: z.string(),
+        outcome: z.enum(["closed", "already_closed", "not_closed"]),
+        via: z.enum(["recovery_key", "confirmed_proposal"]).nullable(),
+        seq: z.number().int().nullable(),
+        reason: z.enum(["recovery_code_required", "second_admin_required", "no_admin_key", "error"]).nullable(),
+        message: z.string(),
+      }),
+    ),
     hostsRemoved: z.number().int(),
     hostsRemaining: z.array(StaleHostV2View),
     keystore: z.object({ backend: z.string().nullable(), kek: z.enum(["deleted", "absent", "kept", "failed"]), message: z.string().nullable() }),

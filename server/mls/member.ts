@@ -39,6 +39,12 @@
 //   a rekey requested before a restart (its `rekey` packages are already in the sealed record).
 // - State at rest (8): the group state is sealed (MlsStore) before `msg.ack`; `checkRollback` refuses a
 //   stored state older than the host's `lastAck` (8.4).
+// - Chat (5.2; R3.4): `chat.message` carries a `ChatMessage` signed by the sender's device key, bound to
+//   the group and epoch. It is accepted only when it names the leaf the message decrypted from and the
+//   signature verifies with that leaf's `deviceSig`; otherwise it is dropped and `chat_attribution_failed`
+//   is raised. Accepted messages go to `storeMessages` (the sealed chat store) before the state that
+//   consumed them is written, and both before `msg.ack` (8.2): a crash in between re-delivers the
+//   message, which the store drops by log position.
 // Nothing here logs key material, messages or package bytes.
 import type { KeyObject } from "node:crypto";
 import { bodyHash, type SignedEntry } from "../authority/entries";
@@ -50,7 +56,7 @@ import { rjcs } from "../proto/rjcs";
 import { sign } from "../proto/tbs";
 import { AUTHORITY_EXTENSION_TYPE, MLS_MESSAGE_MAX_BYTES, MLS_SUITE, type MlsAdapter, type MlsClientConfig, type MlsKeyPackage, type MlsPrivateKeyPackage, type MlsState } from "./adapter";
 import { checkCredential, MlsAuthService, referenceRosterOf, type ReferenceRoster } from "./auth-service";
-import { AppPayload, authorityExtension, encodeAad, epochAuth, mlsGroupId, parseAad, parseAppPayload, signMlsIdentity, type MlsAad } from "./formats";
+import { AppPayload, authorityExtension, checkChatMessage, encodeAad, epochAuth, mlsGroupId, parseAad, parseAppPayload, signChatMessage, signMlsIdentity, type MlsAad } from "./formats";
 import { checkCommit, continuity, parseLeaves, pendingChanges, rosterEquality, type Leaf, type OpenRepair, type RuleRefusal } from "./roster-rule";
 
 export type MlsAlertType =
@@ -62,10 +68,15 @@ export type MlsAlertType =
   | "leaf_replaced_unrequested"
   | "state_rollback"
   | "welcome_refused"
-  | "host_fault";
+  | "host_fault"
+  | "chat_attribution_failed";
 
 export type MlsAlert = { type: MlsAlertType; seq: number; at: number; detail?: string; peer?: { memberId: string; deviceId: string } };
-export type MlsMessage = { seq: number; epoch: number; from: { memberId: string; deviceId: string } | null; text: string };
+/**
+ * A chat message whose signature and binding checked out (5.2). `hts`: the host time of its log entry;
+ * `ts`: the sender's own clock (a claim).
+ */
+export type MlsMessage = { seq: number; epoch: number; hts: number; ts: number; from: { memberId: string; deviceId: string }; text: string };
 /** A `room.profile` or `member.profile` (R3.3), with the sender's leaf and its role in the verified roster at delivery. */
 export type MlsProfileEvent = { seq: number; epoch: number; from: { memberId: string; deviceId: string; role: string }; payload: Extract<AppPayload, { kind: "room.profile" | "member.profile" }> };
 
@@ -150,6 +161,11 @@ export interface MlsMemberOptions {
   /** Admin-signed `device.rekey.approved` for the admin route (4.4); only on an admin daemon. */
   onAlert?(a: MlsAlert): void;
   onMessage?(m: MlsMessage): void;
+  /**
+   * Persists the chat messages one entry delivered, before the state that consumed them is written and
+   * before the ack (8.2; R3.4). Must be idempotent by `seq` and throw when it could not write.
+   */
+  storeMessages?(m: MlsMessage[]): void;
   /** Profile payloads of other devices, once the state that consumed them is written (R3.3). */
   onProfile?(e: MlsProfileEvent): void;
   /**
@@ -188,6 +204,7 @@ export class MlsMember {
   readonly profiles: MlsProfileEvent[] = [];
   /** Settable after construction (tests); the runtime passes them as options. */
   onProfile: ((e: MlsProfileEvent) => void) | null;
+  storeMessages: ((m: MlsMessage[]) => void) | null;
   announce: (() => AppPayload[]) | null;
   private rec: MemberRecord;
   private state: MlsState | null = null;
@@ -232,6 +249,7 @@ export class MlsMember {
     this.random = o.random ?? Math.random;
     this.device = o.device;
     this.onProfile = o.onProfile ?? null;
+    this.storeMessages = o.storeMessages ?? null;
     this.announce = o.announce ?? null;
     this.groupId = mlsGroupId(o.genesisHash, 0, o.scope ?? null);
     this.groupKey = b64u(this.groupId);
@@ -326,16 +344,25 @@ export class MlsMember {
     return null;
   }
 
-  /** Sends a `chat.message` application message. Pending removals are committed first (6.3). */
-  async sendText(text: string): Promise<{ seq: number }> {
+  /**
+   * Sends a signed `chat.message` (5.2): the device key of this device's own leaf signs the text bound
+   * to the group and the current epoch. Pending removals are committed first (6.3). The device does not
+   * process its own message, so the caller stores it with the returned `seq`.
+   */
+  async sendText(text: string): Promise<{ seq: number; epoch: number; ts: number; from: { memberId: string; deviceId: string } }> {
     await this.idle();
     await this.maintain({ removalsOnly: true });
     return this.locked(async () => {
       const why = this.canSendReason();
       if (why) throw new MlsMemberError(why === "no_group" ? "no_group" : why === "stalled" ? "stalled" : why === "unconfirmed" ? "unconfirmed" : "blocked", `cannot send: ${why}`);
-      const payload = rjcs({ kind: "chat.message", text }, 64 * 1024);
-      const r = await this.sendPayload(payload);
-      return r;
+      const own = this.currentLeaves().find((l) => l.leafIndex === this.o.adapter.ownLeafIndex(this.state!));
+      const key = [this.device, this.nextDevice].find((d) => d && own && d.sigPub === own.deviceSig);
+      if (!own || !key) throw new MlsMemberError("not_ready", "cannot send: this device's leaf does not hold its current key");
+      const epoch = this.o.adapter.epoch(this.state!);
+      const ts = this.now();
+      const payload = signChatMessage({ v: 2, typ: "chat-message", roomId: this.o.roomId, groupId: this.groupKey, epoch, memberId: own.memberId, deviceId: own.deviceId, ts, text }, key.sigKey);
+      const r = await this.sendPayload(rjcs(payload, 64 * 1024));
+      return { seq: r.seq, epoch, ts, from: { memberId: own.memberId, deviceId: own.deviceId } };
     });
   }
 
@@ -552,6 +579,8 @@ export class MlsMember {
     this.bodies.delete(q.signed.entry.seq);
     if (!mls) return true;
     try {
+      // The chat store first, then the state (8.2): a crash between them re-delivers, never loses.
+      if (this.deliverAfterSave.length > 0 && this.storeMessages) this.storeMessages(this.deliverAfterSave.map((m) => ({ ...m, from: { ...m.from } })));
       this.save();
     } catch (e) {
       this.deliverAfterSave = [];
@@ -715,8 +744,11 @@ export class MlsMember {
     this.noteAnchor(peek.epoch, aad.epochAuth, sender.deviceId);
     const payload = parseAppPayload(r.plaintext);
     if (payload?.kind === "chat.message") {
+      // 5.2: the signed object must name this group, this epoch and the leaf it decrypted from.
+      const v = checkChatMessage(payload, { roomId: this.o.roomId, groupId: this.groupId, epoch: peek.epoch, sender });
+      if (!v.ok) this.raise("chat_attribution_failed", e.seq, `chat message refused: ${v.reason}`, { memberId: sender.memberId, deviceId: sender.deviceId });
       // Shown once the state that consumed it is written (8.2): a crash before the write shows it once, later.
-      this.deliverAfterSave.push({ seq: e.seq, epoch: peek.epoch, from: { memberId: sender.memberId, deviceId: sender.deviceId }, text: payload.text });
+      else this.deliverAfterSave.push({ seq: e.seq, epoch: peek.epoch, hts: e.hts, ts: payload.msg.ts, from: { memberId: sender.memberId, deviceId: sender.deviceId }, text: payload.msg.text });
     }
     if (payload?.kind === "room.profile" || payload?.kind === "member.profile") {
       // The sender's role in the verified roster now (room.profile needs an admin; room-book.ts decides).

@@ -117,9 +117,10 @@ import { SealedLogCopy } from "./member/log-copy";
 import { RoomLogFold } from "./authority/fold";
 import { MlsDelivery } from "./host/mls-delivery";
 import { mlsAdapter, type MlsAdapter } from "./mls/adapter";
-import { MlsMember, type MlsProfileEvent, type MlsTimings } from "./mls/member";
+import { MlsMember, type MlsMessage, type MlsProfileEvent, type MlsTimings } from "./mls/member";
 import type { AppPayload } from "./mls/formats";
 import { ActivityFeed } from "./member/activity";
+import { ChatStore } from "./member/chat-store";
 import { RoomBook, ROOM_DESCRIPTION_MAX, ROOM_NAME_MAX, MEMBER_NAME_MAX, SealedRoomBookStore, sanitizeDisplayText } from "./member/room-book";
 import { SealedMlsStore } from "./mls/sealed-store";
 import { writePrivateFile } from "./platform/durable";
@@ -181,6 +182,20 @@ type Owned = {
   ownFeed: (() => void) | null;
 };
 type Joined = { client: RoomClient; memberId: string; deviceId: string };
+/** R2.6: what "delete hosted rooms" can do about closing a hosted room (keys 6.8). */
+export type HostedClosurePlan = {
+  plan: "already_closed" | "confirm_proposal" | "recovery_key" | "none";
+  reason: "recovery_code_required" | "second_admin_required" | "no_admin_key" | null;
+  message: string;
+};
+export type HostedClosure = {
+  roomId: string;
+  outcome: "closed" | "already_closed" | "not_closed";
+  via: "recovery_key" | "confirmed_proposal" | null;
+  seq: number | null;
+  reason: HostedClosurePlan["reason"] | "error";
+  message: string;
+};
 
 const SCHEDULE_FILE = "grant-schedule.json";
 const AUTH_FAILURE_CODES = new Set(["authentication_failed", "auth_failed", "incorrect_password", "password_required"]);
@@ -231,6 +246,8 @@ export class RoomsRuntimeV2 {
   private readonly books = new Map<string, RoomBook>();
   /** R3.5: activity notices of each room from this daemon's own verified fold (owner or member device). */
   private readonly feeds = new Map<string, ActivityFeed>();
+  /** R3.4: the chat history of each room on this device, sealed at rest (member/chat-store.ts). */
+  private readonly chats = new Map<string, ChatStore>();
   /** Admin daemon: automatic approvals that failed, retried after this time (by request bodyHash). */
   private readonly approveRetryAt = new Map<string, number>();
   /** Admin daemon: rekey approvals in flight (the admin route is asynchronous), by request bodyHash. */
@@ -249,8 +266,8 @@ export class RoomsRuntimeV2 {
    */
   readonly clock: TestClock;
   /**
-   * True only on a marked e2e test home (testHomeRefusal): the development RPCs (`rooms.v2.mls.send`,
-   * `rooms.v2.mls.messages`) are registered only then (index.server.ts).
+   * True only on a marked e2e test home (testHomeRefusal). No RPC depends on it since R3.4 replaced the
+   * development chat RPCs (`rooms.v2.mls.send`, `rooms.v2.mls.messages`) with `rooms.v2.chat.*`.
    */
   readonly testHome: boolean;
 
@@ -542,7 +559,7 @@ export class RoomsRuntimeV2 {
     }
     const g = host.state.auth.endpoint.relay;
     const roomId = host.roomId;
-    const grants = new HostGrants({ dataDir: this.dataDir, kek: this.kek!, host, env: this.env });
+    const grants = new HostGrants({ dataDir: this.dataDir, kek: this.kek!, host, env: this.env, now: this.clock.now });
     let lanes: LaneService | null = null;
     let endpoint: RoomEndpoint | null = null;
     let ownFeed: (() => void) | null = null;
@@ -639,6 +656,7 @@ export class RoomsRuntimeV2 {
       blocked: () => host.isStopped,
       onAlert: (a) => log("mls_member_alert", { roomId, type: a.type, seq: a.seq }),
       onProfile: (e) => this.onProfile(roomId, e),
+      storeMessages: (ms) => this.storeChat(roomId, ms),
       announce: () => this.announcements(roomId, memberId, () => host.state),
     });
     this.mlsMembers.set(roomId, member);
@@ -694,6 +712,7 @@ export class RoomsRuntimeV2 {
       timings: this.mlsTimings(),
       onAlert: (a) => log("mls_member_alert", { roomId, type: a.type, seq: a.seq }),
       onProfile: (e) => this.onProfile(roomId, e),
+      storeMessages: (ms) => this.storeChat(roomId, ms),
       announce: () => this.announcements(roomId, memberId, () => this.joined.get(roomId)?.client.state ?? null),
     });
     this.mlsMembers.set(roomId, member);
@@ -807,27 +826,110 @@ export class RoomsRuntimeV2 {
     return { ok: true, acked };
   }
 
-  /** Sends a chat message in the room group (development RPC; the chat UI is M2). */
-  async mlsSend(roomId: string, text: string): Promise<{ seq: number }> {
-    await this.ready();
-    const m = this.mlsMembers.get(roomId);
-    if (!m) throw new Error("No MLS group member for that room on this daemon");
-    return m.sendText(text);
+  // ------------------------------------------------------------------------------ chat (R3.4)
+
+  /** The chat store of a room, opened on first use. Throws before the keystore is ready. */
+  private chatOf(roomId: string): ChatStore {
+    const have = this.chats.get(roomId);
+    if (have) return have;
+    if (!this.kek) throw new Error("Rooms is not ready");
+    const store = new ChatStore({ dataDir: this.dataDir, kek: this.kek, roomId });
+    if (store.problems.length) log("chat_store_damaged", { roomId, problems: store.problems.slice(0, 8) });
+    this.chats.set(roomId, store);
+    return store;
   }
 
-  async mlsMessages(roomId: string): Promise<{ messages: { seq: number; epoch: number; from: { memberId: string; deviceId: string } | null; text: string }[] }> {
-    await this.ready();
+  /** The MLS member's write-ordering hook (8.2): messages are sealed on disk before the state and the ack. Throws on failure. */
+  private storeChat(roomId: string, ms: MlsMessage[]): void {
+    this.chatOf(roomId).add(ms.map((m) => ({ seq: m.seq, epoch: m.epoch, hts: m.hts, ts: m.ts, memberId: m.from.memberId, deviceId: m.from.deviceId, text: m.text, own: false })));
+  }
+
+  /**
+   * The room group member of a room this daemon is in, for chat. Only rooms this daemon owns or joined
+   * have one: lane viewers are not group members, and chat is never served through a lane.
+   */
+  private chatMember(roomId: string): MlsMember {
     const m = this.mlsMembers.get(roomId);
-    if (!m) throw new Error("No MLS group member for that room on this daemon");
+    if (!m || (!this.owned.has(roomId) && !this.joined.has(roomId))) throw new Error("This daemon is not a member of that room");
+    return m;
+  }
+
+  /** R3.4: sends a signed chat message in the room group and stores it here. */
+  async chatSend(roomId: string, text: string): Promise<{ seq: number }> {
+    await this.ready();
+    const m = this.chatMember(roomId);
+    const j = this.joined.get(roomId);
+    if (j && j.client.status === "ended") throw new Error("This device no longer has access to the room");
+    const r = await m.sendText(text);
+    try {
+      this.chatOf(roomId).add([{ seq: r.seq, epoch: r.epoch, hts: Date.now(), ts: r.ts, memberId: r.from.memberId, deviceId: r.from.deviceId, text, own: true }]);
+    } catch (err) {
+      // Sent: the others have it. Only this device's copy is missing.
+      logError("chat_store_failed", err, { roomId });
+    }
+    log("chat_sent", { roomId, seq: r.seq });
+    return { seq: r.seq };
+  }
+
+  /** R3.4: a page of this device's chat history of a room, with the senders' names and verification state. */
+  async chatList(roomId: string, before?: number, limit = 50) {
+    const kek = await this.ready();
+    const m = this.chatMember(roomId);
     await m.idle();
-    return { messages: m.messages.map((x) => ({ seq: x.seq, epoch: x.epoch, from: x.from, text: x.text })) };
+    const store = this.chatOf(roomId);
+    const page = store.page(before ?? null, limit);
+    let self: { memberId: string; state: Readonly<RoomState> } | null = null;
+    try {
+      self = this.selfIn(kek, roomId);
+    } catch {
+      self = null;
+    }
+    const st = self?.state ?? null;
+    const ids = [...new Set(page.messages.map((x) => x.memberId))];
+    const names = this.bookIfOpen(roomId)?.names(ids) ?? ids.map((memberId) => ({ memberId, name: null, collision: false }));
+    const j = this.joined.get(roomId);
+    const why = j?.client.status === "ended" ? "ended" : m.canSendReason();
+    return {
+      messages: page.messages.map((x) => ({
+        seq: x.seq,
+        hts: x.hts,
+        ts: x.ts,
+        memberId: x.memberId,
+        deviceId: x.deviceId,
+        text: x.text,
+        own: x.own,
+        verified: x.own ? ("own" as const) : ("verified" as const),
+        current: !!st?.members[x.memberId]?.devices.some((d) => d.deviceId === x.deviceId),
+      })),
+      more: page.more,
+      readSeq: store.read,
+      unread: store.unread,
+      selfMemberId: self?.memberId ?? null,
+      names,
+      cannotSend: why,
+    };
+  }
+
+  /** R3.4: moves this device's read marker of a room. */
+  async chatRead(roomId: string, seq: number): Promise<{ unread: number }> {
+    await this.ready();
+    this.chatMember(roomId);
+    return { unread: this.chatOf(roomId).markRead(seq) };
+  }
+
+  /** R3.4: unread counts of every room this daemon is a group member of. */
+  async chatUnread(): Promise<{ total: number; rooms: { roomId: string; unread: number }[] }> {
+    await this.ready();
+    const rooms = [...this.mlsMembers.keys()].filter((r) => this.owned.has(r) || this.joined.has(r)).map((roomId) => ({ roomId, unread: this.chatOf(roomId).unread }));
+    return { total: rooms.reduce((n, r) => n + r.unread, 0), rooms };
   }
 
   private mlsView() {
     return [...this.mlsMembers.entries()].map(([roomId, m]) => {
       const v = m.view();
       const book = this.bookIfOpen(roomId);
-      return { roomId, inGroup: v.inGroup, epoch: v.epoch, cursor: v.cursor, leaves: v.leaves.length, join: v.join?.status ?? null, stalled: v.stalled !== null, disabled: v.disabled, canSend: v.canSend, messages: m.messages.length, alerts: m.alerts.slice(-16).map((a) => ({ type: a.type, seq: a.seq, acked: book?.isAcked(a.type, a.seq) ?? false })) };
+      const chat = this.kek ? this.chatOf(roomId) : null;
+      return { roomId, inGroup: v.inGroup, epoch: v.epoch, cursor: v.cursor, leaves: v.leaves.length, join: v.join?.status ?? null, stalled: v.stalled !== null, disabled: v.disabled, canSend: v.canSend, messages: chat?.size ?? 0, unread: chat?.unread ?? 0, alerts: m.alerts.slice(-16).map((a) => ({ type: a.type, seq: a.seq, acked: book?.isAcked(a.type, a.seq) ?? false })) };
     });
   }
 
@@ -853,7 +955,9 @@ export class RoomsRuntimeV2 {
         void this.approveRekeyNow(roomId, ref, "auto")
           .then((r) => log("device_rekey_auto_approved", { roomId, deviceId: p.deviceId, seq: r.seq, sole: p.sole }))
           .catch((e) => {
-            this.approveRetryAt.set(ref, Date.now() + ((e as { code?: string }).code === "no_key_package" ? 5_000 : 60_000));
+            // no_key_package: B publishes soon. stale_roster: another entry (a grant reissue, say) was
+            // sequenced between the approval and its commit; a transient race, so retry soon.
+            this.approveRetryAt.set(ref, Date.now() + (["no_key_package", "stale_roster"].includes((e as { code?: string }).code ?? "") ? 5_000 : 60_000));
             log("device_rekey_auto_approve_failed", { roomId, deviceId: p.deviceId, code: (e as { code?: string }).code ?? "error", error: String((e as Error)?.message ?? e).slice(0, 160) });
           });
         continue;
@@ -908,6 +1012,7 @@ export class RoomsRuntimeV2 {
           closeDelayS: host.state.auth.policy.closeDelay,
         },
         lineages: lineageCount(host.state.auth),
+        closeOnDelete: this.closurePlanFor(host.roomId),
         invites: (endpoint.enrollment?.invites() ?? []).map(inviteView),
         joinRequests: (endpoint.enrollment?.pendings() ?? []).map(pendingView),
         lanes: lanes.lanes(),
@@ -2120,6 +2225,7 @@ export class RoomsRuntimeV2 {
     if (mls && !this.owned.has(roomId)) {
       mls.stop();
       this.mlsMembers.delete(roomId);
+      this.chats.delete(roomId);
       await Promise.race([mls.idle().catch(() => undefined), new Promise<void>((r) => (setTimeout(r, 2000) as { unref?: () => void }).unref?.())]);
     }
     this.linkers.delete(roomId);
@@ -2133,6 +2239,67 @@ export class RoomsRuntimeV2 {
   }
 
   /**
+   * R2.6 with "Also delete hosted rooms": how this daemon can close a room it hosts before deleting it,
+   * without asking for anything more (keys 6.8). `confirm_proposal`: an open `room.close.proposed` of
+   * another lineage that this admin key may confirm now. `recovery_key`: one admin lineage and no
+   * recovery key, so this admin adds a recovery key alone and closes with it (6.8, last bullet); the
+   * key is used once and never shown or stored. `none`: the room has a recovery key (its code is
+   * needed) or two lineages (a second admin is needed), or this daemon holds no admin key; the room
+   * then stops without a closure and its members see it go offline.
+   */
+  closurePlanFor(roomId: string): HostedClosurePlan {
+    const o = this.ownedRoom(roomId);
+    const a = o.host.state.auth;
+    if (a.closed) return { plan: "already_closed", reason: null, message: "The room is already closed." };
+    if (!o.signer) return { plan: "none", reason: "no_admin_key", message: "This daemon holds no admin key for this room, so it cannot close it. Members will see it offline." };
+    for (const [ref, p] of Object.entries(a.pendingClose)) {
+      if (p.used) continue;
+      if (!closeConfirmationBlocker(o.host.state, ref, o.signer.kid, this.clock.now(), o.holds?.firstSeen(ref))) return { plan: "confirm_proposal", reason: null, message: "This daemon confirms the open closure proposal of the other admin." };
+    }
+    if (a.recovery) return { plan: "none", reason: "recovery_code_required", message: "Closing this room needs its recovery code. Close it first (Keys, recovery code, Close room) or it stops without a closure and members see it offline." };
+    if (lineageCount(a) > 1) return { plan: "none", reason: "second_admin_required", message: "Closing this room needs an admin of another lineage. Ask them to confirm a closure first, or it stops without a closure and members see it offline." };
+    return { plan: "recovery_key", reason: null, message: "This daemon adds a one-time recovery key and signs the closure with it. Members see the room as closed." };
+  }
+
+  /** Signs the closure `closurePlanFor` allows. Never throws: the outcome is returned and logged. */
+  private closeHostedForDeletion(roomId: string): HostedClosure {
+    const plan = this.closurePlanFor(roomId);
+    const o = this.ownedRoom(roomId);
+    let out: HostedClosure;
+    try {
+      if (plan.plan === "confirm_proposal") {
+        const ref = Object.entries(o.host.state.auth.pendingClose).find(([r, p]) => !p.used && !closeConfirmationBlocker(o.host.state, r, o.signer!.kid, this.clock.now(), o.holds?.firstSeen(r)))![0];
+        const seq = this.reducing(roomId, () => this.adminSubmit(roomId, "room.closed", { proposal: ref }).receipt.entry.seq);
+        out = { roomId, outcome: "closed", via: "confirmed_proposal", seq, reason: null, message: "Closed by confirming the other admin's proposal." };
+      } else if (plan.plan === "recovery_key") {
+        const k = newRecoveryKey(roomId);
+        this.reducing(roomId, () => this.adminSubmit(roomId, "recovery.key.rotated", { change: k.change, newKeySig: k.newKeySig, proposal: null }));
+        const r = RecoveryKey.fromCode(k.code, o.host.state, this.clock.now);
+        try {
+          const res = this.reducing(roomId, () => o.endpoint.submit(r.sign("room.closed", { proposal: null }, o.host.head)));
+          if (!res.ok) throw new Error(`room.closed refused: ${res.code} (${res.reason})`);
+          out = { roomId, outcome: "closed", via: "recovery_key", seq: res.receipt.entry.seq, reason: null, message: "Closed with a one-time recovery key." };
+        } finally {
+          r.dispose();
+        }
+      } else {
+        out = { roomId, outcome: plan.plan === "already_closed" ? "already_closed" : "not_closed", via: null, seq: null, reason: plan.reason, message: plan.message };
+      }
+    } catch (e) {
+      out = { roomId, outcome: "not_closed", via: null, seq: null, reason: "error", message: `The closure failed: ${String((e as Error)?.message ?? e).slice(0, 200)}. The room stops without a closure.` };
+    }
+    log("hosted_room_closure_for_deletion", { roomId, outcome: out.outcome, via: out.via, seq: out.seq, reason: out.reason });
+    return out;
+  }
+
+  /** Waits (at most `ms`) until the hosted rooms have no live session, so access_ended reaches members. */
+  private async drainSessions(roomIds: string[], ms = 3000): Promise<void> {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms && roomIds.some((id) => (this.owned.get(id)?.endpoint.sessions().length ?? 0) > 0)) await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  /**
    * R2.6 "Leave all rooms and delete keys" (the user's typed confirmation): leaves every joined room
    * (a room that cannot be reached is forgotten here; its owner still lists the member), removes every
    * lane host this plugin registered, stops the runtime, deletes the KEK through the KeyStore and the
@@ -2141,6 +2308,7 @@ export class RoomsRuntimeV2 {
   async deleteAllData(i: { deleteHosted: boolean }): Promise<{
     left: { roomId: string; statement: "member.left" | "device.removed" | null; error: string | null }[];
     hostedDeleted: string[];
+    hostedClosed: HostedClosure[];
     hostsRemoved: number;
     hostsRemaining: StaleHost[];
     keystore: KeyStoreDeletion;
@@ -2149,6 +2317,10 @@ export class RoomsRuntimeV2 {
     await this.requireVerifiedTree();
     const hosted = [...this.owned.keys()];
     if (hosted.length && !i.deleteHosted) throw new Error(`This daemon hosts ${hosted.length} room(s). Deleting the keys stops them for good and their members lose access. Confirm deleting hosted rooms too.`);
+    // Hosted rooms are closed first where this daemon may (keys 6.8): connected members get
+    // access_ended room_closed and see the room closed, not just offline.
+    const hostedClosed = hosted.map((roomId) => this.closeHostedForDeletion(roomId));
+    if (hostedClosed.some((c) => c.outcome === "closed")) await this.drainSessions(hosted);
     const left: { roomId: string; statement: "member.left" | "device.removed" | null; error: string | null }[] = [];
     let hostsRemoved = 0;
     for (const roomId of new Set([...this.joining.keys(), ...this.joined.keys()])) {
@@ -2196,8 +2368,8 @@ export class RoomsRuntimeV2 {
     this.migration = null;
     this.state = "error";
     this.error = "data_deleted";
-    log("rooms_data_deleted", { left: left.length, hosted: hosted.length, hostsRemoved, hostsRemaining: todo.length, kek: keystore.kek, dataDeleted });
-    return { left, hostedDeleted: hosted, hostsRemoved, hostsRemaining: todo, keystore, dataDeleted };
+    log("rooms_data_deleted", { left: left.length, hosted: hosted.length, hostedClosed: hostedClosed.filter((c) => c.outcome === "closed").length, hostsRemoved, hostsRemaining: todo.length, kek: keystore.kek, dataDeleted });
+    return { left, hostedDeleted: hosted, hostedClosed, hostsRemoved, hostsRemaining: todo, keystore, dataDeleted };
   }
 
   private deviceFor(kek: Kek, roomId: string, nextKeys = false): { genesis: RoomGenesis | Uint8Array; device: { publicKey: Uint8Array; secretKey: Uint8Array }; memberId: string; deviceId: string; relay(g: RoomGenesis): RelayAddress } {

@@ -98,6 +98,7 @@ H(label, data)            = SHA-256(TBS("h:" + label, data))
 | `enroll-request` | device signing key | `EnrollSigned` (includes Noise `h`) | enrollment-v2 5.2 |
 | `key-change-new` | the **new** key | `KeyChange` | keys-rotation-recovery 2 |
 | `mls-identity` | device signing key | `MlsIdentity` | mls-integration 3 |
+| `chat-message` | device signing key | `ChatMessage` (inside MLS) | mls-integration 5.2 |
 
 Each statement type is its own context (`stmt:member.admitted`, `stmt:member.removed`, …). Type names match `^[a-z0-9.-]+$` (`room-log-v2.md` section 4), so every `stmt:<type>` is inside the alphabet of section 3.1; a unit test checks this for every type in the catalogue. The full type list is `room-log-v2.md` section 4; decision round 8 adds `stmt:device.leaf.repair.requested`, signed by the device whose leaf it names (vector `deviceLeafRepair`). Every `Statement.body` carries `base: {seq, hash}`, the log head the producer had verified, and a producer's `base.seq` strictly increases from one of its statements to the next (`room-log-v2.md` section 2). State-changing statements carry `ver`, a log position, instead of the old value of the field they change (`room-log-v2.md` section 4.0). The `LogWitness` object, which travels inside MLS, is signed with `stmt:log.witness` so it can be shown as evidence outside the group. A signature for one type never verifies as another (the generator checks this).
 

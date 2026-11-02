@@ -48,6 +48,15 @@ export const ENV_DEV_SHORT_GRANTS = "PASEO_ROOMS_DEV_SHORT_GRANTS";
 export const ENV_DEV_GRANT_TTL = "PASEO_ROOMS_DEV_GRANT_TTL_S";
 /** Section 9: iat up to 120 s in the future is accepted. */
 export const IAT_SKEW_S = 120;
+/**
+ * Section 9: a grant's iat may be up to 5 min before its host key's `validFrom`. `validFrom` comes
+ * from the room clock when the key took effect (the genesis or rotation `hts`), `iat` from the clock
+ * at issuance; an NTP step back on the host must not make every new grant fail `host_key_not_valid`.
+ * 5 min covers ordinary NTP corrections and VM or laptop resume drift; it cannot widen the window of a
+ * key that is not yet in the log (validFrom is never earlier than the statement that added the key),
+ * and it is far below the 24 h overlap of a rotated key, so it gives a stolen old key nothing.
+ */
+export const HOST_KEY_SKEW_S = 300;
 export const PRUNE_AFTER_EXP_MS = 10 * 60_000;
 export const PRUNE_HELD_MS = 24 * 3_600_000;
 export const PRUNE_BACKSTOP_MS = 30 * 24 * 3_600_000;
@@ -147,7 +156,7 @@ export function verifyGrantV2(token: unknown, c: VerifyContext): GrantCheck {
   // Step 2: the issuing host key, by its stored public key, valid at iat, not revoked, certified.
   const hk = s.auth.hostKeys.find((h) => h.kid === claims.hostKid);
   if (!hk) return { ok: false, reason: "unknown_host_key", claims };
-  if (hk.revoked || hk.uncertified || claims.iat < hk.validFrom || (hk.validTo !== null && claims.iat > hk.validTo)) return { ok: false, reason: "host_key_not_valid", claims };
+  if (hk.revoked || hk.uncertified || claims.iat + HOST_KEY_SKEW_S < hk.validFrom || (hk.validTo !== null && claims.iat > hk.validTo)) return { ok: false, reason: "host_key_not_valid", claims };
   if (!verify(b64uDecode(hk.pub, 32), CTX_LANE_GRANT, t.payload, t.sig)) return { ok: false, reason: "bad_signature", claims };
   // Step 3.
   if (claims.roomId !== s.roomId || claims.laneId !== c.laneId || claims.aud !== c.aud) return { ok: false, reason: "wrong_audience", claims };
@@ -260,6 +269,11 @@ export class HostGrants {
     (this.flushTimer as { unref?: () => void }).unref?.();
   }
 
+  /** The clock grants are issued and checked on (unix ms). */
+  clockNow(): number {
+    return this.now();
+  }
+
   ttlS(): number {
     return grantTtlS(this.o.host.state.auth.policy.grantTtl, this.o.env ?? {});
   }
@@ -291,6 +305,21 @@ export class HostGrants {
     const ttl = this.ttlS();
     const k = key(dev.deviceId, laneId);
     const nowMs = this.now();
+    const hk = s.auth.hostKeys.find((h) => h.toSeq === null);
+    if (!hk) return { ok: false, code: "internal" };
+    const hostKid = hk.kid;
+    // Section 9: a clock more than HOST_KEY_SKEW_S behind the key's validFrom would sign a grant every
+    // lane endpoint refuses (host_key_not_valid). Refuse here, retryable, and say why.
+    if (Math.floor(nowMs / 1000) + HOST_KEY_SKEW_S < hk.validFrom) {
+      log("grant_refused_clock_behind", {
+        roomId: this.roomId,
+        laneId,
+        behindS: hk.validFrom - Math.floor(nowMs / 1000),
+        toleranceS: HOST_KEY_SKEW_S,
+        message: "This daemon's clock is behind the room's host key start time by more than the allowed skew. Correct the system clock; grants resume once it is within tolerance.",
+      });
+      return { ok: false, code: "busy" };
+    }
     const recent = (this.issues.get(k) ?? []).filter((t) => nowMs - t < 3_600_000);
     if (recent.length >= issuesPerHour(ttl) || (recent.length > 0 && nowMs - recent[recent.length - 1] < Math.min(ISSUE_MIN_INTERVAL_MS, (ttl * 1000) / 4))) {
       this.issues.set(k, recent);
@@ -300,8 +329,6 @@ export class HostGrants {
     this.issues.set(k, recent);
     // 1. Claims.
     const iat = Math.floor(nowMs / 1000);
-    const hostKid = s.auth.hostKeys.find((h) => h.toSeq === null)?.kid;
-    if (!hostKid) return { ok: false, code: "internal" };
     const claims: GrantClaimsV2 = { v: 2, typ: "lane-grant", roomId: this.roomId, laneId, aud: lane.offer.serverId, sub: m.memberId, dev: edKid(d.sig), role: m.role, gid: newId("grant"), iat, exp: iat + ttl, hostKid };
     let token: string;
     try {

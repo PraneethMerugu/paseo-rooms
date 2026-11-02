@@ -209,6 +209,8 @@ With the allowlist of section 4 step 6, a pruned or forgotten denylist entry can
 
 A member whose clock is far off still rotates correctly. A gateway whose clock is far off cuts or accepts links early or late; the 120 s `iat` window and the warning bound the effect.
 
+The host key's validity window (section 4, step 2) starts at the room-clock time of the entry that installed the key, while `iat` comes from the issuer's clock at issuance. A grant whose `iat` is at most 300 s before the key's `validFrom` is still within the window, so a small step back of the host clock (an NTP correction, a resume from sleep) does not invalidate every new grant; the issuer and the lane endpoint use the same clock. A host whose clock is further behind refuses to issue (retryable `busy`) and logs that its clock is behind, instead of signing grants every lane endpoint would refuse.
+
 ## 10. What a grant authorizes (P-21, documented)
 
 A grant admits the **member daemon's link**. Every client of that daemon that can open routes through connected hosts can then read the lane: the member's own Paseo app sessions, paired devices with routed access, and the member's own agents through Paseo's MCP routed-host tools. A prompt-injected agent on the member's daemon can therefore read lane content and exfiltrate it.

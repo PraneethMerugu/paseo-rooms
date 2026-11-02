@@ -38,8 +38,7 @@
 // 72 h the admin daemon approves automatically -> B is the same member with its own device id, its own
 // session and its own lane grant -> the removal of the member later ends both devices.
 //
-// Rotation (I-12): before the test clock moves (grants are timed on the wall clock, hts on the test
-// clock), the owner rotates the host key; the member's fold accepts the rotation, the lane stays online
+// Rotation (I-12): before the test clock moves, the owner rotates the host key; the member's fold accepts the rotation, the lane stays online
 // on the old key's grant, the next grant is issued under the new key and the routed view works. After
 // the MLS exchange, device B requests its own rekey: it is held 24 h (A is another active device), is
 // still pending after 23 h on the admin daemon's TEST-ONLY clock, and after 24 h the admin daemon
@@ -242,13 +241,6 @@ async function main() {
   const laneUp = await attempt(() => until("lane endpoint online", async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId)?.lanes.find((l: any) => l.laneId === laneId)?.endpoint === "online", 30_000));
   check("lane created (lane.created in the log) and its endpoint online on the relay", laneUp.ok, laneUp.ok ? { laneId } : { error: laneUp.error });
   const so2 = (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === roomId);
-  // Room 2 (section 9b, R3.1 and R3.2): created now, while the owner's TEST-ONLY clock still equals the
-  // wall clock, with two lanes of the same shared agent. A member joins it only in 9b.
-  const room2 = (await rpc(o, "rooms.v2.room.create", {})).roomId as string;
-  const owned2 = async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === room2);
-  await until("room 2 endpoint online", async () => (await owned2())?.endpoint === "online", 30_000);
-  const l1 = await adminRpc(o, "rooms.v2.lane.create", { roomId: room2, agentId: agent.id, label: "Close me" });
-  const l2 = await adminRpc(o, "rooms.v2.lane.create", { roomId: room2, agentId: agent.id, label: "Keep me" });
   check("grant lifetime is the development short value (switch on the host only)", so2?.grantTtlS === GRANT_TTL_S, { grantTtlS: so2?.grantTtlS });
   const invite = await adminRpc(o, "rooms.v2.invite.create", { roomId, lanes: [laneId], note: "for the e2e member", roomName: "E2E room" });
   const code: string = invite.code;
@@ -554,7 +546,10 @@ async function main() {
   // runs with PASEO_ROOMS_DEV_MLS_FAST=1 (witness within 1 s, joiner check 5 s). The texts are
   // random markers; the scan at the end looks for them in every file.
   const mlsOf = async (c: any) => (await rpc(c, "rooms.v2.status", {})).mls.find((r: any) => r.roomId === roomId);
-  const textsOf = async (c: any) => ((await rpc(c, "rooms.v2.mls.messages", { roomId })).messages as any[]).map((x) => x.text);
+  // R3.4: the real chat RPCs. `textsOf` lists what a device received from others (its own messages are
+  // in its history too, marked own).
+  const chatOf = async (c: any) => await rpc(c, "rooms.v2.chat.list", { roomId, limit: 200 });
+  const textsOf = async (c: any) => ((await chatOf(c)).messages as any[]).filter((x) => !x.own).map((x) => x.text);
   const groupUp = await attempt(() => until("room group with three leaves", async () => {
     const v = await Promise.all([o, m, m2].map(mlsOf));
     return v.every((x) => x?.inGroup && x.leaves === 3 && x.epoch === v[0].epoch && x.canSend) ? v : null;
@@ -583,14 +578,31 @@ async function main() {
   const alpha = mark("alpha");
   const bravo = mark("bravo");
   const charlie = mark("charlie");
-  const sentA = await attempt(() => rpc(o, "rooms.v2.mls.send", { roomId, text: alpha }));
-  const sentB = await attempt(() => rpc(m, "rooms.v2.mls.send", { roomId, text: bravo }));
+  const sentA = await attempt(() => rpc(o, "rooms.v2.chat.send", { roomId, text: alpha }));
+  const sentB = await attempt(() => rpc(m, "rooms.v2.chat.send", { roomId, text: bravo }));
   check("MLS: the owner's device and device A each send an application message", sentA.ok && sentB.ok, { owner: sentA.ok ? sentA.value.seq : sentA.error, a: sentB.ok ? sentB.value.seq : sentB.error });
   const exchanged = await attempt(() => until("messages exchanged", async () => {
     const [ot, at, bt] = await Promise.all([o, m, m2].map(textsOf));
     return ot.includes(bravo) && at.includes(alpha) && bt.includes(alpha) && bt.includes(bravo) ? { ot, at, bt } : null;
   }, 20_000, 250));
   check("MLS: each reads the other's message; B reads both; nobody reads its own back", exchanged.ok && !exchanged.value.ot.includes(alpha) && !exchanged.value.at.includes(bravo), exchanged.ok ? {} : { error: exchanged.error });
+  // R3.4: attribution, verification state, names, ordering, own copy, unread and read marker.
+  const bChat = await chatOf(m2);
+  const bAlpha = (bChat.messages as any[]).find((x) => x.text === alpha);
+  const bBravo = (bChat.messages as any[]).find((x) => x.text === bravo);
+  check(
+    "R3.4 chat: B sees the owner's and A's messages attributed to their member and device, verified, in log order, with A's display name",
+    !!bAlpha && !!bBravo && bAlpha.verified === "verified" && bBravo.verified === "verified" && bAlpha.current && bBravo.memberId === mv.memberId && bBravo.deviceId === mv.deviceId && bAlpha.seq === (sentA.ok ? sentA.value.seq : -1) && bAlpha.seq < bBravo.seq && (bChat.names as any[]).some((n) => n.memberId === mv.memberId && n.name === aNameMark),
+    { alpha: bAlpha && { seq: bAlpha.seq, verified: bAlpha.verified }, bravo: bBravo && { seq: bBravo.seq, verified: bBravo.verified } },
+  );
+  const aChat = await chatOf(m);
+  check("R3.4 chat: A's own message is in its history (own), the owner's is unread until read", (aChat.messages as any[]).some((x) => x.text === bravo && x.own && x.verified === "own") && aChat.unread >= 1, { unread: aChat.unread });
+  const aRead = await rpc(m, "rooms.v2.chat.read", { roomId, seq: (aChat.messages as any[]).at(-1).seq });
+  const aUnreadAll = await rpc(m, "rooms.v2.chat.unread", {});
+  check("R3.4 chat: marking read clears A's unread count (sidebar total too)", aRead.unread === 0 && (aUnreadAll.rooms as any[]).find((r) => r.roomId === roomId)?.unread === 0, { aRead, aUnreadAll });
+  const bUnread = (await rpc(m2, "rooms.v2.chat.unread", {})).total;
+  const bStatusUnread = (await mlsOf(m2))?.unread;
+  check("R3.4 chat: B's unread count (sidebar and room card) counts the two messages from others", bUnread === 2 && bStatusUnread === 2, { bUnread, bStatusUnread });
   const ownerMlsBefore = await mlsOf(o);
 
   // ------------------------------------------------------------ 8c. device rekey by the admin route (I-12, keys 4.1)
@@ -633,13 +645,16 @@ async function main() {
   }
   const delta = mark("delta");
   const echo = mark("echo");
-  const sentD = await attempt(() => rpc(o, "rooms.v2.mls.send", { roomId, text: delta }));
-  const sentE = await attempt(() => until("B sends", async () => (await attempt(() => rpc(m2, "rooms.v2.mls.send", { roomId, text: echo }))).ok, 20_000, 500));
+  const sentD = await attempt(() => rpc(o, "rooms.v2.chat.send", { roomId, text: delta }));
+  const sentE = await attempt(() => until("B sends", async () => (await attempt(() => rpc(m2, "rooms.v2.chat.send", { roomId, text: echo }))).ok, 20_000, 500));
   const chat = await attempt(() => until("chat across the rekey", async () => {
     const [ot, at, bt] = await Promise.all([o, m, m2].map(textsOf));
     return bt.includes(delta) && at.includes(delta) && ot.includes(echo) && at.includes(echo) ? true : null;
   }, 20_000, 250));
   check("chat continues across the rekey: B reads the owner's message, and the owner and A read B's", sentD.ok && sentE.ok && chat.ok, chat.ok ? {} : { error: chat.error });
+  const aEcho = ((await chatOf(m)).messages as any[]).find((x) => x.text === echo);
+  const bHist = ((await chatOf(m2)).messages as any[]).map((x) => x.text);
+  check("R3.4 chat after the rekey: B's message is verified against its new leaf key; B keeps its earlier history", aEcho?.verified === "verified" && aEcho.deviceId === req.deviceId && bHist.includes(alpha) && bHist.includes(bravo), { verified: aEcho?.verified });
   const bLane = await attempt(() => until("B's new grant", async () => {
     const l = (await bJoined())?.lanes.find((x: any) => x.laneId === laneId);
     const g = (await ownerRoom())?.grants.find((x: any) => x.deviceId === req.deviceId && x.laneId === laneId);
@@ -692,12 +707,14 @@ async function main() {
 
   // MLS after the removal: the owner's device commits both leaves out (pending_remove) before it sends,
   // so the next message is of an epoch the removed devices never reach.
-  const sentC = await attempt(() => rpc(o, "rooms.v2.mls.send", { roomId, text: charlie }));
+  const sentC = await attempt(() => rpc(o, "rooms.v2.chat.send", { roomId, text: charlie }));
   const ownerAfter = await mlsOf(o);
   check("MLS: after the removal the owner's device is alone in the group, at a later epoch, and sends", sentC.ok && ownerAfter?.leaves === 1 && ownerAfter.epoch > ownerMlsBefore.epoch, { sent: sentC.ok, leaves: ownerAfter?.leaves, epoch: ownerAfter?.epoch, before: ownerMlsBefore?.epoch });
   await sleep(3000);
   const [aAfter, bAfter] = await Promise.all([m, m2].map(mlsOf));
   const [aTexts, bTexts] = await Promise.all([m, m2].map(textsOf));
+  const aSendAfter = await attempt(() => rpc(m, "rooms.v2.chat.send", { roomId, text: "after removal" }));
+  check("R3.4 chat: the removed device cannot send any more", !aSendAfter.ok, { error: aSendAfter.ok ? null : String(aSendAfter.error).slice(0, 120) });
   check("MLS: the removed devices cannot read the next message and stay at the old epoch", !aTexts.includes(charlie) && !bTexts.includes(charlie) && aAfter.epoch < ownerAfter.epoch && bAfter.epoch < ownerAfter.epoch, { aEpoch: aAfter?.epoch, bEpoch: bAfter?.epoch, ownerEpoch: ownerAfter?.epoch });
   // ------------------------------------------------------------ 9b. close a lane and leave a room (R3.2, R3.1, R3.7)
   // A second room on the owner with two lanes of the shared agent; device A joins it (SAS compared as
@@ -705,8 +722,13 @@ async function main() {
   // is cut, its grant leaves the allowlist, and A removes that routed host while lane 2 stays. Then A,
   // the member's only device, leaves (member.left): the owner's roster drops it, A removes the routed
   // host of lane 2 and deletes its keys and data for the room; room 1 on A is untouched.
-  // Room 2 and its lanes were created in step 2, before the TEST-ONLY clock moved: grants carry the
-  // wall clock and must not predate the host key's `validFrom` (the genesis hts).
+  // Room 2 is created now, after the TEST-ONLY clock moved forward: grants are issued and checked on
+  // the same room clock as the genesis hts (the host key's `validFrom`), so they are usable.
+  const room2 = (await rpc(o, "rooms.v2.room.create", {})).roomId as string;
+  const owned2 = async () => (await rpc(o, "rooms.v2.status", {})).owned.find((r: any) => r.roomId === room2);
+  await until("room 2 endpoint online", async () => (await owned2())?.endpoint === "online", 30_000);
+  const l1 = await adminRpc(o, "rooms.v2.lane.create", { roomId: room2, agentId: agent.id, label: "Close me" });
+  const l2 = await adminRpc(o, "rooms.v2.lane.create", { roomId: room2, agentId: agent.id, label: "Keep me" });
   await until("room 2 lanes online", async () => (await owned2())?.lanes.every((l: any) => l.endpoint === "online"), 30_000);
   const invite2 = await adminRpc(o, "rooms.v2.invite.create", { roomId: room2, lanes: [l1.laneId, l2.laneId], note: "R3 e2e", roomName: "E2E room 2" });
   await rpc(m, "rooms.v2.join.start", { code: invite2.code, label: "E2E member laptop", ...(LIVE ? {} : { trustRelay: true }) });
@@ -751,6 +773,13 @@ async function main() {
   const badLeave = await attempt(() => rpc(m, "rooms.v2.room.leave", { roomId: room2 }));
   check("R3.1: leaving without the typed word is refused", !badLeave.ok, { error: badLeave.ok ? null : badLeave.error.slice(0, 80) });
   await until("A synced in room 2", async () => (await joined2())?.memberDevices === 1, 15_000);
+  // MLS in room 2 before the leave: the owner's device and A share the group.
+  const mls2Of = async (c: any) => (await rpc(c, "rooms.v2.status", {})).mls.find((r: any) => r.roomId === room2);
+  const group2 = await attempt(() => until("room 2 group with A", async () => {
+    const [x, y] = await Promise.all([o, m].map(mls2Of));
+    return x?.inGroup && y?.inGroup && x.leaves === 2 && y.leaves === 2 && x.epoch === y.epoch ? x : null;
+  }, 30_000, 250));
+  check("R3.1 MLS: before the leave, the owner's device and A are the two leaves of room 2's group", group2.ok, group2.ok ? { epoch: group2.value.epoch } : { error: group2.error });
   const left = await attempt(() => rpc(m, "rooms.v2.room.leave", { roomId: room2, confirm: "leave" }));
   check("R3.1: A (the member's only device) leaves with member.left; both lane hosts were handled", left.ok && left.value.statement === "member.left" && left.value.hostsRemaining.length === 0, left.ok ? { seq: left.value.seq, hostsRemoved: left.value.hostsRemoved } : { error: left.error });
   const ownerAfterLeave = await until("owner roster without the member", async () => {
@@ -758,6 +787,16 @@ async function main() {
     return r && !r.roster.some((x: any) => x.memberId === memberId2) && r.sessions.length === 0 && r.grants.length === 0 ? r : null;
   }, 15_000).catch(() => null);
   check("R3.1: the owner's roster drops the member; no session and no grant remain in room 2", !!ownerAfterLeave, { members: ownerAfterLeave?.members });
+  // MLS after the leave: the owner's device commits A's leaf out before it sends, so the next message
+  // is of an epoch A never reaches (A also deleted its group state with the room's member data).
+  const foxtrot = `e2e-mls-foxtrot-${randomUUID()}`;
+  const sentF = await attempt(() => rpc(o, "rooms.v2.chat.send", { roomId: room2, text: foxtrot }));
+  const owner2After = await mls2Of(o);
+  check("R3.1 MLS: after member.left the owner's device is alone in room 2's group, at a later epoch, and sends", sentF.ok && owner2After?.leaves === 1 && group2.ok && owner2After.epoch > group2.value.epoch, { sent: sentF.ok, leaves: owner2After?.leaves, epoch: owner2After?.epoch, before: group2.ok ? group2.value.epoch : null });
+  await sleep(2000);
+  const aRead2 = await attempt(() => rpc(m, "rooms.v2.chat.list", { roomId: room2 }));
+  const aTexts2 = aRead2.ok ? ((aRead2.value.messages ?? []) as any[]).map((x) => x.text) : [];
+  check("R3.1 MLS: A cannot read the next message in room 2 and holds no group state for it", !aTexts2.includes(foxtrot) && !(await mls2Of(m)), { aReadOk: aRead2.ok, aMessages: aTexts2.length });
   const l2Gone = await attempt(() => until("lane 2 host removed", async () => !(await hostOf(l2.laneId)), 20_000, 250));
   check("R3.1: the member removed the routed host of lane 2 (no lane host of room 2 is left)", l2Gone.ok, l2Gone.ok ? {} : { error: l2Gone.error });
   const sAfter = await rpc(m, "rooms.v2.status", {});
@@ -932,6 +971,9 @@ async function main() {
     cutOk && cutTo > 0 && typeof ownerCut?.seq === "number" && !(copyBefore?.alerts ?? []).some((a: any) => a.type === "truncation" || a.type === "fork") && (copyAfter?.alerts ?? []).some((a: any) => (ownerCut.seq < cutTo ? a.type === "truncation" : a.type === "fork") && a.seq === cutTo) && copyAfter?.head?.seq === cutTo && copyAfter?.head?.hash === copyBefore?.head?.hash,
     { cutTo, ownerHead: ownerCut?.seq, memberHead: copyAfter?.head?.seq, alerts: (copyAfter?.alerts ?? []).map((a: any) => `${a.type}@${a.seq}`), reconnect: reconnect.ok ? reconnect.value : reconnect.error },
   );
+  // R3.4: the owner's chat history comes back from its sealed store after the restart (not from the host).
+  const ownerHist = await attempt(async () => ((await rpc(o, "rooms.v2.chat.list", { roomId, limit: 200 })).messages as any[]).map((x) => `${x.own ? "own" : "in"}:${x.text}`));
+  check("R3.4 chat: the owner's history survives a daemon restart (sealed store), own and received messages, in order", ownerHist.ok && [`own:${alpha}`, `in:${bravo}`, `in:${echo}`, `own:${charlie}`].every((x) => ownerHist.value.includes(x)) && ownerHist.value.indexOf(`own:${alpha}`) < ownerHist.value.indexOf(`in:${bravo}`), ownerHist.ok ? { count: ownerHist.value.length } : { error: ownerHist.error });
 
   await o.close();
   await m.close();

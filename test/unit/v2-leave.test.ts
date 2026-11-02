@@ -15,8 +15,16 @@ import type { KeyStoreBackend } from "../../server/keystore/types";
 import { LaneRegistrar, type HostsApi } from "../../server/member/lane-registration";
 import { isUnknownHost, mergeStale, readStaleHosts, removeHosts, staleHostsPath, writeStaleHosts, type StaleHost } from "../../server/member/stale-hosts";
 import { memberRoomDir } from "../../server/member/enrollment-journal";
+import { randomBytes } from "node:crypto";
+import { parseLeaves } from "../../server/mls/roster-rule";
+import { generateNoiseKeyPair } from "../../server/noise/handshake-state";
+import { b64u, b64uDecodeVar } from "../../server/proto/b64u";
+import { newId } from "../../server/proto/ids";
+import { ed25519PrivateKeyFromSeed, rawPublicKey } from "../../server/proto/keys";
+import { H } from "../../server/proto/tbs";
 import { startFakeRelay, until } from "./fake-relay";
 import { tempDir } from "./helpers";
+import { Harness, type Dev } from "./mls-harness";
 
 const ROOM = `room_${"a".repeat(32)}`;
 const LANE_A = `lane_${"1".repeat(32)}`;
@@ -247,10 +255,10 @@ async function twoRuntimes() {
 }
 
 /** Owner creates a room with two lanes; the member joins with both (real SAS enrollment) and registers both. */
-async function joinedWithTwoLanes(owner: Rt, member: Rt, memberPaseo: ReturnType<typeof fakePaseo>) {
+async function joinedWithTwoLanes(owner: Rt, member: Rt, memberPaseo: ReturnType<typeof fakePaseo>, recovery: "create" | "skip" = "skip") {
   owner.attach(fakePaseo().api as never);
   member.attach(memberPaseo.api as never);
-  const { roomId } = await owner.createRoom();
+  const { roomId } = await owner.createRoom(recovery);
   await until("endpoint online", () => owner.status().owned.find((r) => r.roomId === roomId)?.endpoint === "online", 5000);
   const a = await owner.createLane({ roomId, agentId: "agent-a", label: "Live A" });
   const b = await owner.createLane({ roomId, agentId: "agent-b", label: "Live B" });
@@ -388,5 +396,128 @@ test("R2.6: the owner may delete hosted rooms too; lane hosts of this plugin unk
     assert.equal(owner.laneAgents().length, 0);
   } finally {
     await env.cleanup();
+  }
+});
+
+test("R2.6: deleting a hosted room first closes it (one lineage, no recovery key): connected members see it closed, not offline", async () => {
+  const env = await twoRuntimes();
+  try {
+    const { owner, member } = env;
+    const mp = fakePaseo();
+    const r = await joinedWithTwoLanes(owner, member, mp);
+    await until("member session open", () => r.joined()?.status === "open", 5000);
+    const plan = r.room().closeOnDelete!;
+    assert.equal(plan.plan, "recovery_key");
+    assert.equal(r.room().keys.recoveryKid, null);
+    const o = await owner.deleteAllData({ deleteHosted: true });
+    assert.equal(o.hostedClosed.length, 1);
+    const c = o.hostedClosed[0];
+    assert.deepEqual([c.roomId, c.outcome, c.via, c.reason], [r.roomId, "closed", "recovery_key", null]);
+    assert.ok(typeof c.seq === "number" && c.seq > 0);
+    assert.equal(existsSync(owner.dataDir), false, "then deleted");
+    // The member got access_ended room_closed before the host went away, and keeps showing it.
+    await until("member sees the closure", () => r.joined()?.status === "ended", 5000);
+    assert.equal(r.joined()!.endedReason, "room_closed");
+    await until("member's lane hosts removed", () => mp.hosts.size === 0, 5000);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test("R2.6: a hosted room with a recovery key cannot be closed without its code: the dialog says so, the result records it", async () => {
+  const env = await twoRuntimes();
+  try {
+    const { owner, member } = env;
+    const mp = fakePaseo();
+    const r = await joinedWithTwoLanes(owner, member, mp, "create");
+    await until("member session open", () => r.joined()?.status === "open", 5000);
+    const plan = r.room().closeOnDelete!;
+    assert.deepEqual([plan.plan, plan.reason], ["none", "recovery_code_required"]);
+    assert.match(plan.message, /recovery code/);
+    const head = r.room().head.seq;
+    const o = await owner.deleteAllData({ deleteHosted: true });
+    assert.deepEqual(
+      o.hostedClosed.map((c) => [c.outcome, c.via, c.seq, c.reason]),
+      [["not_closed", null, null, "recovery_code_required"]],
+    );
+    assert.match(o.hostedClosed[0].message, /recovery code/);
+    assert.equal(existsSync(owner.dataDir), false);
+    // Nothing was signed: the member never sees room_closed (the room only goes offline).
+    await until("member session drops", () => r.joined()?.status !== "open", 5000);
+    assert.notEqual(r.joined()!.endedReason, "room_closed");
+    assert.ok(head >= 0);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+// ------------------------------------------------------------------------------ R3.1 and the MLS group
+
+/** Owner C plus member A with one device, and member B with two devices (B1, B2); all in the group. */
+async function groupWithTwoDeviceMember(): Promise<{ h: Harness; C: Dev; A: Dev; B1: Dev; B2: Dev }> {
+  const h = await Harness.create();
+  await h.settle();
+  const A = h.admit("A");
+  const memberId = newId("member");
+  const devs = [0, 1].map(() => {
+    const sigKey = ed25519PrivateKeyFromSeed(randomBytes(32));
+    return { deviceId: newId("device"), sigKey, dh: b64u(generateNoiseKeyPair().publicKey) };
+  }).sort((a, b) => (a.deviceId < b.deviceId ? -1 : 1));
+  h.admin("member.admitted", {
+    member: { memberId, role: "watch", lanes: [], devices: devs.map((d) => ({ deviceId: d.deviceId, kind: "person", sig: b64u(rawPublicKey(d.sigKey)), dh: d.dh })) },
+    confirmation: { method: "sas6", inviteRef: b64u(H("test-invite", randomBytes(8))), transcript: b64u(H("test-transcript", randomBytes(8))) },
+  });
+  const [B1, B2] = devs.map((d, i) => h.addDevice(`B${i + 1}`, memberId, d.deviceId, d.sigKey, d.dh));
+  h.syncAll();
+  await h.settle();
+  const C = h.dev("C");
+  for (const d of [C, A, B1, B2]) assert.equal(d.member.inGroup, true, `${d.name} in group`);
+  return { h, C, A, B1, B2 };
+}
+
+const leafIds = (h: Harness, d: Dev) => parseLeaves(h.adapter.leaves(h.adapter.decodeState(b64uDecodeVar(d.store.record!.state!, 8 << 20), h.adapter.config({ validateCredential: async () => true }))))!.map((l) => l.deviceId);
+
+async function readsNext(h: Harness, sender: Dev, text: string): Promise<void> {
+  await sender.member.sendText(text);
+  h.syncAll();
+  for (const d of h.devs.values()) await d.member.idle();
+}
+
+test("R3.1 MLS: after member.left the leaving device's leaf is committed out and it cannot read the next message", async () => {
+  const { h, C, A, B1 } = await groupWithTwoDeviceMember();
+  try {
+    const stale = h.adapter.decodeState(b64uDecodeVar(A.store.record!.state!, 8 << 20), h.adapter.config({ validateCredential: async () => true }));
+    const left = h.deviceStatement(A, "member.left", { memberId: A.memberId });
+    assert.ok(left.ok, JSON.stringify(left));
+    await h.settle();
+    assert.equal(leafIds(h, C).includes(A.deviceId), false, "A's leaf is gone from the group");
+    await readsNext(h, C, "after A left");
+    assert.ok(B1.member.messages.some((m) => m.text === "after A left"), "the others read it");
+    assert.ok(!A.member.messages.some((m) => m.text === "after A left"), "A does not");
+    const last = h.room.host.entries().filter((r) => r.signed.entry.type === "mls.app").at(-1)!;
+    await assert.rejects(h.adapter.process(stale, last.body, () => true), "A's last group state cannot decrypt it either");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("R3.1 MLS: after device.removed {reason: self} only that device's leaf is committed out; the member's other device still reads", async () => {
+  const { h, C, A, B1, B2 } = await groupWithTwoDeviceMember();
+  try {
+    const stale = h.adapter.decodeState(b64uDecodeVar(B2.store.record!.state!, 8 << 20), h.adapter.config({ validateCredential: async () => true }));
+    const res = h.deviceStatement(B2, "device.removed", { memberId: B2.memberId, deviceId: B2.deviceId, reason: "self" });
+    assert.ok(res.ok, JSON.stringify(res));
+    await h.settle();
+    const leaves = leafIds(h, C);
+    assert.equal(leaves.includes(B2.deviceId), false, "B2's leaf is gone");
+    assert.ok(leaves.includes(B1.deviceId), "B1 stays");
+    await readsNext(h, A, "after B2 left");
+    assert.ok(B1.member.messages.some((m) => m.text === "after B2 left"));
+    assert.ok(C.member.messages.some((m) => m.text === "after B2 left"));
+    assert.ok(!B2.member.messages.some((m) => m.text === "after B2 left"));
+    const last = h.room.host.entries().filter((r) => r.signed.entry.type === "mls.app").at(-1)!;
+    await assert.rejects(h.adapter.process(stale, last.body, () => true));
+  } finally {
+    h.cleanup();
   }
 });

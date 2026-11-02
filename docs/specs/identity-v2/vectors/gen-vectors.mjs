@@ -136,6 +136,7 @@ const CONTEXTS = [
   "enroll-token",
   "key-change-new",
   "mls-identity",
+  "chat-message",
 ];
 function tbs(ctx, payload) {
   if (!/^[a-z0-9.:-]{1,64}$/.test(ctx)) throw new Error("bad ctx");
@@ -1998,6 +1999,22 @@ mlsAad.epochAuth = epochAuth;
 const witness = { v: 2, typ: "log-witness", roomId, deviceId, head: { seq: 3, hash: e3.hash }, roster: { seq: rosterAfter[3].rosterSeq, hash: rosterAfter[3].rosterHash } };
 const witnessSig = sigOf(keys.devSig, "stmt:log.witness", rjcsBytes(witness));
 const witnessPayload = { kind: "log.witness", witness, sig: b64u(witnessSig) };
+// Chat message (mls-integration.md section 5.2; R3.4): signed by the sender's device key, bound to group and epoch.
+const chatMessage = {
+  v: 2,
+  typ: "chat-message",
+  roomId,
+  groupId: epochAuthInput.groupId,
+  epoch: 0,
+  memberId,
+  deviceId,
+  ts: 1793232400000,
+  text: "Hello room. Plain text: <b>not markup</b> https://example.org/x",
+};
+const chatSig = sigOf(keys.devSig, "chat-message", rjcsBytes(chatMessage));
+check(!ed25519.verify(chatSig, tbs("mls-identity", rjcsBytes(chatMessage)), keys.devSig.pub), "a chat-message signature does not verify as mls-identity");
+check(!ed25519.verify(chatSig, tbs("chat-message", rjcsBytes({ ...chatMessage, epoch: 1 })), keys.devSig.pub), "a chat-message signature does not verify for another epoch");
+const chatPayload = { kind: "chat.message", msg: chatMessage, sig: b64u(chatSig) };
 
 // ------------------------------------------------------------------ records (enrollment-v2.md section 3.4)
 const pingFrame = rjcsBytes({ t: "ping" });
@@ -2459,6 +2476,7 @@ const out = {
     authorityExtension,
     groupIds,
     witness: witnessPayload,
+    chatMessage: { msg: chatMessage, tbsHex: hex(tbs("chat-message", rjcsBytes(chatMessage))), sig: b64u(chatSig), payload: rjcs(chatPayload) },
   },
   records: {
     single: { frame: td.decode(pingFrame), recordHex: hex(recordSingle) },

@@ -29,8 +29,10 @@ import {
   roomsV2DeviceApprove,
   roomsV2ConflictResolve,
   roomsV2TestClockAdvance,
-  roomsV2MlsSend,
-  roomsV2MlsMessages,
+  roomsV2ChatList,
+  roomsV2ChatRead,
+  roomsV2ChatSend,
+  roomsV2ChatUnread,
   roomsV2DeviceRekey,
   roomsV2DeviceRemove,
   roomsV2HostKeyRotate,
@@ -157,12 +159,12 @@ export default function contribute(server: PluginServerContext) {
   handle(roomsV2AlertsAck, (i) => rt.ackAlerts(i.roomId, i.alerts));
   handleAdmin(roomsV2DeviceApprove, "device.approve", (i) => rt.approveDevice(i.roomId, i.ref));
   handleAdmin(roomsV2ConflictResolve, "device.conflict.resolve", (i) => rt.resolveConflict(i.roomId, i.memberId));
-  // DEVELOPMENT-ONLY unsigned chat path (until R3.4's sender signature): registered only on a marked
-  // e2e test home, the same home check as the test clock (server/platform/test-clock.ts).
-  if (rt.testHome) {
-    handle(roomsV2MlsSend, (i) => rt.mlsSend(i.roomId, i.text));
-    handle(roomsV2MlsMessages, (i) => rt.mlsMessages(i.roomId));
-  }
+  // R3.4: room chat, signed by the sending device inside MLS (mls-integration 5.2). It replaced the
+  // development-only unsigned `rooms.v2.mls.send` and `rooms.v2.mls.messages`, which are gone.
+  handle(roomsV2ChatSend, (i) => rt.chatSend(i.roomId, i.text));
+  handle(roomsV2ChatList, (i) => rt.chatList(i.roomId, i.before, i.limit));
+  handle(roomsV2ChatRead, (i) => rt.chatRead(i.roomId, i.seq));
+  handle(roomsV2ChatUnread, () => rt.chatUnread());
   // Rotation and recovery (I-12). Admin actions need the token of their confirmation dialog (I-14);
   // a member's own rekey and the recovery procedures (typed recovery code) do not.
   handle(roomsV2DeviceRekey, (i) => rt.requestRekey(i.roomId));

@@ -29,6 +29,7 @@ import {
 import { Badge, Button, ConfirmButton, errorText, relativeTime, type Styles } from "./ui";
 import { SasDigits, TypedConfirm } from "./v2-dialogs";
 import { ActivityListV2, AlertNoticesV2, NameEditorV2 } from "./v2-activity";
+import { ChatSectionV2 } from "./v2-chat";
 import { STATUS_V2_KEY } from "./v2-owner";
 import { memberErrorText, nameWithId, shortId } from "./v2-text";
 
@@ -362,6 +363,7 @@ export function JoinedCardV2({ view, mls, theme, styles }: { view: Joined; mls: 
           Members: {others.map((n) => who(n.memberId)).join(", ")}
         </Text>
       ) : null}
+      {mls ? <ChatSectionV2 roomId={roomId} unread={mls.unread ?? 0} theme={theme} styles={styles} /> : null}
       <Button theme={theme} label={showActivity ? "Hide activity" : `Activity (${view.activity.length})`} onPress={() => setShowActivity((v) => !v)} />
       {showActivity ? <ActivityListV2 items={view.activity} who={who} theme={theme} styles={styles} /> : null}
       <Text style={styles.small}>{LOST_DEVICE_GUIDANCE}</Text>

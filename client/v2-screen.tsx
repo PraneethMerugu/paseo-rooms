@@ -45,7 +45,7 @@ export function RoomsV2Screen({ theme, layout, navigation }: PluginScreenProps) 
 
       <Section styles={styles} title="Rooms you own" trailing={s?.state === "ready" ? <CreateRoomButton theme={theme} styles={styles} /> : null}>
         {s && s.owned.length === 0 ? <Text style={styles.muted}>No rooms yet. Create one, then share an agent: open the agent, {commandCenterHint(layout.compact)} and choose "Open room…".</Text> : null}
-        {s?.owned.map((r) => <OwnedRoomCardV2 key={r.roomId} view={r} theme={theme} styles={styles} compact={layout.compact} />)}
+        {s?.owned.map((r) => <OwnedRoomCardV2 key={r.roomId} view={r} unread={s.mls.find((m) => m.roomId === r.roomId)?.unread ?? 0} theme={theme} styles={styles} compact={layout.compact} />)}
       </Section>
 
       <Section styles={styles} title="Rooms you joined">
@@ -369,6 +369,13 @@ function DeleteAllData({ s, theme, styles }: { s: Status; theme: PluginTheme; st
                 {hostedToo ? `${hosted} room(s) hosted here stop for good. Their members lose access and the rooms cannot be recovered.` : `This daemon hosts ${hosted} room(s). Choose "Also delete hosted rooms" first, or the request is refused.`}
               </Text>
             ) : null}
+            {hosted > 0 && hostedToo
+              ? s.owned.map((o) => (
+                  <Text key={o.roomId} style={[styles.small, o.closeOnDelete?.plan === "none" ? { color: theme.colors.statusDanger } : null]}>
+                    {o.roomName ?? o.roomId.slice(0, 13)}: {o.closeOnDelete?.message ?? "Closure state unknown."}
+                  </Text>
+                ))
+              : null}
           </TypedConfirm>
         </View>
       ) : null}
@@ -378,6 +385,11 @@ function DeleteAllData({ s, theme, styles }: { s: Status; theme: PluginTheme; st
             Left {result.left.filter((l) => l.statement).length} room(s), forgot {result.left.filter((l) => !l.statement).length}. Removed {result.hostsRemoved} lane host(s).
           </Text>
           {result.hostsRemaining.length ? <Text style={styles.small}>{result.hostsRemaining.length} lane host(s) could not be removed. Disable them in Paseo's host list.</Text> : null}
+          {result.hostedClosed.map((c) => (
+            <Text key={c.roomId} style={styles.small}>
+              Hosted room {c.roomId.slice(0, 13)}: {c.outcome.replace(/_/g, " ")}. {c.message}
+            </Text>
+          ))}
           <Text style={styles.small}>
             Room key: {result.keystore.kek}
             {result.keystore.message ? ` (${result.keystore.message})` : ""}. Rooms files deleted: {result.dataDeleted ? "yes" : "no"}.

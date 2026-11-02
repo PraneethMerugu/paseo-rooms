@@ -337,6 +337,7 @@ export class LaneService {
   private authority(laneId: string, aud: string): LaneGrantAuthority {
     return {
       failedAttemptsPerMinute: FAILED_LINKS_PER_MINUTE,
+      now: () => this.o.grants.clockNow(),
       check: (token, id, opts) => (id === laneId ? this.o.grants.verify(token, { laneId, aud }, opts) : { ok: false, reason: "wrong_audience" }),
       keyPair: () => {
         const keys = readHostKeys(this.o.dataDir, this.o.kek, this.roomId);

@@ -36,7 +36,8 @@
       "enroll-request",
       "enroll-token",
       "key-change-new",
-      "mls-identity"
+      "mls-identity",
+      "chat-message"
     ],
     "statementContext": "stmt:<type>",
     "hashContext": "h:<label>"
@@ -5491,6 +5492,22 @@
         }
       },
       "sig": "8TZBNIV7NmAgEWVU5CQrRsfAc5s9Tsa_KJqJmBpJOXzGdS3-Y68cDrRyvYQFC4Putr7vt3-JSmK3wzPMQHGDCA"
+    },
+    "chatMessage": {
+      "msg": {
+        "v": 2,
+        "typ": "chat-message",
+        "roomId": "room_ed7e2aebb600e1be4fe242e3dcc65445",
+        "groupId": "ChCQLMPXjTfot96is8OG_wja_BQ32ebKfhz__kbDtfY",
+        "epoch": 0,
+        "memberId": "mem_3f601ad1dc407d5d4aba0078cdfd73ee",
+        "deviceId": "dev_486180968f32e4ea081013c5a32a637e",
+        "ts": 1793232400000,
+        "text": "Hello room. Plain text: <b>not markup</b> https://example.org/x"
+      },
+      "tbsHex": "706173656f2d726f6f6d732f763200636861742d6d657373616765007b226465766963654964223a226465765f3438363138303936386633326534656130383130313363356133326136333765222c2265706f6368223a302c2267726f75704964223a22436843514c4d50586a54666f7439366973384f475f776a615f4251333265624b66687a5f5f6b6244746659222c226d656d6265724964223a226d656d5f3366363031616431646334303764356434616261303037386364666437336565222c22726f6f6d4964223a22726f6f6d5f6564376532616562623630306531626534666532343265336463633635343435222c2274657874223a2248656c6c6f20726f6f6d2e20506c61696e20746578743a203c623e6e6f74206d61726b75703c2f623e2068747470733a2f2f6578616d706c652e6f72672f78222c227473223a313739333233323430303030302c22747970223a22636861742d6d657373616765222c2276223a327d",
+      "sig": "0UvAt-dDf1pGNzIfDTq_yjECCaHPJprcztxas4dzETjE3eMiesIILvkQ8CoPvkLKz-xnf8Kd3FFpSOWUWZM8Dw",
+      "payload": "{\"kind\":\"chat.message\",\"msg\":{\"deviceId\":\"dev_486180968f32e4ea081013c5a32a637e\",\"epoch\":0,\"groupId\":\"ChCQLMPXjTfot96is8OG_wja_BQ32ebKfhz__kbDtfY\",\"memberId\":\"mem_3f601ad1dc407d5d4aba0078cdfd73ee\",\"roomId\":\"room_ed7e2aebb600e1be4fe242e3dcc65445\",\"text\":\"Hello room. Plain text: <b>not markup</b> https://example.org/x\",\"ts\":1793232400000,\"typ\":\"chat-message\",\"v\":2},\"sig\":\"0UvAt-dDf1pGNzIfDTq_yjECCaHPJprcztxas4dzETjE3eMiesIILvkQ8CoPvkLKz-xnf8Kd3FFpSOWUWZM8Dw\"}"
     }
   },
   "records": {

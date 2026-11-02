@@ -15,6 +15,8 @@ export const CTX_LANE_GRANT = "lane-grant";
 export const CTX_ENROLL_REQUEST = "enroll-request";
 export const CTX_KEY_CHANGE_NEW = "key-change-new";
 export const CTX_MLS_IDENTITY = "mls-identity";
+/** A chat message inside MLS, signed by the sender's device key (mls-integration.md 5.2; R3.4). */
+export const CTX_CHAT_MESSAGE = "chat-message";
 /** Prefix of per-type statement contexts: `stmt:<type>` (room-log-v2.md section 4). */
 export const CTX_STMT_PREFIX = "stmt:";
 /** Statement type of the `LogWitness` object that travels inside MLS. */
@@ -66,6 +68,6 @@ export const H_RECOVERY_CODE = "recovery-code";
 // Noise prologue label (section 3.3; enrollment-v2.md section 3.3).
 export const PROLOGUE_NOISE_IK = "noise-ik";
 
-export const SIGNATURE_CONTEXTS = [CTX_GENESIS, CTX_LOG_ENTRY, CTX_LANE_GRANT, CTX_ENROLL_REQUEST, CTX_KEY_CHANGE_NEW, CTX_MLS_IDENTITY] as const;
+export const SIGNATURE_CONTEXTS = [CTX_GENESIS, CTX_LOG_ENTRY, CTX_LANE_GRANT, CTX_ENROLL_REQUEST, CTX_KEY_CHANGE_NEW, CTX_MLS_IDENTITY, CTX_CHAT_MESSAGE] as const;
 export const HASH_LABELS = [H_KID, H_GENESIS, H_LOG_ENTRY, H_LOG_BODY, H_ROSTER, H_INVITE_REF, H_LINK_REF, H_ADMIN_SET, H_MLS_GROUP, H_MLS_EPOCH_AUTH, H_SAS_COMMIT, H_SAS_TRANSCRIPT, H_RECOVERY_CODE] as const;
 export const DERIVATION_LABELS = [MAC_ENROLL_TOKEN, KDF_INVITE_TOKEN_KEY, KDF_LINK_TOKEN_KEY, KDF_SAS, KDF_FILE_KEY, PROLOGUE_NOISE_IK] as const;

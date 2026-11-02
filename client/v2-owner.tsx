@@ -36,6 +36,7 @@ import {
 import { Badge, Button, ConfirmButton, Dot, errorText, relativeTime, Section, Segmented, type Styles } from "./ui";
 import { RecoveryCodeModal, SasDigits, useAdminConfirm, type RecoveryOffer } from "./v2-dialogs";
 import { ActivityListV2, NameEditorV2 } from "./v2-activity";
+import { ChatSectionV2 } from "./v2-chat";
 import { shortId } from "./v2-text";
 
 export type OwnedV2 = z.infer<typeof OwnedRoomV2View>;
@@ -67,7 +68,7 @@ function Notice({ theme, styles, tone, children }: { theme: PluginTheme; styles:
   return <View style={[styles.codeBox, { borderLeftWidth: 3, borderLeftColor: color, gap: 6 }]}>{children}</View>;
 }
 
-export function OwnedRoomCardV2({ view, theme, styles, compact }: { view: OwnedV2; theme: PluginTheme; styles: Styles; compact: boolean }) {
+export function OwnedRoomCardV2({ view, unread, theme, styles, compact }: { view: OwnedV2; unread?: number; theme: PluginTheme; styles: Styles; compact: boolean }) {
   const qc = useQueryClient();
   const toast = useToast();
   const admin = useAdminConfirm(theme, styles);
@@ -265,6 +266,7 @@ export function OwnedRoomCardV2({ view, theme, styles, compact }: { view: OwnedV
         </View>
       ) : null}
       {view.adminFingerprint ? <Text style={styles.small}>Your owner fingerprint (people joining see it next to their code): {view.adminFingerprint}</Text> : null}
+      {!view.keys.closed ? <ChatSectionV2 roomId={roomId} unread={unread ?? 0} theme={theme} styles={styles} /> : null}
       <Button theme={theme} label={showActivity ? "Hide activity" : `Activity (${view.activity.length})`} onPress={() => setShowActivity((v) => !v)} />
       {showActivity ? <ActivityListV2 items={view.activity} who={(id) => (id ? labelOf(id) : "Someone")} theme={theme} styles={styles} /> : null}
 

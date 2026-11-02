@@ -11,7 +11,7 @@ import type { RoomState } from "../../server/authority/fold";
 import type { StatementType } from "../../server/authority/statements";
 import { LaneConnection, LinkSession, type LaneEndpoint } from "../../server/gateway/lane-endpoint";
 import { LaneErrorLog } from "../../server/gateway/lane-errors";
-import { grantTtlS, HostGrants, parseGrantToken, verifyGrantV2, PRUNE_HELD_MS, type CurrentGrant } from "../../server/host/grants";
+import { grantTtlS, HOST_KEY_SKEW_S, HostGrants, parseGrantToken, verifyGrantV2, PRUNE_HELD_MS, type CurrentGrant } from "../../server/host/grants";
 import { LaneService, V2_LANE_LIMITS } from "../../server/host/lane-service";
 import { endpointKeyFromHost, RoomEndpoint } from "../../server/host/room-endpoint";
 import { openKeyStore, type Kek } from "../../server/keystore/keystore";
@@ -76,7 +76,7 @@ interface Env {
   cleanup(): Promise<void>;
 }
 
-async function setup(o: { env?: NodeJS.ProcessEnv; livenessWaitMs?: number } = {}): Promise<Env> {
+async function setup(o: { env?: NodeJS.ProcessEnv; livenessWaitMs?: number; now?: () => number } = {}): Promise<Env> {
   const t = tempDir();
   const home = join(t.dir, "home");
   mkdirSync(home, { mode: 0o700 });
@@ -92,6 +92,7 @@ async function setup(o: { env?: NodeJS.ProcessEnv; livenessWaitMs?: number } = {
     host: room.host,
     env: o.env ?? {},
     retryMs: 50,
+    ...(o.now ? { now: o.now } : {}),
     write: {
       fsyncSync: (fd: number) => {
         if (fail.write) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
@@ -211,6 +212,49 @@ test("lifetime: 12 h fixed; policy only shortens; below 1 h only with the develo
 });
 
 // ------------------------------------------------------------------------------ verification order
+
+test("section 9 skew: a host clock a little behind the host key's validFrom still issues usable grants; far behind is refused clearly", async () => {
+  let offsetMs = 0;
+  const env = await setup({ now: () => Date.now() + offsetMs });
+  const logged: string[] = [];
+  const realLog = console.log;
+  try {
+    const d = newDevice();
+    admit(env, d);
+    const hk = env.room.host.state.auth.hostKeys.find((h) => h.toSeq === null)!;
+    const v = (tok: string) => env.grants.verify(tok, { laneId: env.laneId, aud: env.ep.lane.serverId });
+    // NTP steps the clock back 2 minutes after the room was created: within HOST_KEY_SKEW_S.
+    offsetMs = -(Math.floor(Date.now() / 1000) - hk.validFrom + 120) * 1000;
+    const g = issue(env, d);
+    assert.ok(g.iat < hk.validFrom, "the grant predates the key's validFrom");
+    assert.deepEqual(v(g.token), { ok: true, claims: parseGrantToken(g.token)!.claims }, "accepted within the tolerance");
+    // At the edge: iat = validFrom - HOST_KEY_SKEW_S passes step 2, one second more does not.
+    const base = parseGrantToken(g.token)!.claims;
+    const step2 = (iat: number) => {
+      const r = v(forge(env, { ...base, iat }));
+      return r.ok ? "ok" : r.reason;
+    };
+    assert.notEqual(step2(hk.validFrom - HOST_KEY_SKEW_S), "host_key_not_valid");
+    assert.equal(step2(hk.validFrom - HOST_KEY_SKEW_S - 1), "host_key_not_valid");
+    // A step back of 20 minutes: the host refuses to sign a grant every lane endpoint would refuse,
+    // as retryable (busy), and logs why.
+    offsetMs = -(Math.floor(Date.now() / 1000) - hk.validFrom + 20 * 60) * 1000;
+    console.log = (...a: unknown[]) => void logged.push(a.map(String).join(" "));
+    const r = env.grants.issue({ memberId: d.memberId, deviceId: d.deviceId }, env.laneId);
+    console.log = realLog;
+    assert.deepEqual(r, { ok: false, code: "busy" });
+    const line = logged.find((l) => l.includes("grant_refused_clock_behind"));
+    assert.ok(line && /behind the room's host key start time/.test(line) && /"toleranceS":300/.test(line), line);
+    assert.equal(env.grants.currentOf(d.deviceId, env.laneId)?.gid, g.gid, "the previous grant stays current");
+    // Once the clock is right again, issuance resumes (the refused attempt used no rate-limit slot).
+    offsetMs = 0;
+    assert.ok(issue(env, d).iat >= hk.validFrom);
+  } finally {
+    console.log = realLog;
+    await env.cleanup();
+  }
+});
+
 
 test("section 4: each verification step refuses in order; only the current gid of an active device passes", async () => {
   const env = await setup();

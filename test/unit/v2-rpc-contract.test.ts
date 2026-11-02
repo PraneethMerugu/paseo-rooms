@@ -270,7 +270,7 @@ test("I-14 client texts: members see mapped codes only; ids and recovery codes a
   assert.equal(fmtSas("317837"), "317 837");
 });
 
-test("V-3: the development MLS RPCs (rooms.v2.mls.send, rooms.v2.mls.messages) are not registered outside a marked test home", async () => {
+test("V-3: the development MLS RPCs (rooms.v2.mls.send, rooms.v2.mls.messages) are gone on every home; the chat RPCs (R3.4) are registered on an ordinary home", async () => {
   const t = tempDir();
   const env: Record<string, string> = { PASEO_HOME: "", PASEO_ROOMS_KEYSTORE: "fallback-file" };
   const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
@@ -289,6 +289,7 @@ test("V-3: the development MLS RPCs (rooms.v2.mls.send, rooms.v2.mls.messages) a
     const plain = await registered(join(t.dir, "home"));
     assert.ok(plain.has("rooms.v2.status"), "the entry registered its RPCs");
     for (const n of dev) assert.equal(plain.has(n), false, `${n} on an ordinary home`);
+    for (const n of ["rooms.v2.chat.send", "rooms.v2.chat.list", "rooms.v2.chat.read", "rooms.v2.chat.unread"]) assert.ok(plain.has(n), `${n} on an ordinary home`);
     // Named like a test home but without the marker: still absent.
     const unmarked = await registered(join(t.dir, ".test-homes", "v2-unmarked"));
     for (const n of dev) assert.equal(unmarked.has(n), false, `${n} on an unmarked test-home path`);
@@ -296,7 +297,7 @@ test("V-3: the development MLS RPCs (rooms.v2.mls.send, rooms.v2.mls.messages) a
     mkdirSync(markedHome, { recursive: true, mode: 0o700 });
     writeFileSync(join(markedHome, TEST_HOME_MARKER), TEST_HOME_MARKER_TEXT, { mode: 0o600 });
     const marked = await registered(markedHome);
-    for (const n of dev) assert.equal(marked.has(n), true, `${n} on a marked test home`);
+    for (const n of dev) assert.equal(marked.has(n), false, `${n} on a marked test home (replaced by rooms.v2.chat.*)`);
   } finally {
     for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k];
     else process.env[k] = v;

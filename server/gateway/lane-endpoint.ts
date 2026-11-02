@@ -98,6 +98,8 @@ export interface LaneGrantAuthority {
   admitLink?(link: LinkSession): Promise<"accept" | "reject">;
   /** v2: failed link attempts per minute on this endpoint (section 11); only failures consume it. */
   failedAttemptsPerMinute?: number;
+  /** The clock grants are checked against (unix ms); the expiry timer uses it too. Default Date.now. */
+  now?(): number;
 }
 
 export interface LaneEndpointDeps {
@@ -601,7 +603,7 @@ export class LinkSession {
 
   private armExpiry(): void {
     if (!this.claims) return;
-    const ms = Math.max(0, this.claims.exp * 1000 - Date.now()) + 50;
+    const ms = Math.max(0, this.claims.exp * 1000 - (this.endpoint.authority.now?.() ?? Date.now())) + 50;
     this.expiryTimer = setTimeout(() => this.recheck("expiry_timer"), Math.min(ms, 2 ** 31 - 1));
   }
 
