@@ -96,6 +96,7 @@ import type { PendingView, InviteView } from "./host/enrollment";
 import { isDevInsecureRelay, memberRelayUseTls, relayKey } from "./host/invites";
 import { endpointKeyFromHost, movedEndpointKeys, RoomEndpoint } from "./host/room-endpoint";
 import { genesisPath, RoomHost } from "./host/room-host";
+import { CompatGuard } from "./compat";
 import { deleteKeyStore, ENV_KEYSTORE, openKeyStore, type Kek, type KeyStoreDeletion, type KeyStoreStatus, type OpenKeyStoreOptions } from "./keystore/keystore";
 import { log, logError } from "./log";
 import { HostGrants } from "./host/grants";
@@ -234,6 +235,8 @@ export class RoomsRuntimeV2 {
   private observing: { release(): Promise<void> } | null = null;
   /** Notices sessions that ended (access_ended) and stops their lanes. */
   private endedWatch: ReturnType<typeof setInterval> | null = null;
+  /** R2.7: the owner daemon's Paseo version and protocol against the tested range; lanes refuse to serve outside it. */
+  readonly compat = new CompatGuard({ log });
   private paseo: PaseoApi | null = null;
   private started: Promise<void> | null = null;
   private stopping = false;
@@ -482,6 +485,8 @@ export class RoomsRuntimeV2 {
   }
 
   private async startInner(): Promise<void> {
+    // R2.7: read the daemon's version and protocol in the background; lanes check it again at start.
+    if (!this.stopping) this.compat.probe(this.paseoHome);
     this.protection.ensureDir(this.dataDir);
     const check = this.protection.verifyTree(this.dataDir);
     if (!check.ok) throw new ProtectionError(check.problems);
@@ -589,6 +594,7 @@ export class RoomsRuntimeV2 {
       relay: relayAddress(g, this.env),
       paseoHome: this.paseoHome,
       onAgentGone: (laneId, reason) => this.closeLaneForAgent(roomId, laneId, reason),
+      compat: this.compat,
     });
     // The admin daemon's automatic approvals of held device adds (identity-model.md 6.3).
     const approver = signer ? setInterval(() => this.autoApprove(roomId), 2000) : null;
@@ -995,6 +1001,7 @@ export class RoomsRuntimeV2 {
         : null,
       ...(this.permissionProblems ? { permissionProblems: this.permissionProblems.slice(0, 20).map((p) => ({ path: p.path, code: p.code, detail: p.detail })) } : {}),
       platform: process.platform,
+      paseoCompat: this.compat.verdict,
       migration: this.migrationView(),
       owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes, holds, signer, moved }) => ({
         roomId: host.roomId,
@@ -2418,6 +2425,7 @@ export class RoomsRuntimeV2 {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.compat.stop();
     if (this.endedWatch) clearInterval(this.endedWatch);
     for (const r of this.registrars.values()) r.stop();
     for (const m of this.schedulers.values()) for (const sc of m.values()) sc.stop();

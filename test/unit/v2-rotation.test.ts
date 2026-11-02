@@ -94,7 +94,7 @@ function newKey() {
 async function room(timings = FAST): Promise<{ h: Harness; C: Dev; A: Dev; D: Dev }> {
   const h = await Harness.create(timings);
   await h.settle();
-  // One at a time: devices added by the same commit only witness for each other later (see Follow-ups).
+  // One at a time, so each joiner is confirmed by both other leaves (co-joiners are covered in v2-mls.test.ts).
   h.admit("A");
   await h.settle();
   h.admit("D");
@@ -237,7 +237,8 @@ test("device rekey: a refused pair leaves no outstanding approval (the signer is
 });
 
 test("periodic leaf refresh: an UpdatePath after the message budget, credential unchanged, accepted by everyone", async () => {
-  const { h, C, A, D } = await room({ ...FAST, refreshMessages: 2 });
+  // A has sent two witnesses by now (its own join, then D's Add; round 10, item 6): a budget of 3 is reached by the two texts below.
+  const { h, C, A, D } = await room({ ...FAST, refreshMessages: 3 });
   try {
     const leavesBefore = parseLeaves(h.adapter.leaves((A.member as unknown as { state: never }).state))!;
     const epoch = A.member.epoch!;

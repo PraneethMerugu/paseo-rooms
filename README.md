@@ -56,7 +56,7 @@ Relay: the genesis of a new room records `PASEO_ROOMS_RELAY_ENDPOINT` (default `
 
 ## Tests
 
-**Unit and conformance** (`npm test`, 343 tests, about 10 s): the v2 vectors and encoding, Noise, records, keystore, file layer, fold core and authority, room host, room endpoint, enrollment, grants and lane service, device links, rotation, MLS, RPC contracts and the migration from M1 (`v2-*.test.ts`); the Room Profile and field tables, viewer policy, lane endpoint limits, relay connection, agent guard and tripwire.
+**Unit and conformance** (`npm test`, 394 tests, about 10 s): the v2 vectors and encoding, Noise, records, keystore, file layer, fold core and authority, room host, room endpoint, enrollment, grants and lane service, device links, rotation, MLS, RPC contracts and the migration from M1 (`v2-*.test.ts`); the Room Profile and field tables, viewer policy, lane endpoint limits, relay connection, agent guard and tripwire.
 
 **End to end, offline** (`bash test/e2e-v2/run.sh`, about 2.5 minutes): three disposable daemons on 6921, 6922 and 6924 and a fake relay on 6923, homes under `plugin/.test-homes/v2-*` (0700, git-ignored, deleted afterwards). Enrollment with SAS and a restart mid-pending, lane grants with rotation, a device link with the 72 h hold on the TEST-ONLY clock, MLS, host key rotation, device rekey, removal, closing a lane and leaving a room (a second room; the member's routed lane hosts are removed), the denials of out-of-scope operations, the one-time invite, a full file-mode check, secret scans, an independent fold of the owner's room log, and archiving the shared agent closing its lane. Two agents are created without a prompt: no model call. `--live-relay` uses relay.paseo.sh (network; run only with the user's go-ahead).
 
@@ -75,6 +75,11 @@ Every test daemon: config written before the first start (loopback listen, daemo
 - **Room agents created by Rooms** get the inert `paseo` MCP shadow (`agent-guard.ts`) and the stored-config tripwire before a resume. Identity v2 shares existing agents and creates none; the guard and tripwire still protect the fork agents M1 left on a daemon.
 - **Other plugins are trusted.** Paseo 0.13.2 runs `before` hooks in plugin-id order, and every server plugin runs with owner permissions.
 - **Resource limits.** Defaults in `server/limits.ts`, with the grants-v2 section 11 limits for lanes (32 routes per link, 256 per lane, 30 failed links per minute). Override in `<PASEO_HOME>/plugin-data/rooms/limits.json` (clamped to safe bounds).
+
+## Platforms and Paseo versions
+
+- **Platforms.** The v0.2 pilot supports Linux only: every unit and e2e run so far was on Linux. macOS and Windows are untested. The code has paths for both (Keychain and Credential Manager through the keyring, Windows DACLs, named pipes), but none has been run, so do not use Rooms on them for anything that matters yet.
+- **Paseo versions.** The manifest requires Paseo `>=0.13.2 <0.14.0` (`paseo-plugin.json`). The Room Profile was generated from `@getpaseo/protocol` 0.13.2. At start, and again when each lane starts, Rooms reads the daemon's version and protocol number from `server_info` (`server/compat.ts`). Outside the tested range, or for a protocol the Room Profile has no tested entry for, Rooms does not serve lanes (fail closed). The Rooms screen then shows "Shared agents are paused" with the reported and tested versions. Rooms itself (invites, members, chat) keeps working. A pre-release build counts as untested. To support a new Paseo release, regenerate and review the profile, run both test suites against it, then widen the range and add a tested entry.
 
 ## Installing on a real daemon (not done by the tests)
 

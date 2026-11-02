@@ -47,6 +47,7 @@ import {
 } from "../room-profile/sanitize";
 import { LaneErrorLog } from "./lane-errors";
 import { buildUpstreamHello, openDaemonSocket, RawDaemon } from "./local-daemon";
+import { checkPaseoCompat, type CompatGuard } from "../compat";
 import { MAX_CONNECTION_ID_CHARS, parseRelayNotice, RelayConnection, RelayControlSocket, relayServerUrl, type RelayAddress } from "../transport/relay-server";
 
 /** What a lane endpoint needs to know about its lane (the owner-local binding plus the offer). */
@@ -120,6 +121,8 @@ export interface LaneEndpointDeps {
    * future sandboxed room agent runner; tested in lane-endpoint.test.ts.
    */
   verifyRoomAgent?(lane: EndpointLane): { ok: boolean; problems: string[] };
+  /** R2.7: records the daemon's version verdict for status; without it the check still runs. */
+  compat?: CompatGuard;
 }
 
 /** Shared deny/limit log limiter (C-5): bounded per source key. */
@@ -265,6 +268,12 @@ export class LaneEndpoint {
       await d.connect(`rooms-lane-${this.lane.id}-scope`);
       try {
         this.upstreamVersion = String(d.serverInfo?.version ?? "0.0.0");
+        // R2.7 compatibility guard (decisions round 10, item 2): fail closed outside the tested range.
+        const verdict = this.deps.compat ? this.deps.compat.observe(d.serverInfo) : checkPaseoCompat(d.serverInfo);
+        if (!verdict.ok) {
+          this.block(`paseo_${verdict.code}`, verdict.message ?? verdict.code);
+          return;
+        }
         const res = await d.request({ type: "fetch_agent_request", agentId: this.lane.agentId });
         const agent = res.payload?.agent;
         if (res.type === "fetch_agent_response" && agent === null && !res.payload?.error) {

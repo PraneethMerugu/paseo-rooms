@@ -471,8 +471,9 @@ function LanesTab({ view, theme, styles, admin, refresh }: TabProps) {
                   {l.status} · {l.links} link(s) · {l.routes} open view(s) · project names {l.showNames ? "shown" : "hidden"}
                 </Text>
               </View>
-              <Badge theme={theme} label={l.status === "closed" ? "Closed" : (l.endpoint ?? "offline")} tone={l.status === "closed" ? "muted" : l.endpoint === "online" ? "ok" : "warn"} />
+              <Badge theme={theme} label={l.status === "closed" ? "Closed" : l.blocked?.startsWith("paseo_") ? "Paused" : (l.endpoint ?? "offline")} tone={l.status === "closed" ? "muted" : l.endpoint === "online" ? "ok" : "warn"} />
             </View>
+            {l.status !== "closed" && l.blocked?.startsWith("paseo_") ? <Text style={styles.small}>Not served: this Paseo version is untested with Rooms. See the notice at the top of Rooms.</Text> : null}
             {l.status !== "closed" ? (
               <View style={styles.row}>
                 <Button

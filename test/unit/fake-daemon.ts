@@ -13,6 +13,8 @@ export interface FakeDaemon {
   sockets: Set<WebSocket>;
   /** Set to false to keep sessions "not ready" (no server_info after hello). */
   sendServerInfo: boolean;
+  /** Version fields of server_info (R2.7 compatibility tests); default Paseo 0.13.2, protocol 1. */
+  serverVersion: { version?: unknown; protocolVersion?: unknown };
   onSession: (message: any, reply: (m: any) => void) => void;
   close(): Promise<void>;
 }
@@ -32,6 +34,7 @@ export async function startFakeDaemon(): Promise<FakeDaemon> {
     messages: [],
     sockets: new Set(),
     sendServerInfo: true,
+    serverVersion: { version: "0.13.2", protocolVersion: 1 },
     onSession: () => undefined,
     async close() {
       for (const s of fake.sockets) s.terminate();
@@ -48,7 +51,7 @@ export async function startFakeDaemon(): Promise<FakeDaemon> {
       if (msg.type === "hello") {
         fake.hellos.push(msg);
         if (fake.sendServerInfo)
-          reply({ type: "status", payload: { status: "server_info", serverId: "srv_owner_secret", version: "0.13.2", protocolVersion: 1, permissions: ["workspace.read"], features: {} } });
+          reply({ type: "status", payload: { status: "server_info", serverId: "srv_owner_secret", ...fake.serverVersion, permissions: ["workspace.read"], features: {} } });
         return;
       }
       if (msg.type === "session") {

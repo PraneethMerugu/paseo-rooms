@@ -410,6 +410,15 @@ export async function pluginLogs(home: string): Promise<string> {
   return redact(r.stdout + r.stderr);
 }
 
+/**
+ * Unredacted plugin log text, for in-memory secret checks only (credential-negative, resource-stress):
+ * the caller only tests whether a tracked secret occurs in it. Never print or write the result.
+ */
+export async function pluginLogsRaw(home: string): Promise<string> {
+  const r = await runCli(home, ["plugin", "logs", PLUGIN], 60_000);
+  return r.stdout + r.stderr;
+}
+
 // ------------------------------------------------------------------ on-disk plugin state (read-only)
 export function readJson(path: string): any {
   return JSON.parse(readFileSync(path, "utf8"));

@@ -874,6 +874,9 @@ export class MlsMember {
     log("mls_joined", { roomId: this.o.roomId, seq: e.seq, epoch, lastResort: kp.lastResort });
     // R3.3: tell the group this device's profile once it may send (after the joiner check).
     this.announceAt = this.now();
+    // 5.1 (decision round 10, item 6): the joiner witnesses its new epoch too, so devices added by the
+    // same commit can confirm each other. A witness is sent while the joiner is still unconfirmed.
+    if (needed > 0) this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
     if (kp.lastResort) this.retryAt = 0;
     return "joined";
   }
@@ -1021,7 +1024,11 @@ export class MlsMember {
     if (this.witnessAt === null || this.now() < this.witnessAt || !this.state || !this.latest) return;
     this.witnessAt = null;
     const epoch = this.o.adapter.epoch(this.state);
-    if ((this.anchorsSeen.get(epoch)?.size ?? 0) >= 2 || this.canSendReason() !== null) return;
+    // A witness carries no content beyond a signed log position, so an unconfirmed joiner may send it
+    // (5.1, decision round 10, item 6); every other reason not to send still holds. Anchors from three
+    // other devices make this witness unneeded: each joiner then has two confirmers besides itself.
+    const why = this.canSendReason();
+    if ((this.anchorsSeen.get(epoch)?.size ?? 0) >= 3 || (why !== null && why !== "unconfirmed")) return;
     const st = this.latest.state;
     const ref = referenceRosterOf(st, this.o.scope ?? null);
     const witness = { v: 2, typ: "log-witness", roomId: this.o.roomId, deviceId: this.o.deviceId, head: this.latest.head, roster: { seq: ref.seq, hash: ref.hash } };

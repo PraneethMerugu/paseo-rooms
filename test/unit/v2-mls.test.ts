@@ -944,6 +944,52 @@ test("MLS 13 (round 9, item 4): a joiner of a two-leaf group is confirmed by the
   }
 });
 
+test("MLS 13 (round 10, item 6): two devices added by one commit witness their epoch and confirm each other; no epoch_unconfirmed", async () => {
+  const h = await Harness.create();
+  try {
+    await h.settle();
+    const C = h.dev("C");
+    // Both admitted before any maintenance pass: one commit adds both.
+    const J = h.admit("J");
+    const K = h.admit("K");
+    await h.settle();
+    assert.equal(J.member.inGroup, true, JSON.stringify(J.member.alerts));
+    assert.equal(K.member.inGroup, true, JSON.stringify(K.member.alerts));
+    assert.equal(J.store.record!.join?.seq, K.store.record!.join?.seq, "added by the same commit");
+    assert.equal(J.store.record!.join?.needed, 2, "two other leaves: the committer and the co-joiner");
+    // Only the committer and the co-joiner are other leaves, so the co-joiner's witness is needed.
+    for (const [d, other] of [[J, K], [K, J]] as const) {
+      assert.equal(d.store.record!.join?.status, "confirmed", `${d.name}: ${JSON.stringify(d.member.alerts)}`);
+      assert.ok(d.store.record!.join?.confirmers.includes(other.deviceId), `${d.name} confirmed by the co-joiner`);
+      assert.ok(d.store.record!.join?.confirmers.includes(C.deviceId), `${d.name} confirmed by the committer`);
+      assert.equal(d.member.canSendReason(), null);
+    }
+    h.advance(10 * 60_000);
+    await h.settle();
+    for (const d of [C, J, K]) assert.deepEqual(d.member.alerts, [], `${d.name} raised no alert`);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("MLS 13 (round 10, item 6): an unconfirmed joiner sends its witness but no other application message", async () => {
+  const h = await three({ ...FAST, witnessMaxDelayMs: 24 * 3_600_000 }, () => 0.99); // no witness inside the window
+  try {
+    const J = h.admit("J");
+    await h.settle();
+    assert.equal(J.member.canSendReason(), "unconfirmed");
+    await assert.rejects(J.member.sendText("too early"), (e: { code?: string }) => e.code === "unconfirmed");
+    const head = h.room.host.head.seq;
+    h.advance(24 * 3_600_000);
+    await J.member.maintain();
+    h.syncAll();
+    const added = h.room.host.entries(head + 1);
+    assert.equal(added.length, 1, "the joiner's witness was sequenced while unconfirmed (the timeout check runs after it)");
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("prompt Add (round 9, item 5): the admitting admin daemon adds the device as soon as it publishes; the repair delay is the fallback", async () => {
   const h = await Harness.create({ ...FAST, repairDelayMs: 60_000, repairJitterMs: 60_000 });
   try {

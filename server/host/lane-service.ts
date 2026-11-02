@@ -37,6 +37,7 @@ import type { RoomState } from "../authority/fold";
 import { firstIssue, LaneId, RoomId } from "../authority/schema";
 import { edKid, versionKey } from "../authority/state";
 import { LaneEndpoint, type AgentGoneReason, type EndpointLane, type LaneGrantAuthority, type LinkSession } from "../gateway/lane-endpoint";
+import type { CompatGuard } from "../compat";
 import type { Kek } from "../keystore/keystore";
 import { DEFAULT_LIMITS, resolveLimits, type ResourceLimits } from "../limits";
 import { log } from "../log";
@@ -72,6 +73,8 @@ export interface LaneServiceOptions {
   relay: RelayAddress;
   paseoHome: string;
   limits?: ResourceLimits;
+  /** R2.7: the runtime's Paseo compatibility guard; each lane reports the daemon's version to it. */
+  compat?: CompatGuard;
   livenessWaitMs?: number;
   /** Test only: build endpoints without starting them (no daemon, no relay). */
   autostart?: boolean;
@@ -288,6 +291,7 @@ export class LaneService {
         label: b?.label ?? null,
         agentId: b?.agentId ?? null,
         endpoint: ep?.status ?? null,
+        blocked: ep?.blockedReason ?? null,
         links: ep?.links.length ?? 0,
         routes: ep?.routes.length ?? 0,
         showNames: namesShown(s, laneId),
@@ -331,6 +335,7 @@ export class LaneService {
       paseoHome: this.o.paseoHome,
       limits: this.o.limits ?? V2_LANE_LIMITS,
       onAgentGone: (laneId, reason) => this.agentGone(laneId, reason),
+      ...(this.o.compat ? { compat: this.o.compat } : {}),
     });
   }
 

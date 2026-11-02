@@ -129,6 +129,16 @@ function RuntimeNotices({ s, theme, styles }: { s: Status; theme: PluginTheme; s
           />
         </View>
       ) : null}
+      {s.paseoCompat && !s.paseoCompat.ok ? (
+        <View style={box("danger")}>
+          <Text style={styles.h2}>Shared agents are paused on this Paseo version</Text>
+          <Text style={styles.body}>{s.paseoCompat.message}</Text>
+          <Text style={styles.body}>{s.paseoCompat.action}</Text>
+          <Text style={styles.small}>
+            Reported: Paseo {s.paseoCompat.version ?? "unknown"}, protocol {s.paseoCompat.protocolVersion ?? "unknown"}. Tested: Paseo {s.paseoCompat.testedRange}, Room Profile {s.paseoCompat.profile}. Rooms does not serve lanes on an untested version, because the Room Profile may not classify new message types.
+          </Text>
+        </View>
+      ) : null}
       {s.staleHosts?.length ? <StaleHostsNotice s={s} theme={theme} styles={styles} /> : null}
       {s.state === "error" && s.error === "data_deleted" ? (
         <View style={box("warn")}>

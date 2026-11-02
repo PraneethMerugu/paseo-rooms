@@ -172,6 +172,8 @@ export const LaneV2View = z.object({
   label: z.string().nullable(),
   agentId: z.string().nullable(),
   endpoint: z.enum(["starting", "online", "offline", "closed"]).nullable(),
+  /** Why the lane endpoint refuses to serve (e.g. `paseo_version_untested`, R2.7); null when it is not blocked. */
+  blocked: z.string().nullable().optional(),
   links: z.number().int(),
   routes: z.number().int(),
   showNames: z.boolean(),
@@ -423,6 +425,24 @@ export const roomsV2Status = defineRpc({
     mls: z.array(MlsV2View),
     /** Only on an e2e test home with the test clock switch. */
     testClockOffsetMs: z.number().int().optional(),
+    /**
+     * R2.7 compatibility guard: the owner daemon's Paseo version and protocol against the tested range
+     * and the Room Profile's tested entries. Null until the daemon answered. When `ok` is false, lanes
+     * are not served and the Rooms screen shows `message` and `action`.
+     */
+    paseoCompat: z
+      .object({
+        ok: z.boolean(),
+        code: z.enum(["ok", "version_unknown", "version_untested", "protocol_unknown", "protocol_untested"]),
+        version: z.string().nullable(),
+        protocolVersion: z.number().int().nullable(),
+        testedRange: z.string(),
+        profile: z.string(),
+        message: z.string().nullable(),
+        action: z.string().nullable(),
+      })
+      .nullable()
+      .optional(),
   }),
 });
 
