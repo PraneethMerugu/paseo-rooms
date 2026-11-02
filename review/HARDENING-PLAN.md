@@ -209,3 +209,9 @@ After Spike A (`spikes/security/RESULTS.md`):
 5. **Attack harness:** draft the remaining modules (credential-negative and resource-stress) as reviewable test code against our own test daemons only. They are not run until the user approves.
 6. **Joiner witness:** joiners also send `log.witness` after processing their Welcome.
 7. **v2 UI check:** the user runs it with `ui-check/up-v2.sh` before a labmate installs the plugin.
+
+## Decisions, round 11 (user, 2026-11-02)
+
+1. **License:** MIT for the plugin. The vendored Noise code in `server/noise/` stays under Apache-2.0 with its LICENSE and NOTICE, as Apache-2.0 requires.
+2. **Commit email:** kept as is in the public history.
+3. **Public repository:** polished for installing and using: no local-development paths, portable scripts, user-facing README, cleaned history. Push only after the user reviews it.
