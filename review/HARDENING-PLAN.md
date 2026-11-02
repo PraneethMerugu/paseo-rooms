@@ -212,6 +212,6 @@ After Spike A (`spikes/security/RESULTS.md`):
 
 ## Decisions, round 11 (user, 2026-11-02)
 
-1. **License:** MIT for the plugin. The vendored Noise code in `server/noise/` stays under Apache-2.0 with its LICENSE and NOTICE, as Apache-2.0 requires.
+1. **License:** Apache-2.0 for the whole plugin (the user first chose MIT, then reverted to Apache-2.0 the same day). This matches the vendored Noise code from Paseo, which keeps its own NOTICE.
 2. **Commit email:** kept as is in the public history.
 3. **Public repository:** polished for installing and using: no local-development paths, portable scripts, user-facing README, cleaned history. Push only after the user reviews it.
