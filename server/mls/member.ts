@@ -17,10 +17,12 @@
 //   joiner processes the log up to that entry, uses the roster the commit named as the reference roster,
 //   checks the authority extension and the tree against it, then the epoch anchors of later messages.
 //   ts-mls 1.6.4 exposes neither the GroupInfo signer nor the sender of an application message through
-//   its public API; the sender is derived from the secret tree (adapter.ts), and an epoch counts as
-//   confirmed once decryptable messages with the joiner's anchor came from min(2, other leaves) other
-//   leaves (5.1; decision round 9, item 4): with two or more other leaves at least one confirmer is not
-//   the GroupInfo signer; in a group of two the only other leaf confirms alone.
+//   its public API; the sender is derived from the secret tree (adapter.ts). The epoch counts as
+//   confirmed (5.1) when decryptable messages with the joiner's anchor came from enough leaves of the
+//   tree it joined: at least max(min(2, k), m + 1) of them, where k is the number of other leaves and
+//   m the number of devices the Welcome adds (at most m of them can be the committer and co-joiners), or
+//   from every other leaf when every device of the reference roster has a leaf. Anchors of later epochs
+//   the joiner reached by processing commits from its join epoch count too (its chain of epochs).
 // - Committing (4.2, 4.4, 6.3): a commit carries every pending removal (old-key leaves included) and the
 //   pending adds it has a valid KeyPackage for. Removals are committed at once (`pending_remove`). The
 //   admitting admin daemon adds a device it admitted at once (`promptAdd`, 4.4; decision round 9, item
@@ -86,8 +88,27 @@ export interface MlsLink {
 }
 
 type KpRecord = { ref: string; pool: "current" | "rekey"; lastResort: boolean; sig: string; pub: string; priv: { init: string; hpke: string; sig: string }; at: number };
-/** `needed`: confirming leaves required, min(2, other leaves) at the join (absent in older records: 2). */
-type JoinRecord = { seq: number; epoch: number; at: number; anchor: string; confirmers: string[]; needed?: number; status: "pending" | "confirmed" | "unconfirmed" | "fork" };
+/**
+ * Joiner epoch check (5.1). `needed`: min(2, other leaves) at the join (absent in older records: 2).
+ * `others`: the other leaves of the tree joined, as `deviceId/b64u(leaf signature key)`; only they
+ * confirm. `adds`: KeyPackageRefs in the Welcome (devices the commit adds, the joiner included).
+ * `missing`: active devices of the reference roster with no leaf in that tree. `chain`: anchors of the
+ * later epochs the joiner reached by processing (or making) commits from its join epoch. Records written
+ * before these fields existed keep the round-9 rule (`needed` confirmers).
+ */
+type JoinRecord = {
+  seq: number;
+  epoch: number;
+  at: number;
+  anchor: string;
+  confirmers: string[];
+  needed?: number;
+  others?: string[];
+  adds?: number;
+  missing?: number;
+  chain?: { epoch: number; anchor: string }[];
+  status: "pending" | "confirmed" | "unconfirmed" | "fork";
+};
 
 /** Sealed per device and group (8.1). Holds private keys: never logged. */
 export type MemberRecord = {
@@ -138,6 +159,23 @@ export type MlsTimings = {
   refreshMs: number;
   refreshMessages: number;
 };
+/** Later epochs of a joiner's chain kept for the joiner check (5.1). */
+const JOIN_CHAIN_MAX = 16;
+
+/**
+ * 5.1: whether the confirmers suffice. (a) max(min(2, k), m + 1) confirmers among the k other leaves:
+ * in a forked Welcome only the committer and the m - 1 co-joiners can confirm, so m + 1 include a device
+ * that was a leaf before the Add commit and is not its committer. (b) Every other leaf confirmed while
+ * every device of the reference roster has a leaf: then no device can be outside the joiner's epoch
+ * (the committer was alone with the joiners, or everyone answered).
+ */
+export function joinConfirmed(j: Pick<JoinRecord, "confirmers" | "needed" | "others" | "adds" | "missing">): boolean {
+  if (!j.others) return j.confirmers.length >= (j.needed ?? 2);
+  const k = j.others.length;
+  if (j.confirmers.length >= Math.max(Math.min(2, k), (j.adds ?? 1) + 1)) return true;
+  return j.missing === 0 && j.others.every((o) => j.confirmers.includes(o.slice(0, o.lastIndexOf("/"))));
+}
+
 export const MLS_TIMINGS: Readonly<MlsTimings> = { repairDelayMs: 60_000, repairJitterMs: 60_000, witnessMaxDelayMs: 30_000, epochConfirmMs: 5 * 60_000, retryMs: 60_000, refreshMs: 7 * 24 * 3600 * 1000, refreshMessages: 1000 };
 
 export interface MlsMemberOptions {
@@ -224,6 +262,12 @@ export class MlsMember {
   /** Eligible devices to try now: armed at admission and when the device publishes KeyPackages. */
   private readonly promptArmed = new Set<string>();
   private witnessAt: number | null = null;
+  /**
+   * Whether the due witness may be skipped (5.1): a joiner and a committer always send theirs; a device
+   * that processed an Add commit skips once it saw matching anchors from `adds + 2` other devices.
+   */
+  private witnessMust = false;
+  private witnessAdds = 0;
   /** Profile re-announcement (R3.3): after a commit with an Add, and after this device joined. */
   private announceAt: number | null = null;
   private anchorsSeen = new Map<number, Set<string>>();
@@ -625,9 +669,10 @@ export class MlsMember {
         return;
       }
       this.state = this.pendingOwn.newState;
+      this.extendChain();
       if (this.pendingOwn.refresh) this.rec.refresh = { at: this.now(), sent: 0 };
-      // The committer holds the new epoch too and witnesses it like every other device (5.1).
-      if (this.pendingOwn.adds > 0) this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
+      // The committer holds the new epoch too and witnesses it like every other device (5.1), always.
+      if (this.pendingOwn.adds > 0) this.scheduleWitness(true, this.pendingOwn.adds);
       if (this.pendingOwn.adds > 0) this.announceAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
       this.pendingOwn = null;
       this.rec.stalled = null;
@@ -713,7 +758,8 @@ export class MlsMember {
       return;
     }
     this.state = result.newState;
-    if (v.adds > 0) this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
+    this.extendChain();
+    if (v.adds > 0) this.scheduleWitness(false, v.adds);
     if (v.adds > 0) this.announceAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
   }
 
@@ -757,18 +803,26 @@ export class MlsMember {
     }
   }
 
-  /** Joiner epoch check (5.1) for one message of the group after the join. */
+  /**
+   * Joiner epoch check (5.1) for one message of the group after the join, in the join epoch or in a
+   * later epoch of the joiner's chain.
+   */
   private joinerCheck(seq: number, epoch: number, aad: MlsAad, decrypted: boolean, senderLeaf: number | null, leavesBefore?: Leaf[]): void {
     const j = this.rec.join;
-    if (!j || j.status === "fork" || epoch !== j.epoch || seq <= j.seq) return;
+    if (!j || j.status === "fork" || seq <= j.seq) return;
+    const mine = epoch === j.epoch ? j.anchor : j.chain?.find((c) => c.epoch === epoch)?.anchor;
+    if (mine === undefined) return;
     const leaves = leavesBefore ?? (this.state ? this.currentLeaves() : []);
     const sender = senderLeaf === null ? undefined : leaves.find((l) => l.leafIndex === senderLeaf);
-    if (aad.epochAuth === j.anchor) {
-      if (decrypted && sender && sender.deviceId !== this.o.deviceId && !j.confirmers.includes(sender.deviceId)) {
+    if (aad.epochAuth === mine) {
+      // Only a leaf of the tree joined, still holding the same leaf, confirms: a device added or re-added
+      // later shares a later epoch without having been in the join epoch.
+      const counts = sender && sender.deviceId !== this.o.deviceId && (!j.others || j.others.includes(`${sender.deviceId}/${b64u(sender.signaturePublicKey)}`));
+      if (decrypted && counts && !j.confirmers.includes(sender.deviceId)) {
         j.confirmers = [...j.confirmers, sender.deviceId];
-        if (j.confirmers.length >= (j.needed ?? 2) && (j.status === "pending" || j.status === "unconfirmed")) {
+        if (joinConfirmed(j) && (j.status === "pending" || j.status === "unconfirmed")) {
           j.status = "confirmed";
-          log("mls_epoch_confirmed", { roomId: this.o.roomId, epoch });
+          log("mls_epoch_confirmed", { roomId: this.o.roomId, epoch: j.epoch, at: epoch });
         }
       }
       return;
@@ -779,6 +833,21 @@ export class MlsMember {
     }
     j.status = "fork";
     this.raise("epoch_fork", seq, `joined at entry ${j.seq}; a message of epoch ${epoch} with another anchor does not decrypt`);
+  }
+
+  /** Records the anchor of a new epoch reached from the join epoch while the joiner is not confirmed (5.1). */
+  private extendChain(): void {
+    const j = this.rec.join;
+    if (!j || !j.others || (j.status !== "pending" && j.status !== "unconfirmed") || !this.state) return;
+    const epoch = this.o.adapter.epoch(this.state);
+    if (epoch === j.epoch || j.chain?.some((c) => c.epoch === epoch)) return;
+    j.chain = [...(j.chain ?? []), { epoch, anchor: this.anchor() }].slice(-JOIN_CHAIN_MAX);
+  }
+
+  private scheduleWitness(must: boolean, adds: number): void {
+    this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
+    this.witnessMust = this.witnessMust || must;
+    this.witnessAdds = Math.max(this.witnessAdds, adds);
   }
 
   private checkJoinTimeout(): void {
@@ -864,10 +933,13 @@ export class MlsMember {
       this.nextDevice = null;
     }
     const epoch = this.o.adapter.epoch(state);
-    // 5.1 (round 9, item 4): min(2, other leaves) confirmers. No other leaf cannot happen (the committer
+    // 5.1: the other leaves of this tree confirm; how many depends on the devices the Welcome adds and on
+    // roster devices absent from the tree (see joinConfirmed). No other leaf cannot happen (the committer
     // stays a leaf); it would leave nothing to compare with, so the epoch counts as confirmed.
-    const needed = Math.min(2, (leaves ?? []).filter((l) => l.deviceId !== this.o.deviceId).length);
-    this.rec.join = { seq: e.seq, epoch, at: this.now(), anchor: this.anchor(), confirmers: [], needed, status: needed === 0 ? "confirmed" : "pending" };
+    const others = (leaves ?? []).filter((l) => l.deviceId !== this.o.deviceId).map((l) => `${l.deviceId}/${b64u(l.signaturePublicKey)}`);
+    const needed = Math.min(2, others.length);
+    const missing = pendingChanges(ref, leaves ?? []).adds.length;
+    this.rec.join = { seq: e.seq, epoch, at: this.now(), anchor: this.anchor(), confirmers: [], needed, others, adds: Math.max(1, refs.length), missing, chain: [], status: needed === 0 ? "confirmed" : "pending" };
     this.rec.cursor = e.seq;
     this.save();
     await ack();
@@ -876,7 +948,7 @@ export class MlsMember {
     this.announceAt = this.now();
     // 5.1 (decision round 10, item 6): the joiner witnesses its new epoch too, so devices added by the
     // same commit can confirm each other. A witness is sent while the joiner is still unconfirmed.
-    if (needed > 0) this.witnessAt = this.now() + Math.floor(this.random() * this.t.witnessMaxDelayMs);
+    if (needed > 0) this.scheduleWitness(true, 0);
     if (kp.lastResort) this.retryAt = 0;
     return "joined";
   }
@@ -1023,12 +1095,17 @@ export class MlsMember {
   private async dueWitness(): Promise<void> {
     if (this.witnessAt === null || this.now() < this.witnessAt || !this.state || !this.latest) return;
     this.witnessAt = null;
+    const must = this.witnessMust;
+    const adds = this.witnessAdds;
+    this.witnessMust = false;
+    this.witnessAdds = 0;
     const epoch = this.o.adapter.epoch(this.state);
     // A witness carries no content beyond a signed log position, so an unconfirmed joiner may send it
-    // (5.1, decision round 10, item 6); every other reason not to send still holds. Anchors from three
-    // other devices make this witness unneeded: each joiner then has two confirmers besides itself.
+    // (5.1, decision round 10, item 6); every other reason not to send still holds. A joiner and the
+    // committer always send theirs. Another device skips once anchors from `adds + 2` other devices were
+    // seen: each joiner then has `adds + 1` confirmers besides itself, which rule (a) of 5.1 needs.
     const why = this.canSendReason();
-    if ((this.anchorsSeen.get(epoch)?.size ?? 0) >= 3 || (why !== null && why !== "unconfirmed")) return;
+    if ((!must && (this.anchorsSeen.get(epoch)?.size ?? 0) >= Math.max(1, adds) + 2) || (why !== null && why !== "unconfirmed")) return;
     const st = this.latest.state;
     const ref = referenceRosterOf(st, this.o.scope ?? null);
     const witness = { v: 2, typ: "log-witness", roomId: this.o.roomId, deviceId: this.o.deviceId, head: this.latest.head, roster: { seq: ref.seq, hash: ref.hash } };
