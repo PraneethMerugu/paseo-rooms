@@ -998,8 +998,8 @@ test("MLS 13 (round 10, item 6): an unconfirmed joiner sends its witness but no 
 async function coJoinerFork(omit: boolean) {
   const h = await three({ ...FAST });
   const [C, A, B] = ["C", "A", "B"].map((n) => h.dev(n));
-  // J and K do not commit within the test: with `omit`, C and B look like pending adds to them.
-  Object.assign(h.timings, { repairDelayMs: 3_600_000 });
+  // The normal (FAST) repair delay: with `omit`, C and B look like pending adds to J and K, which must
+  // not commit them while their epoch is unconfirmed (5.1, Q8).
   const J = h.admit("J");
   const K = h.admit("K");
   await J.member.maintain();
@@ -1012,7 +1012,7 @@ async function coJoinerFork(omit: boolean) {
   const otherAad = encodeAad({ ...parseAad(aad), logHead: { seq: 0, hash: b64u(randomBytes(32)) } });
   const other = await h.adapter.commit(st, { adds: kps, ...(omit ? { removes: [leafOf(h, st, C), leafOf(h, st, B)] } : {}) }, otherAad);
   for (const d of [C, A, B]) d.frozen = true;
-  await submitRaw(h, A, st, real.commit, other.welcome);
+  const forkSeq = Number((await submitRaw(h, A, st, real.commit, other.welcome)).seq);
   for (let i = 0; i < 3; i++) {
     await deliver(h);
     for (const d of [J, K]) await d.member.maintain();
@@ -1022,12 +1022,15 @@ async function coJoinerFork(omit: boolean) {
   const m = await h.adapter.encrypt(fork, rjcs({ kind: "fork-chatter" }), aadFor(h, fork));
   await h.endpoint.localRequest(dhOf(h, A), { t: "msg.send", epoch: h.adapter.epoch(fork), message: b64u(m.message) });
   await deliver(h);
-  return { h, C, A, B, J, K };
+  return { h, C, A, B, J, K, forkSeq };
 }
+
+/** Commits sequenced after entry `seq`. */
+const commitsAfter = (h: Harness, seq: number) => h.room.host.entries(seq + 1).filter((r) => r.signed.entry.type === "mls.commit");
 
 test("MLS 13 (5.1, co-joiner fork): co-joiners of a forked Welcome confirm each other and the committer, but stay unconfirmed while an outside leaf exists", async () => {
   for (const omit of [false, true]) {
-    const { h, C, A, J, K } = await coJoinerFork(omit);
+    const { h, C, A, J, K, forkSeq } = await coJoinerFork(omit);
     try {
       for (const [d, other] of [[J, K], [K, J]] as const) {
         const j = d.store.record!.join!;
@@ -1041,14 +1044,20 @@ test("MLS 13 (5.1, co-joiner fork): co-joiners of a forked Welcome confirm each 
       }
       // Flagged after the timeout, and the first message of an outside leaf exposes the fork.
       h.advance(5 * 60_000);
-      await J.member.maintain();
+      for (const d of [J, K]) await d.member.maintain();
       assert.equal(alertsOf(J, "epoch_unconfirmed").length, 1);
+      // Q8: the repair delay has long passed, yet neither joiner committed (no Add of C or B in the fork).
+      assert.equal(commitsAfter(h, forkSeq).length, 0, `omit=${omit}: an unconfirmed joiner commits no Add`);
       C.frozen = false;
       h.syncAll();
       await C.member.idle();
       await C.member.sendText("outside the fork");
       await deliver(h);
       assert.equal(alertsOf(J, "epoch_fork").length, 1, JSON.stringify(J.member.alerts));
+      // C stayed in the real epoch: it never joined the fork by a Welcome.
+      assert.equal(C.store.record!.join, null, "C did not fall back to a Welcome");
+      assert.equal(C.member.inGroup, true);
+      assert.deepEqual(alertsOf(C, "epoch_fork"), []);
     } finally {
       h.cleanup();
     }
@@ -1077,6 +1086,44 @@ test("MLS 13 (5.1, chain): a removal right after a join moves the epoch before t
     h.advance(10 * 60_000);
     await h.settle();
     assert.deepEqual(J.member.alerts, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("MLS 13 (5.1, Q8): an unconfirmed joiner commits a pending removal at once but no Add; once confirmed, adds proceed", async () => {
+  // No witness within the test until the clock moves: J stays unconfirmed.
+  const h = await three({ ...FAST, witnessMaxDelayMs: 60_000 }, () => 0.5);
+  try {
+    const [C, A, B] = ["C", "A", "B"].map((n) => h.dev(n));
+    const J = h.admit("J");
+    await h.settle();
+    assert.equal(J.member.inGroup, true, JSON.stringify(J.member.alerts));
+    assert.equal(J.store.record!.join!.status, "pending");
+    // Only J acts: B is removed and D is a pending add with published KeyPackages.
+    for (const d of [C, A, B]) d.frozen = true;
+    const D = h.admit("D");
+    await D.member.maintain();
+    const removedAt = h.admin("member.removed", { memberId: B.memberId, reason: "admin" });
+    await deliver(h);
+    await J.member.maintain();
+    await deliver(h);
+    const commits = commitsAfter(h, removedAt);
+    assert.equal(commits.length, 1, "J committed the removal");
+    const leaves = parseLeaves(h.adapter.leaves(rawState(h, J)))!;
+    assert.ok(!leaves.some((l) => l.deviceId === B.deviceId), "B removed");
+    assert.ok(!leaves.some((l) => l.deviceId === D.deviceId), "D not added by an unconfirmed joiner");
+    assert.equal(D.member.inGroup, false);
+    assert.equal(J.store.record!.join!.status, "pending");
+    // Normal operation resumes: the others process J's commit, witnesses confirm J, and D is added.
+    for (const d of [C, A]) d.frozen = false;
+    h.advance(60_000);
+    await h.settle();
+    h.advance(60_000);
+    await h.settle();
+    assert.equal(J.store.record!.join!.status, "confirmed", JSON.stringify(J.store.record!.join));
+    assert.equal(D.member.inGroup, true, JSON.stringify(D.member.alerts));
+    assert.deepEqual(alertsOf(J, "epoch_fork"), []);
   } finally {
     h.cleanup();
   }

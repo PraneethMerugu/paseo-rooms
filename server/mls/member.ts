@@ -28,7 +28,8 @@
 //   admitting admin daemon adds a device it admitted at once (`promptAdd`, 4.4; decision round 9, item
 //   5): when the admission is logged and again whenever that device publishes KeyPackages. Any other
 //   pending add waits for the repair delay (60 s, plus up to 60 s at random for devices that are not
-//   admins), which is only the fallback. Every
+//   admins), which is only the fallback. A device whose epoch is not confirmed (5.1, Q8) commits no
+//   Add and sends no Welcome, but still commits pending removals. Every
 //   fetched KeyPackage is checked against the reference roster before use (6.4). The device runs the
 //   4.2 checks on its own result before it submits.
 // - Admin route (4.4): `approveRekey` fetches the device's `rekey` package, signs `device.rekey.approved`
@@ -512,6 +513,8 @@ export class MlsMember {
     await this.idle();
     return this.locked(async () => {
       if (!this.state || !this.latest) throw new MlsMemberError("no_group", "not a leaf of the room group");
+      // 5.1 (Q8): the Remove plus Add adds a leaf, so it waits until this device's epoch is confirmed.
+      if (!this.epochConfirmed()) throw new MlsMemberError("unconfirmed", "this device's epoch is not confirmed yet; it commits no Add");
       const st = this.latest.state;
       const p = st.pending[ref];
       if (!p || p.kind !== "rekey" || p.status !== "pending") throw new MlsMemberError("refused", "no pending rekey with that ref");
@@ -835,6 +838,16 @@ export class MlsMember {
     this.raise("epoch_fork", seq, `joined at entry ${j.seq}; a message of epoch ${epoch} with another anchor does not decrypt`);
   }
 
+  /**
+   * 5.1 (Q8): whether this device's epoch is confirmed. A device that never joined by Welcome (the group's
+   * creator) is; a joiner is from the moment its join record is confirmed. Until then it commits no Add,
+   * no leaf replacement and no rekey pair, and sends no Welcome; pure removals are allowed.
+   */
+  private epochConfirmed(): boolean {
+    const j = this.rec.join;
+    return !j || j.status === "confirmed";
+  }
+
   /** Records the anchor of a new epoch reached from the join epoch while the joiner is not confirmed (5.1). */
   private extendChain(): void {
     const j = this.rec.join;
@@ -973,9 +986,12 @@ export class MlsMember {
     // Prompt adds (round 9, item 5): an armed device this daemon admitted is tried now, once per arming.
     const pendingIds = new Set(pend.adds.map((a) => a.deviceId));
     for (const id of [...this.promptEligible]) if (!pendingIds.has(id)) (this.promptEligible.delete(id), this.promptArmed.delete(id));
-    const prompt = new Set(removalsOnly ? [] : pend.adds.filter((a) => this.promptArmed.has(a.deviceId)).map((a) => a.deviceId));
+    // 5.1 (Q8): while this device's own epoch is not confirmed it commits no Add and sends no Welcome;
+    // pending removals still go out at once. Armed prompt adds stay armed until it is confirmed.
+    const noAdds = removalsOnly || !this.epochConfirmed();
+    const prompt = new Set(noAdds ? [] : pend.adds.filter((a) => this.promptArmed.has(a.deviceId)).map((a) => a.deviceId));
     for (const id of prompt) this.promptArmed.delete(id);
-    const dueAdds = removalsOnly ? [] : pend.adds.filter((a) => prompt.has(a.deviceId) || ((this.addSeen.get(`${a.deviceId}/${a.deviceSig}`) ?? Infinity) <= now && now >= this.retryAt));
+    const dueAdds = noAdds ? [] : pend.adds.filter((a) => prompt.has(a.deviceId) || ((this.addSeen.get(`${a.deviceId}/${a.deviceSig}`) ?? Infinity) <= now && now >= this.retryAt));
     if (pend.removals.length === 0 && dueAdds.length === 0) return;
     const link = this.o.link();
     if (!link) return;
@@ -990,6 +1006,7 @@ export class MlsMember {
     if (repairMissed) this.retryAt = now + this.t.retryMs;
     if (pend.removals.length === 0 && adds.length === 0) return;
     const built = await this.buildCommit(ref, this.latest.head, adds, pend.removals.map((l) => l.leafIndex));
+    if (built.welcome && !this.epochConfirmed()) return; // unreachable (no adds); never send a Welcome unconfirmed
     this.pendingOwn = { bodyHash: bodyHash(built.commit), newState: built.newState, adds: adds.length };
     try {
       const reply = await link.request({ t: "commit.submit", epoch: this.o.adapter.epoch(this.state), commit: b64u(built.commit), ...(built.welcome ? { welcome: b64u(built.welcome) } : {}) });
