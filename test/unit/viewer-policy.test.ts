@@ -1,4 +1,4 @@
-// HARDENING-PLAN decisions round 2: viewer errors and project display names.
+// hardening plan decisions round 2: viewer errors and project display names.
 //  - Viewers get generic error text; the full text goes to the owner-only LaneErrorLog, read through
 //    the local RPC rooms.v2.lane.errors and never through the lane endpoint.
 //  - Project names are hidden from viewers by default (neutral label, hashed folder names); with the

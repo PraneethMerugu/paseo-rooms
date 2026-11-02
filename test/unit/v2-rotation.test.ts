@@ -1,6 +1,6 @@
 // Rotation and recovery operations (implementation plan I-12; keys-rotation-recovery.md sections 4
 // and 6; mls-integration.md 4.4). Vectors are read directly from
-// docs/specs/identity-v2/vectors/vectors.json (statements.deviceRekeyed, adminKeyRotated,
+// docs/design/specs/identity-v2/vectors/vectors.json (statements.deviceRekeyed, adminKeyRotated,
 // hostKeyRotated, deviceRekey.chain). The operations run on a real room host with the MLS delivery
 // service (test/unit/mls-harness.ts): no relay, no network, no real keyring.
 import assert from "node:assert/strict";
@@ -32,7 +32,7 @@ import { rjcs } from "../../server/proto/rjcs";
 import { sign } from "../../server/proto/tbs";
 import { FAST, Harness, type Dev } from "./mls-harness";
 
-const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
+const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
 const KEYS = V.keys as Record<string, { seedHex?: string; pub: string; kid: string }>;
 const keyOf = (name: string) => ed25519PrivateKeyFromSeed(Buffer.from(KEYS[name].seedHex!, "hex"));
 const HOUR = 3600_000;

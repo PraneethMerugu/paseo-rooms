@@ -58,7 +58,7 @@ import {
   type AdminActionV2,
 } from "./shared/rpc-v2";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0"; // keep in step with package.json and paseo-plugin.json
 
 /**
  * Rooms (identity v2). Since the cut-over (I-15) this is the only runtime; M1 data found at start is

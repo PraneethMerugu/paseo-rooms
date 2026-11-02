@@ -15,7 +15,7 @@ import { fileKey, open, parseSealedBytes, readSealedFile, seal, sealedAad, seale
 import { KeyStoreError, type KeyStoreBackend, type NativeBackendName } from "../../server/keystore/types";
 import { tempDir } from "./helpers";
 
-const vectors = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
+const vectors = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
 const V = vectors.sealed;
 const unhex = (h: string) => Buffer.from(h, "hex");
 
@@ -491,8 +491,15 @@ test("napi backend over a fake binding: Secret Service pin, service and account,
   mode = "short";
   await assert.rejects(b.get(50), (e: unknown) => (e as KeyStoreError).code === "kek_invalid");
   mode = "hang";
+  // The backend's timer is unref'd (it must not keep a daemon alive). Here nothing else holds the
+  // event loop open, and Node 20 would end the test before the timer fires, so hold it explicitly.
+  const keepAlive = setInterval(() => {}, 1000);
   const t0 = Date.now();
-  await assert.rejects(b.get(30), (e: unknown) => (e as KeyStoreError).code === "timeout");
+  try {
+    await assert.rejects(b.get(30), (e: unknown) => (e as KeyStoreError).code === "timeout");
+  } finally {
+    clearInterval(keepAlive);
+  }
   assert.ok(Date.now() - t0 < 1000);
   mode = "ok";
   assert.equal(await b.delete(50), true);

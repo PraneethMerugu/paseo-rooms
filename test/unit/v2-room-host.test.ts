@@ -227,7 +227,7 @@ test("recovery key: skippable in one choice with the warning; required when org 
 // ---------------------------------------------------------------------------------- signer
 
 test("recovery code (identity-model 5.4.1): vectors encode, decode, and each failure has its own error", () => {
-  const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
+  const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
   const rc = V.recoveryCode;
   const seed = Buffer.from(rc.seedHex, "hex");
   assert.equal(seed.toString("hex"), V.keys.recovery.seedHex);

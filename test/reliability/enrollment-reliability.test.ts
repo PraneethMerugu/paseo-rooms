@@ -1,5 +1,5 @@
 // Module 2: enrollment reliability on identity v2 (enrollment-v2 SAS flow; the M1 intermittent
-// enrollment failure, M1-RESULTS open issue 8, was in the lane host step that follows admission).
+// enrollment failure, m1-results.md open issue 8, was in the lane host step that follows admission).
 //
 // N = 10 (RL_ENROLL_CYCLES overrides, capped at 20) sequential cycles. A member daemon can join a
 // given room only once and v2 has no leave RPC yet, so every cycle uses a fresh room with one

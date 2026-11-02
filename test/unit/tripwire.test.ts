@@ -15,8 +15,8 @@ function storeRecord(home: string, agentId: string, cwd: string, config: unknown
 }
 
 test("storage slug matches @getpaseo/server 0.13.2 projectDirNameFromCwd", () => {
-  // Observed in the M1 e2e logs: agents/test-e2e-scratch-lane-work/<id>.json
-  assert.equal(projectDirNameFromCwd("test/e2e/scratch/lane-work"), "test-e2e-scratch-lane-work");
+  // Same shape as observed in the M1 e2e logs: agents/<slug of the cwd>/<id>.json
+  assert.equal(projectDirNameFromCwd("/home/alice/Projects/paseo-rooms/test/e2e/scratch/lane-work"), "home-alice-Projects-paseo-rooms-test-e2e-scratch-lane-work");
   assert.equal(projectDirNameFromCwd("/"), "root");
   assert.equal(projectDirNameFromCwd("/a/b/"), "a-b");
 });

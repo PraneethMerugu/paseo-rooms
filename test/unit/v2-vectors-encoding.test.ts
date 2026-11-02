@@ -1,5 +1,5 @@
 // Identity v2 milestone I-1: RJCS, strict base64url, TBS and contexts, key ids, fingerprints and
-// Ed25519 checks against docs/specs/identity-v2/vectors/vectors.json, read directly so the tests
+// Ed25519 checks against docs/design/specs/identity-v2/vectors/vectors.json, read directly so the tests
 // and the spec cannot drift. Seeds in the vectors are test-only (derived from public labels);
 // assertion messages name keys, never print them.
 import assert from "node:assert/strict";
@@ -56,7 +56,7 @@ import {
 import { rjcs, rjcsParse, rjcsText, RJCS_MAX_BYTES, RJCS_MAX_DEPTH } from "../../server/proto/rjcs";
 import { H, hkdf, hmac, sign, tbs, utf8 } from "../../server/proto/tbs";
 
-const VECTORS_PATH = join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json");
+const VECTORS_PATH = join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json");
 const V = JSON.parse(readFileSync(VECTORS_PATH, "utf8"));
 
 const hex = (h: string) => Buffer.from(h, "hex");

@@ -29,8 +29,7 @@ done
 
 UI_DIR=$(cd "$(dirname "$0")" && pwd)
 PLUGIN_DIR=$(dirname "$UI_DIR")
-P=/opt/Paseo/resources/bin/paseo
-NODE=(env ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin)
+source "$PLUGIN_DIR/tools/paseo-env.sh"   # sets P (paseo CLI) and NODE; override with PASEO_BIN / PASEO_NODE
 TSX=("${NODE[@]}" "$PLUGIN_DIR/node_modules/tsx/dist/cli.mjs")
 HOMES=$UI_DIR/.test-homes
 OWNER=$HOMES/v2-owner

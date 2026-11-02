@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One-time seed of profile/classification.csv from spikes/phase0/message-classification.csv.
+"""One-time seed of profile/classification.csv from the Phase 0 message classification (design
+research, not published): python3 tools/seed-classification.py <phase0.csv> [out.csv].
 
 Run once on 2026-10-28; kept for provenance. Edit profile/classification.csv by hand afterwards
 and regenerate server/room-profile/generated.ts with `npm run gen:profile`.
@@ -9,7 +10,9 @@ exact scope binding for it. Everything flagged as unclear in Phase 0 is denied (
 """
 import csv, sys
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "../spikes/phase0/message-classification.csv"
+if len(sys.argv) < 2:
+    sys.exit("usage: seed-classification.py <phase0 message-classification.csv> [out.csv]")
+SRC = sys.argv[1]
 DST = sys.argv[2] if len(sys.argv) > 2 else "profile/classification.csv"
 
 M1 = {

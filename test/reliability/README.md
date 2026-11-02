@@ -1,6 +1,6 @@
 # Reliability and environment-inspection tests
 
-These are routine tests for the `rooms` plugin, run against two disposable test daemons. They cover the "restarts", "flaky-enrollment loop" and "real environment of the room agent's process" items from `review/HARDENING-PLAN.md` section E, as approved in "Decisions, round 2". Since the identity v2 cut-over the room agent is the shared live agent (no fork lanes).
+These are routine tests for the `rooms` plugin, run against two disposable test daemons. They cover the "restarts", "flaky-enrollment loop" and "real environment of the room agent's process" items from `docs/security/hardening-plan.md` section E, as approved in "Decisions, round 2". Since the identity v2 cut-over the room agent is the shared live agent (no fork lanes).
 
 Modules 4 and 5 are the defensive security modules of section E, drafted under decisions round 2 option 3 and round 10 item 5: protocol-level negative tests for credentials (module 4) and bounded load against the documented limits (module 5). They target only the owner test daemon's own endpoints, over a loopback relay. Fuzzing and concurrency races remain **out of scope**.
 
@@ -9,7 +9,7 @@ Modules 4 and 5 are the defensive security modules of section E, drafted under d
 ## How to run
 
 ```bash
-cd plugin
+cd paseo-rooms   # the repository root
 bash test/reliability/run.sh --i-reviewed-this
 bash test/reliability/run.sh --i-reviewed-this --only enrollment-reliability
 bash test/reliability/run.sh --i-reviewed-this --only credential-negative
@@ -56,7 +56,7 @@ The file is one scenario run as ordered steps. A failed step can make later step
 
 ### 2. `enrollment-reliability.test.ts`
 
-**Finding:** the M1 intermittent enrollment failure (`M1-RESULTS.md`, open issue 8). In that failure, a join failed with an empty error message about 0.7 s after a lane host was removed.
+**Finding:** the M1 intermittent enrollment failure (`docs/design/m1-results.md`, open issue 8). In that failure, a join failed with an empty error message about 0.7 s after a lane host was removed.
 
 **Setup:** N = 10 sequential cycles (`RL_ENROLL_CYCLES`, up to 20). A daemon can join a given room only once and v2 has no leave RPC yet, so each cycle uses a fresh room with one share-live lane on the parent:
 
@@ -103,7 +103,7 @@ The main daemon (6767) is never contacted.
 
 ### 4. `credential-negative.test.ts`
 
-**Findings:** HARDENING-PLAN section E ("grant replay and forgery", "invite reuse"), P-15/C-7 (invite burn), P-23/C-8 (signature before lookup), grants-v2 sections 4 and 6, enrollment-v2 5.3 to 5.6.
+**Findings:** hardening plan section E ("grant replay and forgery", "invite reuse"), P-15/C-7 (invite burn), P-23/C-8 (signature before lookup), grants-v2 sections 4 and 6, enrollment-v2 5.3 to 5.6.
 
 **How:** the module acts as member devices inside the test process (`proto-client.ts`): the plugin's own `RoomClient` (Noise IK room sessions), the enrollment and device-link formats, and Paseo's client secure channel for lane links (Noise NK). This lets it send frames that a correct member daemon never sends. The member test daemon is not used.
 

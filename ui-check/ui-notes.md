@@ -4,7 +4,7 @@ Status: **static code review only**. Nothing below was seen in the real app; the
 
 ## Mobile/RN audit (paseo-plugin skill)
 
-Command, from `plugin/`:
+Command, from the repository root:
 
 ```bash
 rg -n "document\.|window\.|localStorage|navigator\.|<[a-z]+[ >]|className=|onClick=" client/
@@ -12,7 +12,7 @@ rg -n "document\.|window\.|localStorage|navigator\.|<[a-z]+[ >]|className=|onCli
 
 One hit, a false positive: `client/ui.tsx:38` `ReturnType<typeof useStyles>` (a TypeScript generic matches `<[a-z]+[ >]`). No DOM globals, HTML elements, `className` or `onClick`. No hard-coded hex or rgb colors in `client/` or `index.client.tsx`. Every `Text` has a style from `theme.colors`; all four `TextInput`s set `placeholderTextColor` from the theme.
 
-## Known rough edges (from M1-RESULTS.md and research/rooms-feasibility.md 2.5)
+## Known rough edges (from docs/design/m1-results.md and the feasibility study (design research, not published) 2.5)
 
 1. Disallowed actions stay visible on the routed lane host. The app ignores `server_info.permissions`, so the composer, archive, terminals and new-agent controls appear and fail with "Room is not authorized for …" when used. Check how each failure is shown (toast, inline, silent).
 2. Stale routed host entries after leave or revoke (Paseo does not prune routed hosts). The joined card says so for `revoked`, but not for `left`.

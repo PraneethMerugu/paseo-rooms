@@ -31,7 +31,7 @@ import { tempDir } from "./helpers";
 
 const NO_TIMER = { setInterval: () => null, clearInterval: () => {} };
 const FAST = { handshakeTimeoutMs: 400 };
-const V = JSON.parse(readFileSync(join(__dirname, "../../docs/specs/identity-v2/vectors/vectors.json"), "utf8"));
+const V = JSON.parse(readFileSync(join(__dirname, "../../docs/design/specs/identity-v2/vectors/vectors.json"), "utf8"));
 
 const realStart = LaneConnection.prototype.start;
 before(() => {

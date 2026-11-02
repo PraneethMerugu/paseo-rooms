@@ -33,7 +33,7 @@ import { startFakeRelay, until, type FakeRelay } from "./fake-relay";
 import { tempDir } from "./helpers";
 
 // Read directly, as v2-vectors-encoding.test.ts does.
-const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8")) as any;
+const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8")) as any;
 const NO_TIMER = { setInterval: () => null, clearInterval: () => {} };
 const FAST = { handshakeTimeoutMs: 400 };
 const hex = (h: string) => Buffer.from(h, "hex");

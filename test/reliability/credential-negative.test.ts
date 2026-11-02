@@ -1,4 +1,4 @@
-// Module 4: credential-negative tests (HARDENING-PLAN section E "grant replay and forgery" and "invite
+// Module 4: credential-negative tests (hardening plan section E "grant replay and forgery" and "invite
 // reuse"; decisions round 2 option 3 and round 10 item 5). Protocol-level refusals of the OWNER test
 // daemon's own room endpoint and lane endpoints.
 //

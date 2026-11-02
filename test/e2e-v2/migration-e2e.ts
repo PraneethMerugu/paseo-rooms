@@ -1,4 +1,4 @@
-// Migration test 3 (docs/specs/identity-v2/migration.md section 6; plan I-15): an M1 room and
+// Migration test 3 (docs/design/specs/identity-v2/migration.md section 6; plan I-15): an M1 room and
 // membership created with the M1 plugin (tag m1-baseline), then both daemons upgrade to this plugin.
 // Checks: the M1 data is archived on both daemons and recorded once, the v1 lane endpoint never comes
 // back on the relay, the member's v1 host registration is removed, the M1 agent is listed under

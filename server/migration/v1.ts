@@ -1,4 +1,4 @@
-// Migration from M1 (identity v1) to identity v2 on first start (docs/specs/identity-v2/migration.md
+// Migration from M1 (identity v1) to identity v2 on first start (docs/design/specs/identity-v2/migration.md
 // section 2; implementation plan I-15). M1 rooms are invalidated, not migrated:
 //
 //   2.1 detect: `gateway/state.json` with v 1, `gateway/host-key.json`, `member/device.json` or

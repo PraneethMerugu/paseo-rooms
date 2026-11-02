@@ -1,4 +1,4 @@
-// Module 5: resource-stress tests (HARDENING-PLAN section B3 and E; decisions round 2 option 3 and
+// Module 5: resource-stress tests (hardening plan section B3 and E; decisions round 2 option 3 and
 // round 10 item 5). Bounded load against the OWNER test daemon's own endpoints, to confirm that the
 // documented limits hold, that going over a limit is refused gracefully (only the offending connection,
 // route or request is refused or closed; the daemon keeps serving), and that service recovers.

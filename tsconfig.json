@@ -14,5 +14,5 @@
     "allowImportingTsExtensions": false
   },
   "include": ["**/*.ts", "**/*.tsx"],
-  "exclude": ["node_modules", ".test-homes", "review"]
+  "exclude": ["node_modules", "**/.test-homes", "**/.homes"]
 }

@@ -1,5 +1,5 @@
 // Identity v2 milestone I-4: records and frames (enrollment-v2.md sections 3.4 and 3.6) against
-// the `records` vectors in docs/specs/identity-v2/vectors/vectors.json, plus the fatal-error rules.
+// the `records` vectors in docs/design/specs/identity-v2/vectors/vectors.json, plus the fatal-error rules.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,7 +18,7 @@ import {
   type Frame,
 } from "../../server/transport/records";
 
-const vectors = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
+const vectors = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
 const hex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");
 const fromHex = (text: string): Uint8Array => new Uint8Array(Buffer.from(text, "hex"));
 const ascii = (text: string): Uint8Array => new TextEncoder().encode(text);

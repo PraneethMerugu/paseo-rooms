@@ -1,4 +1,4 @@
-// Migration from M1 (docs/specs/identity-v2/migration.md section 6, tests 1 and 2; plan I-15).
+// Migration from M1 (docs/design/specs/identity-v2/migration.md section 6, tests 1 and 2; plan I-15).
 //
 // 1. A fixture v1 tree (test/unit/fixtures.ts writeV1Tree): the migration archives `gateway/` and the
 //    v1 part of `member/` by rename, records it in migration.json, and a second run does nothing.

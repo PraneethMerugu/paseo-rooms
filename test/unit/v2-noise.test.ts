@@ -2,7 +2,7 @@
 // and 3.3; signatures-and-encoding.md section 9.3).
 //   - cacophony NK and IK vectors, six of six messages each (fixture copied from the pinned
 //     rweather/noise-c cacophony.txt; provenance inside the fixture);
-//   - noise.enrollment and noise.ikCacophonyKeys from docs/specs/identity-v2/vectors/vectors.json;
+//   - noise.enrollment and noise.ikCacophonyKeys from docs/design/specs/identity-v2/vectors/vectors.json;
 //   - Paseo's noise.test.ts negatives, ported; IK and prologue negatives.
 // Key material in the vectors is public test data; assertion messages never print keys.
 import assert from "node:assert/strict";
@@ -43,7 +43,7 @@ const caco = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", "caco
   source: { commit: string; fileSha256: string };
   vectors: CacoVector[];
 };
-const vectors = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
+const vectors = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
 
 const EMPTY = new Uint8Array(0);
 const hex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");

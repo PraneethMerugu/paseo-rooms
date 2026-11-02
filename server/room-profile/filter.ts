@@ -6,7 +6,7 @@
 // Field level: every forwarded message is rebuilt from the reviewed field table (sanitize.ts and
 // profile/fields.csv), inbound and outbound.
 //
-// Isolation guard (HARDENING-PLAN decision 2): lanes run as the owner's OS user (fork lanes are
+// Isolation guard (hardening plan decision 2): lanes run as the owner's OS user (fork lanes are
 // ordinary agents of the owner's daemon, share lanes ARE the owner's agent). Such a lane must never
 // receive member input that prompts or drives the agent. PROMPTING_INBOUND (future role steer or
 // approve in the classification) is denied before the table is consulted, and

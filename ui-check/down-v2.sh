@@ -4,7 +4,8 @@
 # main daemon (6767).
 set -uo pipefail
 UI_DIR=$(cd "$(dirname "$0")" && pwd)
-P=/opt/Paseo/resources/bin/paseo
+PLUGIN_DIR=$(dirname "$UI_DIR")
+source "$PLUGIN_DIR/tools/paseo-env.sh"   # sets P (paseo CLI) and NODE; override with PASEO_BIN / PASEO_NODE
 HOMES=$UI_DIR/.test-homes
 OWNER=$HOMES/v2-owner
 MEMBER=$HOMES/v2-member

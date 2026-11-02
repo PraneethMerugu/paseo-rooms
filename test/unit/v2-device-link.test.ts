@@ -1,5 +1,5 @@
 // Identity v2 milestone I-11: device linking and holds (identity-model.md 6.3, 6.4; enrollment-v2.md
-// 5.2, 5.4, 6.2; room-log-v2.md 4.2, 4.3, 5; HARDENING-PLAN decisions round 4, R-2, S-13).
+// 5.2, 5.4, 6.2; room-log-v2.md 4.2, 4.3, 5; hardening plan decisions round 4, R-2, S-13).
 //
 // - The `deviceLink` vectors, read from vectors.json, reproduced by the production code.
 // - The confirming device's own limits (R-2), with a scripted host: the host cannot choose Nc; a
@@ -30,7 +30,7 @@ import type { Frame } from "../../server/transport/records";
 import { startFakeRelay, until } from "./fake-relay";
 import { tempDir } from "./helpers";
 
-const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8")) as any;
+const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8")) as any;
 const D = V.deviceLink;
 const hex = (h: string) => Buffer.from(h, "hex");
 const seedKey = (name: string) => ed25519PrivateKeyFromSeed(hex(V.keys[name].seedHex));

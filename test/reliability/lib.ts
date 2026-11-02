@@ -18,7 +18,8 @@ import { createHostChannelTransport } from "@getpaseo/client/internal/hosts";
 import { RoomLogFold } from "../../server/authority/fold";
 
 export const PLUGIN = "rooms";
-export const PASEO_CLI = "/opt/Paseo/resources/bin/paseo";
+/** The paseo CLI; run.sh resolves it (tools/paseo-env.sh) and exports PASEO_BIN. */
+export const PASEO_CLI = process.env.PASEO_BIN || "paseo";
 export const PORT_MIN = 6930;
 export const PORT_MAX = 6939;
 export const RELIABILITY_DIR = dirname(fileURLToPath(import.meta.url));

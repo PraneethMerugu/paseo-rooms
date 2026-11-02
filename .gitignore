@@ -1,5 +1,21 @@
+# Dependencies
 node_modules/
+
+# Disposable test and ui-check daemon homes (owner-only; they hold test keys)
 .test-homes/
-test/e2e/logs/*.log
-test/e2e/scratch/
-test/e2e-v2/logs/
+**/.test-homes/
+**/.homes/
+**/.homes-v2/
+
+# Logs and raw test evidence
+*.log
+logs/
+**/logs/
+test/m1-evidence/
+*.secret
+scratch/
+
+# Packaging and local environment
+*.tgz
+.env
+.env.*

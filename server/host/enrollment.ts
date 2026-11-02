@@ -1,5 +1,5 @@
 // Enrollment on the room host (enrollment-v2.md sections 2.1, 5, 6, 7.1, 7.2, 9, 10; room-log-v2.md
-// 4.2; implementation plan I-9; HARDENING-PLAN D: P-15/C-7, P-23/C-8, P-27).
+// 4.2; implementation plan I-9; hardening plan D: P-15/C-7, P-23/C-8, P-27).
 //
 // - Check order of 5.3 for `enroll.request`: strict frame, version, pre-auth budget, then the
 //   device signature over EnrollSigned with THIS session's handshake hash `h` and the room's

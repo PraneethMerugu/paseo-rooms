@@ -21,7 +21,7 @@ Since the identity v2 cut-over (I-15, 2026-11-01) this is the only kit. The M1 k
 | fake relay | `127.0.0.1:6915` | only with `--offline` |
 
 ```bash
-cd plugin/ui-check
+cd paseo-rooms/ui-check
 ./up-v2.sh             # live relay relay.paseo.sh:443 for the room endpoint (about 45 s)
 ./up-v2.sh --offline   # fake relay on 127.0.0.1:6915, no network
 ./down-v2.sh           # archive the agent, stop everything, delete .test-homes
@@ -69,7 +69,7 @@ Actions that change the demo, worth trying last: **Not me** on v2-member (veto; 
 
 Nothing here was seen in a real app. The code passed `npm run typecheck:client` (no Node or DOM types) and the RPC contract tests only.
 
-Do each item on a wide window and a narrow window (compact layout), in a light and a dark theme (**Settings → Appearance**). With the v2 kit running, the join request card, member join, device link hold, "Was this you?", owner tabs, admin dialogs, Create room and About are ready to look at. "Fix permissions", `stale_base`, "Agents from closed rooms" and the alert boxes need the extra steps given in their items (for "Fix permissions", stop one daemon with `PASEO_HOME=<home> /opt/Paseo/resources/bin/paseo daemon stop --home <home>`, with `<home>` under `ui-check/.test-homes`, and start it the same way).
+Do each item on a wide window and a narrow window (compact layout), in a light and a dark theme (**Settings → Appearance**). With the v2 kit running, the join request card, member join, device link hold, "Was this you?", owner tabs, admin dialogs, Create room and About are ready to look at. "Fix permissions", `stale_base`, "Agents from closed rooms" and the alert boxes need the extra steps given in their items (for "Fix permissions", stop one daemon with `PASEO_HOME=<home> "$PASEO_BIN" daemon stop --home <home>` (`PASEO_BIN` is the paseo CLI, see `tools/paseo-env.sh`), with `<home>` under `ui-check/.test-homes`, and start it the same way).
 
 - [ ] No development badge; the screen is the only Rooms screen (the M1 screens were removed at the I-15 cut-over).
 - [ ] Not in the demo: the upgrade notices (migration from M1: "Rooms was upgraded", the old keys box with "Delete keys" and its confirmation). They need a home that ran the M1 plugin; `test/e2e-v2/migration-run.sh` builds one but deletes it afterwards.
@@ -92,7 +92,7 @@ Record what you see in `ui-notes.md` under "Observed in the app".
 
 ## Known rough edges
 
-- **Disallowed buttons stay visible** on the routed host. The app does not read `server_info.permissions`, so controls such as the composer or archive appear and fail with "Room is not authorized for …" (research/rooms-feasibility.md 2.5).
+- **Disallowed buttons stay visible** on the routed host. The app does not read `server_info.permissions`, so controls such as the composer or archive appear and fail with "Room is not authorized for …" (the feasibility study (design research, not published) 2.5).
 - **Stale routed entries.** After a removal, the routed host can stay in the app's list until you remove it (Paseo does not prune routed hosts).
 - **No leave or lane close in the UI yet** (I-14 follow-up): the cards say "not available yet". Archiving the shared agent closes its lane.
 

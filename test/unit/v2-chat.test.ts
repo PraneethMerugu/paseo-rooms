@@ -15,7 +15,7 @@ import { ed25519PrivateKeyFromSeed } from "../../server/proto/keys";
 import { rjcs } from "../../server/proto/rjcs";
 import { Harness, type Dev } from "./mls-harness";
 
-const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
+const V = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json"), "utf8"));
 const hex = (s: string) => Buffer.from(s, "hex");
 
 async function three(): Promise<Harness> {

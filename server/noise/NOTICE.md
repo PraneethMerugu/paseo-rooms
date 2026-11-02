@@ -1,7 +1,7 @@
 # Vendored Noise module
 
 This directory contains code from Paseo, vendored for identity v2 milestone I-4
-(`docs/IMPLEMENTATION-PLAN-identity-v2.md`; spec `docs/specs/identity-v2/enrollment-v2.md` 3.2.1).
+(`docs/design/implementation-plan-identity-v2.md`; spec `docs/design/specs/identity-v2/enrollment-v2.md` 3.2.1).
 
 ## Origin
 
@@ -56,5 +56,5 @@ Pure JS on `@noble/curves`, `@noble/hashes` and `@noble/ciphers` 2.4.0; no nativ
 network access. Tested on Linux only (Paseo's Node 24.20.0). Win32 and darwin: **untested**, expected
 identical by construction.
 
-`@noble/*` are currently resolved as transitive dependencies (via `@getpaseo/relay`). The spec asks for
-direct, exact-version dependencies; adding them to `package.json` is left for a lockfile update.
+`@noble/curves`, `@noble/hashes` and `@noble/ciphers` are direct dependencies at exactly 2.4.0
+(`package.json`).

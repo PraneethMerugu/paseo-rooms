@@ -70,7 +70,7 @@
 // keyring is not probed at all, so test daemons never touch the user's keyring.
 import * as fs from "node:fs";
 import nodePath from "node:path";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { randomBytes } from "node:crypto";
 import { createRoom, memberKeysPath, memberKeysPurpose, recoveryOfferOf, type RecoveryKeyOffer } from "./admin/genesis";
 import { ConfirmationBook, describeAdminAction, type DescribeContext, type Described } from "./admin/confirmations";
@@ -137,6 +137,9 @@ import { isId, isRoomId } from "./proto/ids";
 import { ed25519PrivateKeyFromSeed, fingerprintOfKid, rawPublicKey, x25519PrivateKeyFromSecret } from "./proto/keys";
 import { rjcsParse } from "./proto/rjcs";
 import type { RelayAddress } from "./transport/relay-server";
+
+/** Paseo's API handle, taken from the host SDK (the plugin does not depend on @getpaseo/client at run time). */
+type PaseoApi = PluginHandlerContext["paseo"];
 
 /**
  * DEV-ONLY: short MLS timers (witness, joiner check, retries) so the offline e2e runs in seconds. The

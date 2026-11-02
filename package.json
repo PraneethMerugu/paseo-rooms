@@ -1,13 +1,27 @@
 {
   "name": "paseo-rooms",
   "private": true,
+  "version": "0.2.0",
+  "description": "Paseo Rooms: share a live agent, read-only, with other Paseo users through their own daemons.",
   "license": "Apache-2.0",
-  "version": "0.1.0",
-  "description": "Paseo Rooms: share a live agent, read-only, with other Paseo users through their own daemons (identity v2).",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PraneethMerugu/paseo-rooms.git"
+  },
+  "homepage": "https://github.com/PraneethMerugu/paseo-rooms#readme",
+  "bugs": {
+    "url": "https://github.com/PraneethMerugu/paseo-rooms/issues"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
     "OVERVIEW.*.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
     "index.client.tsx",
     "index.server.ts",
     "client/",
@@ -17,9 +31,12 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "typecheck:client": "tsc -p tsconfig.client.json",
-    "gen:profile": "ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin node_modules/tsx/dist/cli.mjs tools/gen-room-profile.ts",
-    "test": "ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin --test --import ./node_modules/tsx/dist/esm/index.mjs test/unit/*.test.ts",
-    "test:e2e": "bash test/e2e-v2/run.sh"
+    "typecheck:reliability": "tsc -p test/reliability/tsconfig.json",
+    "gen:profile": "tsx tools/gen-room-profile.ts",
+    "pretest": "node tools/check-node.mjs",
+    "test": "node --test --import tsx test/unit/*.test.ts",
+    "test:e2e": "bash test/e2e-v2/run.sh",
+    "check:docs": "node tools/check-doc-paths.mjs"
   },
   "dependencies": {
     "@getpaseo/protocol": "0.13.2",

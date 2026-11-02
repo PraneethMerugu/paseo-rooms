@@ -94,7 +94,7 @@ async function deliver(h: Harness): Promise<void> {
 type Internals = { initializeEpoch: (initSecret: Uint8Array, commitSecret: Uint8Array, gc: unknown, psk: Uint8Array, kdf: unknown) => Promise<{ keySchedule: { exporterSecret: Uint8Array } }> };
 
 /**
- * Test 1 (ported from spikes/security/src/mls-proto.ts): after a Remove, the removed member cannot
+ * Test 1 (ported from the MLS removal spike, not published): after a Remove, the removed member cannot
  * decrypt under the honest, forced, stale and zero-commit-secret views. Returns what each view got.
  */
 async function removalRegression(adapter: MlsAdapter, internals: Internals) {
@@ -164,9 +164,10 @@ test("MLS 1: removal regression on ts-mls 1.6.4 (honest, forced, stale and zero-
 test("MLS 2: positive control, the same regression fails on ts-mls 1.6.2 (spike install, offline)", async (t) => {
   // The dev alias `ts-mls-162` could not be added to the plugin: its exact @noble/ciphers 2.1.1 peer
   // conflicts with the plugin's 2.4.0 and npm 9 refuses an override for an aliased package. The
-  // control loads the copy Spike A installed under spikes/security, when it is there.
-  const dir = join(process.cwd(), "..", "spikes", "security", "node_modules", "ts-mls-162", "dist", "src");
-  if (!existsSync(join(dir, "index.js"))) return t.skip("spikes/security/node_modules/ts-mls-162 not installed");
+  // control runs when ROOMS_TS_MLS_162_DIR names the dist/src directory of a separate ts-mls 1.6.2
+  // install (for example `npm install ts-mls-162@npm:ts-mls@1.6.2` in a scratch directory).
+  const dir = process.env.ROOMS_TS_MLS_162_DIR ?? "";
+  if (!dir || !existsSync(join(dir, "index.js"))) return t.skip("set ROOMS_TS_MLS_162_DIR to a ts-mls 1.6.2 dist/src to run this control");
   const lib = require(join(dir, "index.js")) as MlsLib;
   const adapter = await MlsAdapter.create(lib);
   const r = await removalRegression(adapter, require(join(dir, "keySchedule.js")) as Internals);
@@ -639,7 +640,7 @@ test("MLS 10: a host that sequences the approval and then any other entry is rep
 });
 
 // Continuity: test code forks createCommit to send an UpdatePath with a changed credential (Spike A
-// case (a)); production never does. Ported from spikes/security/src/mls-rekey-updatepath-welcome.ts.
+// case (a)); production never does. Ported from the Spike A script (not published).
 async function forkedUpdatePath(adapter: MlsAdapter, state: MlsState, newCred: { credentialType: "basic"; identity: Uint8Array }, newKp: { publicKey: Uint8Array; signKey: Uint8Array }, aad: Uint8Array): Promise<Uint8Array> {
   const I = (m: string) => require(`ts-mls/${m}.js`);
   const cs = adapter.cs as any;

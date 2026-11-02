@@ -11,7 +11,7 @@
 // Fields that are not in the table are dropped, so a protocol bump that adds a field cannot leak it.
 // The conformance test fails on any field that the installed protocol has and the table lacks.
 //
-// Project display names (HARDENING-PLAN decisions round 2): hidden from viewers unless the owner
+// Project display names (hardening plan decisions round 2): hidden from viewers unless the owner
 // opts in per room. While hidden, every name field is replaced by the lane's neutral label and the
 // basename of every redacted path is replaced by a keyed hash, so "/room/<project folder>" does not
 // reveal the name either. The policy object is shared by every route of a lane, so a change applies

@@ -1,6 +1,6 @@
 // Identity v2 milestone I-6: key changes, revocation and re-fold, lineages and closure, device
 // holds; round 8: leaf repair requests, keys that never return after a re-fold, the revocation depth
-// cap and the linear re-fold. Read directly from docs/specs/identity-v2/vectors/vectors.json
+// cap and the linear re-fold. Read directly from docs/design/specs/identity-v2/vectors/vectors.json
 // (log.refold, log.closure, log.noRevival, log.revocationDepth, deviceLink.chain(.cases),
 // deviceRekey.chain(.cases), deviceRekey.vetoed, deviceRekey.soleDeviceChangeAdmin,
 // deviceLeafRepair, the recovery-key statements), so the tests and the spec cannot drift. Further
@@ -24,7 +24,7 @@ import { ed25519PrivateKeyFromSeed, kid as kidOf, rawPublicKey } from "../../ser
 import { rjcs } from "../../server/proto/rjcs";
 import { sign } from "../../server/proto/tbs";
 
-const VECTORS_PATH = join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json");
+const VECTORS_PATH = join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json");
 const V = JSON.parse(readFileSync(VECTORS_PATH, "utf8"));
 const L = V.log;
 const GENESIS = V.genesis.signed;

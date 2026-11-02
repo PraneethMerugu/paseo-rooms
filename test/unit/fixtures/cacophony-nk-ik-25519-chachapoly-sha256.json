@@ -6,7 +6,7 @@
     "fileSha256": "e1b0c4100b6c6e76378705a4954c3293f3752a55b586a3a252cecbfc937538c9",
     "fetched": "2026-10-29 (read-only, by the identity-v2 spec agent)",
     "extraction": "the only two entries whose name is Noise_NK_25519_ChaChaPoly_SHA256 or Noise_IK_25519_ChaChaPoly_SHA256, copied field for field (JSON.parse of the pinned file, then JSON.stringify with 2-space indent)",
-    "license": "not checked here (no network); public interoperability test vectors, also copied by Paseo's own NK fixture"
+    "license": "MIT (noise-c COPYING: Copyright (C) 2016 Southern Storm Software, Pty Ltd.; checked 2026-11-02, see NOTICE); public interoperability test vectors, also copied by Paseo's own NK fixture"
   },
   "vectors": [
     {

@@ -1,4 +1,4 @@
-// Native KEK backend through @napi-rs/keyring 2.x (identity-model 7.3; Spike B, spikes/keyring-plugin).
+// Native KEK backend through @napi-rs/keyring 2.x (identity-model 7.3; Spike B, implementation plan 1.2).
 //
 // Loading rules settled by Spike B:
 // - The binding is OPTIONAL and never imported statically: Paseo's plugin compiler (esbuild) cannot

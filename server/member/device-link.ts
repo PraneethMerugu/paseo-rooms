@@ -1,5 +1,5 @@
 // The confirming device's side of a device link (identity-model.md 6.3, 6.4; enrollment-v2.md 5.4,
-// 6.2; HARDENING-PLAN decisions round 4, re-review R-2; review S-13; implementation plan I-11).
+// 6.2; hardening plan decisions round 4, re-review R-2; review S-13; implementation plan I-11).
 //
 // Device A (an active device of the member) creates a link, shows its `prl2.` code, answers the
 // host's `link.request` with its own nonce Nc, computes the SAS itself from inputs it pinned, and on

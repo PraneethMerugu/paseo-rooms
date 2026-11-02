@@ -1,0 +1,18 @@
+Paseo Rooms
+Copyright 2026 Praneeth Merugu
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software from Paseo (https://github.com/getpaseo/paseo),
+Copyright (c) 2025-present Mohamed Boudra, licensed under the Apache License,
+Version 2.0. The files in server/noise/ (cipher-state.ts, symmetric-state.ts and
+handshake-state.ts) were copied from packages/relay/src/noise/ at commit
+1467121b16742c2ce57320748d70d365aaf861c6; handshake-state.ts was modified.
+Paseo's licence is in server/noise/LICENSE, and the origin, checksums and
+modifications are listed in server/noise/NOTICE.md.
+
+The test fixture test/unit/fixtures/cacophony-nk-ik-25519-chachapoly-sha256.json
+contains test vectors extracted from noise-c (https://github.com/rweather/noise-c),
+tests/vector/cacophony.txt, Copyright (C) 2016 Southern Storm Software, Pty Ltd.,
+licensed under the MIT License (test/unit/fixtures/NOISE-C-LICENSE). The
+fixture is test data and is not part of the installed plugin.

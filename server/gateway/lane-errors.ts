@@ -1,5 +1,5 @@
 // Owner-only record of the error detail that viewers of a lane received as generic text (C-16,
-// HARDENING-PLAN "Viewer errors", decisions round 2). The sanitiser replaces every forwarded error
+// hardening plan "Viewer errors", decisions round 2). The sanitiser replaces every forwarded error
 // with generic text and hands the original here. The owner reads it through the local plugin RPC
 // rooms.lane.errors on their own daemon; nothing in this module is ever sent over the lane endpoint.
 // Memory only: error text can carry absolute paths and is not written to disk.

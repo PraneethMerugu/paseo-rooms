@@ -1,94 +1,131 @@
-# paseo-rooms (identity v2)
+# Paseo Rooms
 
-Paseo plugin `rooms` (package `paseo-rooms`). One plugin, one runtime (`server/runtime-v2.ts`), with these roles on any daemon:
+Rooms is a [Paseo](https://paseo.sh) plugin for sharing a running agent, read-only, with other people who use Paseo. You create a room, share an agent in it and invite people. After a short voice or video check, the shared agent appears in their Paseo app as a separate host. They can watch its timeline and turns live, and chat with the room. They cannot prompt it, approve anything for it, or see anything else on your machine. You can remove them at any time.
 
-- **room host and admin** on the owner's daemon: the room's signed log, its room endpoint on the relay (Noise IK sessions), SAS enrollment, device links and holds, grants v2, key rotation and recovery, the MLS delivery service;
-- **lane endpoints** on the owner's daemon: one relay endpoint per shared agent, the Room Profile filter and the field sanitizer, capped upstream sessions, pushed revocation;
-- **member** on each member's daemon: per-room device keys, its own fold of the room log, the room session, grant requests and rotation, the connected-host registration of each lane, the MLS group.
+## Status
 
-Identity v2 replaced the Milestone 1 (M1) identity layer at the cut-over (implementation plan I-15, 2026-11-01). M1 is kept in git at tag `m1-baseline`; its results are in `M1-RESULTS.md`. On first start the plugin archives M1 data it finds and closes M1 rooms (`server/migration/v1.ts`, `docs/specs/identity-v2/migration.md`).
+**v0.2.0 is a pilot release for Linux.** It is used and tested on Linux only. Read the [security model](#security-model) before you share an agent, and share only with people you trust with what that agent shows.
 
-Design: `docs/specs/identity-v2/` (start with its `README.md`), `docs/specs/room-profile-v1.md`, and `../research/rooms-architecture.md`. Plan, follow-ups and open decisions: `docs/IMPLEMENTATION-PLAN-identity-v2.md`.
+| Area | State |
+|---|---|
+| Linux (x64, glibc) | Tested: unit and conformance tests, offline end-to-end tests with real Paseo test daemons, and a Git install. |
+| macOS, Windows | **Untested.** The code has paths for both (Keychain, Credential Manager, Windows file ACLs), but none has run. Do not rely on Rooms there yet. |
+| Paseo app UI | Built and typechecked. A full manual check in the real app ([`ui-check/`](ui-check/README.md)) has not been recorded yet. |
+| Reliability and security test modules | Written and typechecked, **not run yet** ([`test/reliability/`](test/reliability/README.md)). |
 
-## Layout
+## Requirements
 
-| Path | Runtime | What |
-|---|---|---|
-| `index.server.ts`, `server/runtime-v2.ts` | server | RPC registration, the agent guard, the resume tripwire and the agent.archived hook; the runtime (start, owned and joined rooms) |
-| `shared/rpc-v2.ts`, `shared/rpc.ts` | both | Plugin RPC contracts: the room calls (`rooms.v2.*`), and bootstrap, Fix permissions, lane agents, migration |
-| `server/proto/`, `server/noise/`, `server/transport/` | server | Encoding (RJCS), keys and ids, invite and link codes; vendored Noise IK; records and the relay connection shared by room and lane endpoints |
-| `server/authority/` | server | The fold of the room log: statements, entries, roster, holds, lineages, admin revocation re-folds |
-| `server/admin/` | server | Genesis, the admin signer, one-time confirmations of admin actions, the hold clock, recovery |
-| `server/host/` | server | Room host and log store, room endpoint, enrollment, grants v2, lane service, MLS delivery |
-| `server/member/` | server | Enrollment client and journal, device link, room client, grant scheduler, lane registration, rotation |
-| `server/mls/` | server | ts-mls adapter, authentication service, roster rule, member state |
-| `server/keystore/` | server | Keyring (`@napi-rs/keyring`) or protected fallback file; sealed files |
-| `server/platform/` | server | Home resolution, owner-only `FileProtection` (POSIX modes; win32 DACL, untested on Windows), durable writes, log writer lock, the TEST-ONLY clock and test-home guard |
-| `server/migration/v1.ts` | server | Migration from M1: detect, archive by rename, `migration.json`, removal of v1 host registrations, "Delete keys" |
-| `server/gateway/lane-endpoint.ts` | server | Lane relay endpoint: host-link destination side, virtual sessions, capped upstream, pushed revocation |
-| `server/gateway/agent-guard.ts`, `tripwire.ts` | server | `before("agent.create")` guard with the inert MCP shadow for room agents; stored-config tripwire |
-| `server/gateway/local-daemon.ts`, `lane-errors.ts` | server | Loopback upstream with `hello.sessionPermissions`; owner-only lane error log |
-| `server/room-profile/`, `profile/*.csv` | server, data | Room Profile classification and field tables, generated module, filter and sanitizer |
-| `server/limits.ts`, `server/log.ts`, `shared/policy.ts` | both | Resource limits (`limits.json`), redacting logger, provider allowlist |
-| `client/` | app | Rooms screen, share ("Open room…") screen, dialogs, sidebar item, composer pills |
-| `tools/` | dev | Profile generator |
-| `test/unit/`, `test/e2e-v2/` | dev | Unit and conformance tests; end-to-end tests with disposable daemons |
-| `test/m1-evidence/` | dev | Logs of the last M1 e2e runs (git-ignored raw evidence) |
-| `ui-check/` | dev | Disposable daemons with demo state for a manual check in the real app |
+- **Paseo 0.13.2 or a later 0.13.x** on every daemon that uses Rooms, both yours and your members'. The plugin declares `>=0.13.2 <0.14.0`. On other Paseo versions Rooms keeps rooms and chat working but pauses shared agents (see [Troubleshooting](#troubleshooting)).
+- **Plugins enabled** on each daemon (`pluginsEnabled: true`, or Settings → Plugins → Enable plugins in the app). Paseo plugins are trusted code: Rooms runs on your daemon with your permissions.
+- **git and npm on the daemon host.** Paseo clones the repository and runs `npm ci --omit=dev` in it during install. Any recent npm works; the plugin itself runs on Paseo's bundled Node.
+- **A system keyring** is recommended (on Linux, a Secret Service such as GNOME Keyring or KWallet). Without one, Rooms keeps its key in a protected file and says so.
+- **Network access** to the Paseo relay (`relay.paseo.sh`) for the owner's and the members' daemons.
 
-`tools/` and `test/` are not imported by either entry, so Paseo does not bundle them, and they are excluded from the npm `files` list.
+## Install
 
-## Development setup
-
-Requirements: Paseo 0.13.2 (`/opt/Paseo`), npm. Scripts run on the Node 24 bundled with Paseo (`ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin`).
+On each daemon host (yours and every member's):
 
 ```bash
-cd plugin
-npm install
-npm run typecheck          # tsc --noEmit over entries, client, server, shared, tools and tests
-npm run typecheck:client   # the client alone, without Node or DOM types (X-12)
-npm run gen:profile        # regenerate server/room-profile/generated.ts after editing the CSVs
-npm test                   # unit and conformance tests
-npm run test:e2e           # offline end-to-end test; see below
+paseo plugin install github:PraneethMerugu/paseo-rooms
+paseo plugin ls          # rooms should show "running"
 ```
 
-Relay: the genesis of a new room records `PASEO_ROOMS_RELAY_ENDPOINT` (default `relay.paseo.sh:443`, TLS). Keystore: the system keyring, or `PASEO_ROOMS_KEYSTORE=fallback-file` for a protected file. Development switches (`PASEO_ROOMS_DEV_*`: short grants, plain loopback relay, fast MLS timers) are honoured only on a marked e2e test home (`server/platform/test-clock.ts`) and ignored elsewhere.
+To pin a release or commit, add `--ref <tag or commit>`. To manage another daemon, add `--host <host>` (see `paseo plugin install --help`). Paseo shows a trust notice first: the plugin's server code and its install command (`npm ci`) run unsandboxed on the daemon host.
 
-## Tests
+**From a local checkout** (for development): Paseo does not install dependencies for a directory install, so run `npm ci` yourself first.
 
-**Unit and conformance** (`npm test`, 394 tests, about 10 s): the v2 vectors and encoding, Noise, records, keystore, file layer, fold core and authority, room host, room endpoint, enrollment, grants and lane service, device links, rotation, MLS, RPC contracts and the migration from M1 (`v2-*.test.ts`); the Room Profile and field tables, viewer policy, lane endpoint limits, relay connection, agent guard and tripwire.
+```bash
+git clone https://github.com/PraneethMerugu/paseo-rooms.git
+cd paseo-rooms
+npm ci --omit=dev
+paseo plugin install "$PWD"
+```
 
-**End to end, offline** (`bash test/e2e-v2/run.sh`, about 2.5 minutes): three disposable daemons on 6921, 6922 and 6924 and a fake relay on 6923, homes under `plugin/.test-homes/v2-*` (0700, git-ignored, deleted afterwards). Enrollment with SAS and a restart mid-pending, lane grants with rotation, a device link with the 72 h hold on the TEST-ONLY clock, MLS, host key rotation, device rekey, removal, closing a lane and leaving a room (a second room; the member's routed lane hosts are removed), the denials of out-of-scope operations, the one-time invite, a full file-mode check, secret scans, an independent fold of the owner's room log, and archiving the shared agent closing its lane. Two agents are created without a prompt: no model call. `--live-relay` uses relay.paseo.sh (network; run only with the user's go-ahead).
+**Update:** `paseo plugin update rooms` (Git installs; a directory install is updated by pulling and running `paseo plugin reload rooms`).
 
-**Migration from M1** (`bash test/e2e-v2/migration-run.sh`, about 40 s): an M1 build from a temporary worktree of tag `m1-baseline`, two daemons on 6925 and 6926 and a fake relay on 6927. Creates an M1 room and membership, upgrades both plugins, checks the archive, `migration.json`, the removed host registration and the absent v1 lane endpoint, then runs a new v2 room end to end. No model call.
+## First run
 
-Every test daemon: config written before the first start (loopback listen, daemon relay registration off, speech off), every CLI call with `--home`, never `~/.paseo` or the main daemon, keys in the fallback file (never the user's keyring), ports 6920 to 6929 checked free at the end. The Haiku call budget is tracked in `test/e2e-v2/HAIKU-BUDGET.md`.
+Open the Paseo app. **Rooms** appears in the sidebar. On first start Rooms chooses where to keep its key, once:
 
-`test/reliability/` was written for M1 and is stale until rewritten against the v2 RPCs (its README says so).
+- the system keyring, when one is available and unlocked. Your desktop may ask you to unlock it.
+- otherwise a protected file in the daemon's home. The Rooms screen shows a notice that the file is in use.
 
-## Security model and limits
+The choice is recorded and never changes silently afterwards. To always use the file (for example on a headless host), start the daemon with `PASEO_ROOMS_KEYSTORE=fallback-file`.
 
-- **Watch only, by construction.** A lane is the owner's own agent, running as the owner's OS user. Member input must never prompt or drive it: every prompting, steering and approval message type is denied before the Room Profile table is consulted, and a lane endpoint refuses to start if the table ever allows one. Steering needs sandboxed lanes, not a table change.
-- **A grant admits every client of the member's daemon.** The lane is a connected host on the member's daemon, so the member's app, paired devices and the member's own agents (through Paseo's routed-host tools) can read the lane. Treat lane content as visible to everything on the member's daemon.
-- **Joins are confirmed by people.** An invite is one-time and expires (30 minutes by default); the owner admits a join only after both sides compared the six-digit SAS. A device link waits 24 or 72 hours unless an admin approves it, and any of the member's devices can veto it.
-- **Grants** last at most 12 hours, are bound to a device and a lane, and are revoked before the revocation is saved (a failed save is reported and retried).
-- **Room agents created by Rooms** get the inert `paseo` MCP shadow (`agent-guard.ts`) and the stored-config tripwire before a resume. Identity v2 shares existing agents and creates none; the guard and tripwire still protect the fork agents M1 left on a daemon.
-- **Other plugins are trusted.** Paseo 0.13.2 runs `before` hooks in plugin-id order, and every server plugin runs with owner permissions.
-- **Resource limits.** Defaults in `server/limits.ts`, with the grants-v2 section 11 limits for lanes (32 routes per link, 256 per lane, 30 failed links per minute). Override in `<PASEO_HOME>/plugin-data/rooms/limits.json` (clamped to safe bounds).
+## Quick start
+
+**1. Create a room** (owner). Rooms → **Create room**. Rooms offers a recovery key: save it if you want to be able to recover the room after losing your admin key.
+
+**2. Share an agent** (owner). Open the agent, open the Command Center and choose **Open room…**. Pick the room and press **Share**. The agent itself is shared, live and read-only. Rooms does not copy or fork it.
+
+**3. Invite** (owner). On the room's card, **Create invite**, then **Copy code**. The code starts with `prc2.`, works once and expires after 30 minutes by default. Send it privately.
+
+**4. Join** (member). Rooms → paste the code under "Join with an invite or device link code" → **Check code**. Confirm the relay if asked, enter a name for this device (for example "Sam laptop") and press **Join**.
+
+**5. Compare the six-digit code.** Both of you now see six digits. Read them to each other by voice or video. The member presses **Codes match**. The owner presses **Admit** only if the digits match. If they differ, press **Codes do not match**: the join stops and the invite cannot be reused.
+
+**6. Watch.** The shared agent appears in the member's app as a host named after the room's lane. The member's daemon renews access on its own while they stay in the room.
+
+**7. Chat.** On the room card, **Chat** opens the room chat. Messages are end-to-end encrypted to the room's members and signed by the sending device.
+
+**8. Leave or remove.**
+- A member leaves with **Leave room** on the room card (type `leave` to confirm). This deletes the room's keys from that device.
+- The owner removes a member with **Remove** in the Members tab. Their live view is cut immediately.
+- The owner stops sharing an agent with **Close lane** in the Lanes tab (type `close`), or by archiving the agent.
+
+More devices: a member can add another of their own devices with **Link another device**. The new device waits up to 72 hours unless an admin approves it sooner, and any of the member's devices can stop it.
+
+## Security model
+
+- **Watch only.** A shared agent runs as your OS user, so member input can never drive it. Every message type that could prompt, steer, approve, archive, open terminals or files, change settings or reach other agents is refused. Your daemon also gives each viewer session read-only permissions.
+- **Only the shared agent.** Members see that agent, its workspace and its timeline. Project and folder names are hidden by default. Paths, git remotes, pull requests, scripts and your other agents are never sent.
+- **People confirm every join.** Invites are one-time and expire. A join completes only after both people compare the six-digit code and the owner admits it. Removing a member takes effect at once. Access grants last at most 12 hours and are bound to one device and one shared agent.
+- **Signed room log.** Your daemon keeps a signed log of who was admitted, which devices they use, what is shared and every change of access. Each member's daemon keeps its own copy and checks every entry, so inconsistent answers from the host are noticed.
+- **Encrypted transport.** Room and lane traffic goes through the Paseo relay end to end encrypted (Noise IK sessions for the room, the relay's protected mode for lanes, MLS for chat). The relay does not see content.
+- **Everything on a member's daemon can read what they can.** The shared agent is a host on the member's daemon, so their app, their paired devices and their own agents can read it too. Share only with people whose machines you would trust with what the agent shows.
+- **Same-user software is trusted.** Rooms keeps keys in the system keyring or in owner-only files. Another program running as your OS user (including other Paseo plugins, which run with full permissions) is not something Rooms can defend against.
+- **The owner's daemon must be online** for members to see the room and the shared agents.
+
+The design and its reviews are in [`docs/`](docs/README.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Platforms and Paseo versions
 
-- **Platforms.** The v0.2 pilot supports Linux only: every unit and e2e run so far was on Linux. macOS and Windows are untested. The code has paths for both (Keychain and Credential Manager through the keyring, Windows DACLs, named pipes), but none has been run, so do not use Rooms on them for anything that matters yet.
-- **Paseo versions.** The manifest requires Paseo `>=0.13.2 <0.14.0` (`paseo-plugin.json`). The Room Profile was generated from `@getpaseo/protocol` 0.13.2. At start, and again when each lane starts, Rooms reads the daemon's version and protocol number from `server_info` (`server/compat.ts`). Outside the tested range, or for a protocol the Room Profile has no tested entry for, Rooms does not serve lanes (fail closed). The Rooms screen then shows "Shared agents are paused" with the reported and tested versions. Rooms itself (invites, members, chat) keeps working. A pre-release build counts as untested. To support a new Paseo release, regenerate and review the profile, run both test suites against it, then widen the range and add a tested entry.
+- **Platforms:** Linux is the only tested platform for v0.2. macOS and Windows are untested.
+- **Paseo versions:** `>=0.13.2 <0.14.0`. Rooms filters traffic with a message table generated from Paseo's 0.13.2 protocol. At start, and again when each shared agent starts, Rooms checks the daemon's version and protocol. Outside the tested range it stops serving shared agents (fail closed) and the Rooms screen says "Shared agents are paused" with the reported and tested versions. Rooms, members and chat keep working. Pre-release Paseo builds count as untested.
 
-## Installing on a real daemon (not done by the tests)
+## Uninstall
 
-Installing requires `pluginsEnabled: true` on the target daemon and trusts this code with owner permissions. Use `paseo plugin install /absolute/path/to/plugin` on the owner's and each member's daemon, then `paseo plugin ls` to check it is `running`. The UI was not exercised in a real app yet; see `ui-check/README.md` for the manual checklist.
+Leave your rooms and delete the keys **before** removing the plugin:
 
-## Leaving a room, closing a lane, and removing Rooms
+1. Rooms screen → **Remove Rooms from this daemon** (**Show**) → **Leave all rooms and delete keys** (type `delete`). This leaves every joined room, removes the lane hosts Rooms added, deletes the Rooms key from the keyring or file, and deletes `<PASEO_HOME>/plugin-data/rooms`. Rooms you host stop for good, so this asks for an extra "Also delete hosted rooms" choice and closes each hosted room where it can. The dialog lists any room it cannot close.
+2. `paseo plugin remove rooms`.
 
-- **Close a lane** (owner, Lanes tab, typed confirmation): `lane.closed` is logged, the lane endpoint stops, open views are cut and every grant for the lane stops working. Its endpoint key is deleted. A closed lane cannot be reopened; share the agent again with a new lane. The agent itself is not touched.
-- **Leave a room** (member, room card, type `leave`): on the member's only device this signs `member.left`; on one of several devices only that device leaves (`device.removed`, the membership stays with the other devices). A room whose access already ended is removed from the device only. The device's keys and saved copy of the room are deleted. The owner of a room cannot leave it.
-- **Lane hosts.** Each lane a member can view is a host in the member daemon's host list. Rooms removes it when the member leaves, is removed, the room closes, the lane closes, or the member loses access to the lane. Paseo does not prune these entries itself, and Paseo 0.13.2 lets only the plugin that added a host delete it (the app can only disable it). If removal fails (for example before the plugin has a Paseo connection), Rooms keeps the entry in `plugin-data/rooms/member/stale-hosts.json`, retries every 30 s and shows a notice with "Retry now".
-- **Leave all rooms and delete keys** (Rooms screen, "Remove Rooms from this daemon", type `delete`): leaves every joined room (rooms it cannot reach are only forgotten here, and their owners still list you), removes every host this plugin added, deletes the room key from the keystore (the system keyring entry, service `paseo-rooms`, or the fallback file; an operator's `PASEO_ROOMS_KEK_FILE` is never deleted), and deletes `<PASEO_HOME>/plugin-data/rooms`. Rooms this daemon hosts stop for good, so this needs an extra "Also delete hosted rooms" choice. Each hosted room is first closed (`room.closed`) where this daemon may: it confirms another admin's open closure proposal, or, in a room with one admin lineage and no recovery key, signs the closure with a one-time recovery key. Connected members then see the room as closed. A room with a recovery key or a second admin lineage is not closed by this action (the dialog says so per room); close it first with the recovery code or the other admin, or its members only see it go offline. Rooms then stays stopped until the daemon restarts, and starts empty after that.
-- **What `paseo plugin remove rooms` leaves behind** (checked in the Paseo 0.13.2 daemon source, `PluginService.removePlugin`): it stops the plugin, removes it from the config, clears its logs, deletes a managed install under `<PASEO_HOME>/plugins/rooms` (a directory install stays where it is) and deletes `<PASEO_HOME>/plugin-settings/rooms`. It does **not** delete `<PASEO_HOME>/plugin-data/rooms` (room keys, logs, journals), the keyring entry, or the lane hosts in the host list (after removal they can only be disabled). Run "Leave all rooms and delete keys" first. If the plugin is already gone: delete `<PASEO_HOME>/plugin-data/rooms`, delete the keyring entry with service `paseo-rooms` (account `kek:` and a hash of the Paseo home path) with your OS keyring tool, and disable any hosts labelled "Room lane: …".
+`paseo plugin remove` on its own leaves `<PASEO_HOME>/plugin-data/rooms` (room keys, logs), the keyring entry and the lane hosts behind. If the plugin is already gone: delete `<PASEO_HOME>/plugin-data/rooms`, delete the keyring entry with service `paseo-rooms` using your OS keyring tool, and disable any hosts labelled "Room lane: …" in the app.
+
+## Troubleshooting
+
+| Symptom | What to do |
+|---|---|
+| `paseo plugin install` fails with "npm" or "git" not found | Install git and Node.js with npm on the daemon host, then install again. |
+| Rooms does not appear in the app | Check `paseo plugin ls`. If plugins are disabled, enable them (Settings → Plugins). If `rooms` is not `running`, read `paseo plugin logs rooms`. |
+| Install refused because of the Paseo version | Rooms needs Paseo `>=0.13.2 <0.14.0`. Update Paseo, or wait for a Rooms release that supports your version. |
+| "Shared agents are paused" | The daemon's Paseo version or protocol is outside the tested range. Rooms and chat keep working; shared agents resume on a tested version. |
+| "Keyring locked" | Unlock your system keyring, then reload the Rooms screen. Rooms waits instead of switching to another store. |
+| Notice that keys are kept in a protected file | No system keyring was available at first start. This works; the key is protected by file permissions only. |
+| "Rooms files are not protected" with **Fix permissions** | Files under `plugin-data/rooms` were readable or writable by other accounts. Rooms loaded no keys. Press **Fix permissions** after checking why that happened. |
+| The invite code is rejected | Invites work once and expire (30 minutes by default). Ask the owner for a new one. |
+| The member sees a different six-digit code | Press **Codes do not match**. Someone may have intercepted the invite. Ask for a new invite over a different channel. |
+| A member cannot see the room | The owner's daemon must be online and reach `relay.paseo.sh`. |
+| An old lane host stays in the member's host list | Rooms removes lane hosts when access ends and retries every 30 s. Use **Retry now** in the notice, or disable the host in the app. |
+
+Plugin logs: `paseo plugin logs rooms`. Rooms never logs keys, and it redacts grants, invite, link and recovery codes as a second line of defence.
+
+## Upgrading from 0.1
+
+Rooms 0.1 rooms are closed on upgrade. Their invite codes (`prc1.`) stop working and their members lose access. The old data is moved to an archive folder. The Rooms screen offers to delete the old keys and lists agents from closed rooms. Create a new room and invite people again.
+
+## Contributing and licence
+
+Development setup, tests and the code layout are in [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+Licensed under the [Apache License 2.0](LICENSE). Rooms includes code from Paseo (`server/noise/`); see [NOTICE](NOTICE).

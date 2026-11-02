@@ -1,5 +1,5 @@
 // Identity v2 milestone I-5: statements, entries, genesis and the core fold against
-// docs/specs/identity-v2/vectors/vectors.json (sections genesis, statements, log.entries,
+// docs/design/specs/identity-v2/vectors/vectors.json (sections genesis, statements, log.entries,
 // log.rosterAfter, log.foldChecks, log.equivocationExample), read directly so the tests and the
 // spec cannot drift. Further cases build small chains signed with the vector's test-only seeds.
 import assert from "node:assert/strict";
@@ -17,7 +17,7 @@ import { ed25519PrivateKeyFromSeed, verify } from "../../server/proto/keys";
 import { rjcs, rjcsText } from "../../server/proto/rjcs";
 import { sign } from "../../server/proto/tbs";
 
-const VECTORS_PATH = join(import.meta.dirname, "..", "..", "docs", "specs", "identity-v2", "vectors", "vectors.json");
+const VECTORS_PATH = join(import.meta.dirname, "..", "..", "docs", "design", "specs", "identity-v2", "vectors", "vectors.json");
 const V = JSON.parse(readFileSync(VECTORS_PATH, "utf8"));
 const L = V.log;
 const GENESIS = V.genesis.signed;

@@ -10,9 +10,9 @@
 # on the owner's test clock, revokes, and scans every home for invite and link codes (prc2., prl2.) and
 # grants (prg2.).
 #
-#   owner   : plugin/.test-homes/v2-owner    127.0.0.1:6921  (room host, room endpoint, admin daemon)
-#   member  : plugin/.test-homes/v2-member   127.0.0.1:6922  (member device A)
-#   member2 : plugin/.test-homes/v2-member2  127.0.0.1:6924  (the same person's second device B)
+#   owner   : .test-homes/v2-owner    127.0.0.1:6921  (room host, room endpoint, admin daemon)
+#   member  : .test-homes/v2-member   127.0.0.1:6922  (member device A)
+#   member2 : .test-homes/v2-member2  127.0.0.1:6924  (the same person's second device B)
 #   relay   : fake relay process             127.0.0.1:6923  (default, offline)
 #             or the live relay relay.paseo.sh:443 with --live-relay (network; needs the user's go-ahead)
 #
@@ -44,8 +44,7 @@ done
 
 E2E_DIR=$(cd "$(dirname "$0")" && pwd)
 PLUGIN_DIR=$(cd "$E2E_DIR/../.." && pwd)
-P=/opt/Paseo/resources/bin/paseo
-NODE=(env ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin)
+source "$PLUGIN_DIR/tools/paseo-env.sh"   # sets P (paseo CLI) and NODE; override with PASEO_BIN / PASEO_NODE
 TSX=("${NODE[@]}" "$PLUGIN_DIR/node_modules/tsx/dist/cli.mjs")
 HOMES=$PLUGIN_DIR/.test-homes
 OWNER=$HOMES/v2-owner

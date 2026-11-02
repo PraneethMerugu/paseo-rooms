@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Migration test 3 (docs/specs/identity-v2/migration.md section 6; plan I-15): upgrade from the M1 build.
+# Migration test 3 (docs/design/specs/identity-v2/migration.md section 6; plan I-15): upgrade from the M1 build.
 #
-#   M1 build : a temporary git worktree of tag m1-baseline outside the plugin (removed at the end), with
-#              this plugin's node_modules linked in (M1's dependencies are a subset, same versions)
-#   owner    : plugin/.test-homes/v2-mig-owner   127.0.0.1:6925
-#   member   : plugin/.test-homes/v2-mig-member  127.0.0.1:6926
+#   M1 build : a temporary git worktree of tag m1-baseline (or M1_REF) outside the plugin (removed at
+#              the end), with this plugin's node_modules linked in (M1's dependencies are a subset, same
+#              versions). The M1 plugin is the worktree's plugin/ directory if it has one, else its root.
+#   owner    : .test-homes/v2-mig-owner   127.0.0.1:6925
+#   member   : .test-homes/v2-mig-member  127.0.0.1:6926
 #   relay    : fake relay process                127.0.0.1:6927 (offline; never the live relay)
 #
 # Both daemons start with the M1 plugin, make an M1 room with a share lane and a membership, then the
@@ -17,8 +18,7 @@ set -euo pipefail
 E2E_DIR=$(cd "$(dirname "$0")" && pwd)
 PLUGIN_DIR=$(cd "$E2E_DIR/../.." && pwd)
 REPO=$(git -C "$PLUGIN_DIR" rev-parse --show-toplevel)
-P=/opt/Paseo/resources/bin/paseo
-NODE=(env ELECTRON_RUN_AS_NODE=1 /opt/Paseo/Paseo.bin)
+source "$PLUGIN_DIR/tools/paseo-env.sh"   # sets P (paseo CLI) and NODE; override with PASEO_BIN / PASEO_NODE
 TSX=("${NODE[@]}" "$PLUGIN_DIR/node_modules/tsx/dist/cli.mjs")
 HOMES=$PLUGIN_DIR/.test-homes
 OWNER=$HOMES/v2-mig-owner
@@ -40,7 +40,8 @@ port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 for port in "$OWNER_PORT" "$MEMBER_PORT" "$RELAY_PORT"; do
   if port_open "$port"; then echo "Refusing: 127.0.0.1:$port is already in use" >&2; exit 2; fi
 done
-git -C "$REPO" rev-parse -q --verify "refs/tags/m1-baseline" >/dev/null || { echo "tag m1-baseline not found" >&2; exit 2; }
+M1_REF=${M1_REF:-m1-baseline}
+git -C "$REPO" rev-parse -q --verify "$M1_REF^{commit}" >/dev/null || { echo "M1 build $M1_REF not found in this clone (fetch the m1-baseline tag, or set M1_REF to a commit of the M1 plugin)" >&2; exit 2; }
 
 mkdir -p "$LOGDIR"
 export PASEO_DICTATION_ENABLED=false PASEO_VOICE_MODE_ENABLED=false
@@ -93,10 +94,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-WT=$(mktemp -d /tmp/rooms-m1-baseline-XXXXXX)
+WT=$(mktemp -d "${TMPDIR:-/tmp}/rooms-m1-baseline-XXXXXX")
 rmdir "$WT"
-git -C "$REPO" worktree add --detach "$WT" m1-baseline >/dev/null
-ln -s "$PLUGIN_DIR/node_modules" "$WT/plugin/node_modules"
+git -C "$REPO" worktree add --detach "$WT" "$M1_REF" >/dev/null
+M1_PLUGIN=$WT
+[ -f "$WT/plugin/paseo-plugin.json" ] && M1_PLUGIN=$WT/plugin
+ln -s "$PLUGIN_DIR/node_modules" "$M1_PLUGIN/node_modules"
 echo "== M1 build: worktree of m1-baseline at $WT"
 
 rm -rf "$OWNER" "$MEMBER" "$SCRATCH"
@@ -109,8 +112,8 @@ port_open "$RELAY_PORT" || { echo "fake relay did not start" >&2; exit 1; }
 write_config "$OWNER" "$OWNER_PORT"
 write_config "$MEMBER" "$MEMBER_PORT"
 for h in "$OWNER" "$MEMBER"; do pa "$h" daemon start --timeout 120 | tail -1; done
-for h in "$OWNER" "$MEMBER"; do pa "$h" plugin install "$WT/plugin" --json | tail -3; done
+for h in "$OWNER" "$MEMBER"; do pa "$h" plugin install "$M1_PLUGIN" --json | tail -3; done
 
-E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_PASEO_BIN=$P E2E_M1_PLUGIN=$WT/plugin E2E_V2_PLUGIN=$PLUGIN_DIR E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_SCRATCH=$SCRATCH \
+E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_PASEO_BIN=$P E2E_M1_PLUGIN=$M1_PLUGIN E2E_V2_PLUGIN=$PLUGIN_DIR E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_SCRATCH=$SCRATCH \
   "${TSX[@]}" "$E2E_DIR/migration-e2e.ts" 2>&1 | tee "$LOGDIR/e2e.log"
 test "${PIPESTATUS[0]}" -eq 0

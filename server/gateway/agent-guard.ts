@@ -1,4 +1,4 @@
-// Tool restriction for room agents created by the gateway (rooms-architecture.md section 10,
+// Tool restriction for room agents created by the gateway (Rooms architecture document section 10, not published;
 // "confused deputy through Paseo's own MCP").
 //
 // Verified in @getpaseo/server 0.13.2 (dist/server/server/agent/agent-manager.js createAgentInternal,
@@ -17,7 +17,7 @@
 // which tripwire.ts detects after creation and before the first prompt.
 //
 // This is NOT an isolation boundary: the room agent runs as the owner's OS user and can reach the
-// paseo CLI, ~/.paseo and the daemon port with any shell tool (HARDENING-PLAN C-iso1). M1 lanes are
+// paseo CLI, ~/.paseo and the daemon port with any shell tool (hardening plan C-iso1). M1 lanes are
 // watch-only, and filter.ts keeps every prompting message type denied for owner-uid lanes.
 import { existsSync, readFileSync } from "node:fs";
 import { join, posix, win32 } from "node:path";

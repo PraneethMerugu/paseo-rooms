@@ -1,10 +1,6 @@
 // Resource limits for lane endpoints (code review C-4, protocol review P-17).
-// Defaults are safe for a watch-only lane. An owner can tune them in
-// <data>/limits.json (same keys, partial). Every value is clamped to [min, max] below, so a bad file
-// cannot disable a limit. The file is read once when the plugin starts.
-import { join } from "node:path";
-import { log } from "./log";
-import { readJsonFile } from "./platform/durable";
+// Defaults are safe for a watch-only lane. They are compiled in: there is no user-editable limits
+// file. resolveLimits clamps every value to [min, max] below, so an override cannot disable a limit.
 
 export interface ResourceLimits {
   /** Relay data connections per lane endpoint, including pre-authentication and control channels. */
@@ -69,18 +65,6 @@ export function resolveLimits(override: unknown): ResourceLimits {
     if (typeof v === "number" && Number.isFinite(v)) out[k] = Math.min(b.max, Math.max(b.min, Math.floor(v)));
   }
   return out;
-}
-
-export function loadLimits(dataDir: string): ResourceLimits {
-  try {
-    const raw = readJsonFile<unknown>(join(dataDir, "limits.json"));
-    const limits = resolveLimits(raw);
-    if (raw) log("limits_loaded", { ...limits });
-    return limits;
-  } catch (e) {
-    log("limits_invalid", { error: (e as Error).message?.slice(0, 200) });
-    return { ...DEFAULT_LIMITS };
-  }
 }
 
 /** Simple token bucket. */
