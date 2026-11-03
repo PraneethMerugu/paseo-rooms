@@ -96,7 +96,7 @@ import type { PendingView, InviteView } from "./host/enrollment";
 import { isDevInsecureRelay, memberRelayUseTls, relayKey } from "./host/invites";
 import { endpointKeyFromHost, movedEndpointKeys, RoomEndpoint } from "./host/room-endpoint";
 import { genesisPath, RoomHost } from "./host/room-host";
-import { CompatGuard } from "./compat";
+import { CompatGuard, LEGACY_FORK_REFUSED_MESSAGE, legacyForkAgentsAllowed, sessionOpenAllowsInjection } from "./compat";
 import { deleteKeyStore, ENV_KEYSTORE, openKeyStore, type Kek, type KeyStoreDeletion, type KeyStoreStatus, type OpenKeyStoreOptions } from "./keystore/keystore";
 import { log, logError } from "./log";
 import { HostGrants } from "./host/grants";
@@ -240,6 +240,8 @@ export class RoomsRuntimeV2 {
   private endedWatch: ReturnType<typeof setInterval> | null = null;
   /** R2.7: the owner daemon's Paseo version and protocol against the tested range; lanes refuse to serve outside it. */
   readonly compat = new CompatGuard({ log });
+  /** Set when a legacy fork agent's session open was refused (session-time injection seen); drives the notice. */
+  private legacyForkRefused = false;
   private paseo: PaseoApi | null = null;
   private started: Promise<void> | null = null;
   private stopping = false;
@@ -337,6 +339,24 @@ export class RoomsRuntimeV2 {
     });
   }
 
+  /**
+   * Owner notice for legacy fork room agents (compat.ts LEGACY_FORK_RANGE): shown when this daemon is
+   * known not to be Paseo 0.13.x, or a session open was refused, and an unarchived legacy fork agent
+   * is still stored. Null otherwise.
+   */
+  private legacyForkView(): { agentIds: string[]; message: string } | null {
+    const verdict = this.compat.verdict;
+    const refused = this.legacyForkRefused || (verdict !== null && !legacyForkAgentsAllowed(verdict.version));
+    if (!refused) return null;
+    const ids = v1ForkAgentIds(this.dataDir).ids;
+    for (const l of this.migration?.ownerLanes ?? []) if (l.origin === "fork") ids.add(l.agentId);
+    const active = [...ids].filter((id) => {
+      const r = readStoredAgentRecord(this.paseoHome, id, null);
+      return r.state === "ok" && !(r.record as { archivedAt?: unknown }).archivedAt;
+    });
+    return active.length ? { agentIds: active.sort().slice(0, 50), message: LEGACY_FORK_REFUSED_MESSAGE } : null;
+  }
+
   /** Status view of the migration (notice 2.5, archive notice 2.4, routed-entry note 2.3 step 4). */
   private migrationView() {
     const m = this.migration;
@@ -420,8 +440,12 @@ export class RoomsRuntimeV2 {
    * permission check). A room agent must pass verifyRoomAgent. The resume is also refused when the
    * agent's stored record exists but cannot be read, and when the record is missing while the list
    * of M1 forks cannot be read (migration.json unreadable).
+   *
+   * Legacy fork agents are refused outright where other plugins can attach MCP servers or tools at
+   * session open (Paseo 0.14+; compat.ts LEGACY_FORK_RANGE): when `request` (the session-open request)
+   * has `tools` or `mcpServers`, or when the daemon's known version is not 0.13.x.
    */
-  assertRoomAgentIntact(agentId: string): void {
+  assertRoomAgentIntact(agentId: string, request: unknown): void {
     const forks = v1ForkAgentIds(this.dataDir);
     for (const l of this.migration?.ownerLanes ?? []) if (l.origin === "fork") forks.ids.add(l.agentId);
     const known = forks.complete || this.migration !== null;
@@ -435,6 +459,12 @@ export class RoomsRuntimeV2 {
       if (stored.state === "unreadable") refuse(["stored agent record unreadable; Rooms cannot tell whether this is a room agent"]);
       if (stored.state === "missing" && !known) refuse(["stored agent record not found and the list of room agents (migration.json) is not readable"]);
       return;
+    }
+    const verdict = this.compat.verdict;
+    if (sessionOpenAllowsInjection(request) || (verdict !== null && !legacyForkAgentsAllowed(verdict.version))) {
+      this.legacyForkRefused = true;
+      log("legacy_fork_agent_refused", { agentId, when: "session_open", version: verdict?.version ?? null, sessionInjection: sessionOpenAllowsInjection(request) });
+      throw new Error(`Room agent not resumed: ${LEGACY_FORK_REFUSED_MESSAGE}`);
     }
     // A pure descriptor: nothing is written into a data folder that may have failed the permission check.
     const r = verifyRoomAgent(this.paseoHome, agentId, null, inertMcpServer(this.dataDir));
@@ -1005,6 +1035,7 @@ export class RoomsRuntimeV2 {
       ...(this.permissionProblems ? { permissionProblems: this.permissionProblems.slice(0, 20).map((p) => ({ path: p.path, code: p.code, detail: p.detail })) } : {}),
       platform: process.platform,
       paseoCompat: this.compat.verdict,
+      legacyForkAgents: this.legacyForkView(),
       migration: this.migrationView(),
       owned: [...this.owned.values()].map(({ host, endpoint, grants, lanes, holds, signer, moved }) => ({
         roomId: host.roomId,

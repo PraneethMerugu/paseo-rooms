@@ -200,7 +200,7 @@ export default function contribute(server: PluginServerContext) {
   // resume (C-iso2) for room agents Rooms created (M1 fork lanes kept after the migration).
   const removeOpen = server.before("agent.session_open", ({ request }, context) => {
     rt.attach(context?.paseo);
-    if (request.reason !== "create") rt.assertRoomAgentIntact(request.agentId);
+    if (request.reason !== "create") rt.assertRoomAgentIntact(request.agentId, request);
   });
   // C-13: a lane whose agent is archived stops serving at once and is closed (lane.closed).
   const removeArchived = server.on("agent.archived", (event, context) => {

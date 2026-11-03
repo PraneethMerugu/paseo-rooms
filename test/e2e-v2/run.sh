@@ -106,7 +106,16 @@ else
   echo "== offline mode: fake relay on 127.0.0.1:$RELAY_PORT"
 fi
 
-pa() { local home=$1; shift; PASEO_HOME=$home "$P" "$@" --home "$home" < /dev/null; }
+# Mixed-version runs: PASEO_BIN_OWNER (owner daemon) and PASEO_BIN_MEMBER (both member daemons)
+# override PASEO_BIN per daemon; each may be an npm-installed CLI (see tools/paseo-env.sh).
+P_OWNER=$P
+P_MEMBER=$P
+if [ -n "${PASEO_BIN_OWNER:-}" ]; then P_OWNER=$(paseo_cli_command "$PASEO_BIN_OWNER") || exit 2; fi
+if [ -n "${PASEO_BIN_MEMBER:-}" ]; then P_MEMBER=$(paseo_cli_command "$PASEO_BIN_MEMBER") || exit 2; fi
+cli_for() { if [ "$1" = "$OWNER" ]; then printf '%s\n' "$P_OWNER"; else printf '%s\n' "$P_MEMBER"; fi; }
+echo "== paseo CLI: owner $("$P_OWNER" --version 2>/dev/null | tail -1), members $("$P_MEMBER" --version 2>/dev/null | tail -1)"
+
+pa() { local home=$1; shift; PASEO_HOME=$home "$(cli_for "$home")" "$@" --home "$home" < /dev/null; }
 
 write_config() {
   local home=$1 port=$2
@@ -173,6 +182,6 @@ PASEO_ROOMS_TEST_CLOCK=1 pa "$OWNER" daemon start --timeout 120 | tail -1
 for h in "$MEMBER" "$MEMBER2"; do pa "$h" daemon start --timeout 120 | tail -1; done
 for h in "$OWNER" "$MEMBER" "$MEMBER2"; do pa "$h" plugin install "$PLUGIN_DIR" --json | tail -3; done
 
-E2E_SCRATCH=$SCRATCH E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_MEMBER2_HOME=$MEMBER2 E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_PASEO_BIN=$P \
+E2E_SCRATCH=$SCRATCH E2E_OWNER_HOME=$OWNER E2E_MEMBER_HOME=$MEMBER E2E_MEMBER2_HOME=$MEMBER2 E2E_LIVE=$LIVE E2E_RELAY_LOG=$LOGDIR/fake-relay.log E2E_PASEO_BIN=$P E2E_PASEO_BIN_OWNER=$P_OWNER E2E_PASEO_BIN_MEMBER=$P_MEMBER \
   "${TSX[@]}" "$E2E_DIR/e2e.ts" 2>&1 | tee "$LOGDIR/e2e.log"
 test "${PIPESTATUS[0]}" -eq 0

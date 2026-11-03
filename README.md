@@ -4,7 +4,7 @@ Rooms is a [Paseo](https://paseo.sh) plugin for sharing a running agent, read-on
 
 ## Status
 
-**v0.2.0 is a pilot release for Linux.** It is used and tested on Linux only. Read the [security model](#security-model) before you share an agent, and share only with people you trust with what that agent shows.
+**v0.2.1 is a pilot release for Linux.** It is used and tested on Linux only. Read the [security model](#security-model) before you share an agent, and share only with people you trust with what that agent shows.
 
 | Area | State |
 |---|---|
@@ -15,7 +15,7 @@ Rooms is a [Paseo](https://paseo.sh) plugin for sharing a running agent, read-on
 
 ## Requirements
 
-- **Paseo 0.13.2 or a later 0.13.x** on every daemon that uses Rooms, both yours and your members'. The plugin declares `>=0.13.2 <0.14.0`. On other Paseo versions Rooms keeps rooms and chat working but pauses shared agents (see [Troubleshooting](#troubleshooting)).
+- **Paseo 0.13.2 or later, up to 0.14.x** on every daemon and app that uses Rooms, both yours and your members'. The plugin declares `>=0.13.2 <0.15.0`; Paseo checks this range against both the daemon and the app version. Owners and members may run different versions in that range. On other Paseo versions Rooms keeps rooms and chat working but pauses shared agents (see [Troubleshooting](#troubleshooting)).
 - **Plugins enabled** on each daemon (`pluginsEnabled: true`, or Settings → Plugins → Enable plugins in the app). Paseo plugins are trusted code: Rooms runs on your daemon with your permissions.
 - **git and npm on the daemon host.** Paseo clones the repository and runs `npm ci --omit=dev` in it during install. Any recent npm works; the plugin itself runs on Paseo's bundled Node.
 - **A system keyring** is recommended (on Linux, a Secret Service such as GNOME Keyring or KWallet). Without one, Rooms keeps its key in a protected file and says so.
@@ -91,7 +91,7 @@ The design and its reviews are in [`docs/`](docs/README.md). To report a vulnera
 ## Platforms and Paseo versions
 
 - **Platforms:** Linux is the only tested platform for v0.2. macOS and Windows are untested.
-- **Paseo versions:** `>=0.13.2 <0.14.0`. Rooms filters traffic with a message table generated from Paseo's 0.13.2 protocol. At start, and again when each shared agent starts, Rooms checks the daemon's version and protocol. Outside the tested range it stops serving shared agents (fail closed) and the Rooms screen says "Shared agents are paused" with the reported and tested versions. Rooms, members and chat keep working. Pre-release Paseo builds count as untested.
+- **Paseo versions:** `>=0.13.2 <0.15.0`, tested with 0.13.2 and 0.14.0, including an owner and members on different versions. Rooms filters traffic with a message table generated from Paseo's 0.14.0 protocol, which also covers every 0.13.2 message. At start, and again when each shared agent starts, Rooms checks the daemon's version and protocol. Outside the tested range it stops serving shared agents (fail closed) and the Rooms screen says "Shared agents are paused" with the reported and tested versions. Rooms, members and chat keep working. Pre-release Paseo builds count as untested.
 
 ## Uninstall
 
@@ -108,7 +108,8 @@ Leave your rooms and delete the keys **before** removing the plugin:
 |---|---|
 | `paseo plugin install` fails with "npm" or "git" not found | Install git and Node.js with npm on the daemon host, then install again. |
 | Rooms does not appear in the app | Check `paseo plugin ls`. If plugins are disabled, enable them (Settings → Plugins). If `rooms` is not `running`, read `paseo plugin logs rooms`. |
-| Install refused because of the Paseo version | Rooms needs Paseo `>=0.13.2 <0.14.0`. Update Paseo, or wait for a Rooms release that supports your version. |
+| Install refused because of the Paseo version, or the app says `Plugin "rooms" requires Paseo ...` | Rooms needs Paseo `>=0.13.2 <0.15.0` on the daemon and in the app. Update Rooms on the daemon (`paseo plugin install` again) and Paseo, or wait for a Rooms release that supports your version. |
+| "Legacy room agents are not resumed" | These agents were created by Rooms 0.1. On Paseo 0.14 and later other plugins can attach tools to an agent when it starts, which Rooms cannot check, so Rooms refuses to start them. Archive them; Rooms 0.2 shares your existing agents live. |
 | "Shared agents are paused" | The daemon's Paseo version or protocol is outside the tested range. Rooms and chat keep working; shared agents resume on a tested version. |
 | "Keyring locked" | Unlock your system keyring, then reload the Rooms screen. Rooms waits instead of switching to another store. |
 | Notice that keys are kept in a protected file | No system keyring was available at first start. This works; the key is protected by file permissions only. |

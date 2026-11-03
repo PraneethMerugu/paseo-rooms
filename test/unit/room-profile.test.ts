@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { coverage, GENERATED_PATH, protocolTypes, readClassification, renderGenerated } from "../../tools/room-profile-lib";
+import * as messages0132 from "@getpaseo/protocol-0.13.2/messages";
+import { coverage, fieldCoverage, GENERATED_PATH, protocolTypes, readClassification, readFieldPolicy, renderGenerated } from "../../tools/room-profile-lib";
 import { INBOUND_WATCH, OUTBOUND_WATCH, ROOM_PROFILE_PROTOCOL_VERSION } from "../../server/room-profile/generated";
 import {
   ALLOWED_SESSION_EVENTS,
@@ -27,6 +28,24 @@ test("every protocol type is classified (conformance gate)", () => {
   assert.deepEqual(r.stale, { inbound: [], outbound: [] }, "classification rows for types not in the protocol");
   assert.deepEqual(r.duplicates, []);
   assert.equal(types.version, ROOM_PROFILE_PROTOCOL_VERSION);
+});
+
+// The range covers Paseo 0.13.2 too, which reports the same protocol number (1). The profile generated
+// from the newer protocol must classify every type and reviewed field of the older release, with
+// nothing stale and nothing extra allowed.
+test("the profile also covers every type and reviewed field of @getpaseo/protocol 0.13.2", () => {
+  const old = protocolTypes(messages0132, "protocol-0.13.2");
+  assert.equal(old.version, "0.13.2");
+  const r = coverage(rows, old);
+  assert.deepEqual(r.unclassified, { inbound: [], outbound: [] }, "0.13.2 types missing from the profile");
+  for (const d of ["inbound", "outbound"] as const) assert.deepEqual(old[d].filter((t) => !types[d].includes(t)), [], `0.13.2 ${d} types removed in ${types.version}`);
+  // Rows for types newer than 0.13.2 are all denied.
+  const added = rows.filter((x) => !old[x.direction].includes(x.type));
+  assert.ok(added.length > 0);
+  for (const x of added) assert.equal(x.m1Watch, "deny", `${x.type} is newer than 0.13.2 and must stay denied`);
+  const f = fieldCoverage(readFieldPolicy(), rows, messages0132);
+  assert.deepEqual(f.unclassified, [], "0.13.2 fields missing from fields.csv");
+  assert.deepEqual(f.stale, ["in:fetch_agent_timeline_request#wholeTurns"], "only fields newer than 0.13.2 are absent there");
 });
 
 test("the conformance gate fails when a type is missing", () => {

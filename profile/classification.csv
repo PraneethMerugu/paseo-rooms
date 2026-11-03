@@ -176,6 +176,9 @@ set_agent_thinking_request,inbound,workspace.write,owner,deny,phase0 flag: write
 set_daemon_config_request,inbound,daemon.manage,never,deny,default deny
 set_voice_mode,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
 shutdown_server_request,inbound,daemon.manage,never,deny,default deny
+speech.local_models.delete.request,inbound,daemon.manage,never,deny,default deny; Paseo 0.14 local speech model admin
+speech.local_models.download.request,inbound,daemon.manage,never,deny,default deny; Paseo 0.14 local speech model admin (downloads to the owner's machine)
+speech.local_models.list.request,inbound,daemon.read,never,deny,default deny; Paseo 0.14 daemon speech inventory
 start_workspace_script_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
 stash_list_request,inbound,workspace.read,never,deny,phase0 flag: read op without a scope binding; unclear => deny in M1
 stash_pop_request,inbound,workspace.write,owner,deny,phase0 flag: write op; steer/maintain are not in M1
@@ -405,6 +408,9 @@ set_agent_model_response,outbound,workspace.write,owner,deny,default deny
 set_agent_thinking_response,outbound,workspace.write,owner,deny,default deny
 set_daemon_config_response,outbound,daemon.manage,never,deny,default deny
 set_voice_mode_response,outbound,workspace.write,never,deny,default deny
+speech.local_models.delete.response,outbound,daemon.manage,never,deny,default deny; Paseo 0.14
+speech.local_models.download.response,outbound,daemon.manage,never,deny,default deny; Paseo 0.14
+speech.local_models.list.response,outbound,daemon.read,never,deny,default deny; Paseo 0.14
 start_workspace_script_response,outbound,workspace.write,owner,deny,default deny
 stash_list_response,outbound,workspace.read,never,deny,default deny
 stash_pop_response,outbound,workspace.read,owner,deny,default deny

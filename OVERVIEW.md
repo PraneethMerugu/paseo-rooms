@@ -17,7 +17,7 @@ Room traffic goes through the Paseo relay (relay.paseo.sh), end to end encrypted
 ## Requirements and limits
 
 - Pilot release for Linux. macOS and Windows are untested.
-- Paseo 0.13.2 up to, not including, 0.14.0 on every daemon that uses Rooms, with plugins enabled. On other versions shared agents are paused; rooms and chat keep working.
+- Paseo 0.13.2 up to, not including, 0.15.0 on every daemon and app that uses Rooms, with plugins enabled. On other versions shared agents are paused; rooms and chat keep working.
 - Your daemon must be online for members to see the room.
 - Members only watch. Shared agents run as your OS user, so member input can never prompt them.
 - A member's access covers everything on their daemon: their app, their paired devices and their own agents can read the shared agent. Share with people whose machines you would trust with what the agent shows.

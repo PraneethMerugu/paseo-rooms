@@ -12,15 +12,21 @@ import { RawDaemon } from "./gateway/local-daemon";
 import { ROOM_PROFILE_PROTOCOL_VERSION } from "./room-profile/generated";
 
 /** Tested Paseo daemon versions: `>=min <below`. */
-export const PASEO_RANGE = { min: "0.13.2", below: "0.14.0" } as const;
+export const PASEO_RANGE = { min: "0.13.2", below: "0.15.0" } as const;
 export const PASEO_RANGE_TEXT = `>=${PASEO_RANGE.min} <${PASEO_RANGE.below}`;
 
 /**
  * Tested entries of the Room Profile: the daemon's WebSocket protocol number (`server_info.protocolVersion`)
  * and the @getpaseo/protocol release the profile was generated from. Add an entry only after the profile
  * was regenerated and reviewed for that protocol and the unit and e2e suites passed against it.
+ *
+ * Paseo 0.13.2 and 0.14.0 both report protocol 1 (websocket-server.js WS_PROTOCOL_VERSION), so the protocol
+ * number cannot tell them apart; the version range above does. The 0.14.0 profile classifies every message
+ * type and reviewed field of 0.13.2 as well (0.14.0 only adds types; test/unit/room-profile.test.ts checks
+ * the 0.13.2 coverage). Tested: unit suite, and test/e2e-v2 against 0.13.2 and 0.14.0 daemons
+ * (docs/design/paseo-0.14-compat.md).
  */
-export const TESTED_PROFILE_ENTRIES: readonly { protocolVersion: number; profile: string }[] = [{ protocolVersion: 1, profile: "0.13.2" }];
+export const TESTED_PROFILE_ENTRIES: readonly { protocolVersion: number; profile: string }[] = [{ protocolVersion: 1, profile: "0.14.0" }];
 
 export type CompatCode = "ok" | "version_unknown" | "version_untested" | "protocol_unknown" | "protocol_untested";
 
@@ -140,4 +146,31 @@ export class CompatGuard {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Legacy fork room agents (agents Rooms 0.1 created for M1 fork lanes, kept after the migration).
+//
+// Their isolation rests on the stored agent record (tripwire.ts): an inert "paseo" MCP shadow and no
+// other MCP servers. From Paseo 0.14.0 other plugins can attach MCP servers and tools in their
+// "agent.session_open" hooks at launch time; these are not stored, so the tripwire cannot see them
+// (docs/design/paseo-0.14-compat.md). Legacy fork agents are therefore resumed and served only where
+// that injection provably does not exist: a Paseo 0.13.x daemon (>=0.13.2 <0.14.0, no pre-release)
+// whose session-open request has no `tools` or `mcpServers`. Anything else is refused (fail closed).
+
+/** Paseo versions without session-time MCP and tool injection by plugins. */
+export const LEGACY_FORK_RANGE = { min: "0.13.2", below: "0.14.0" } as const;
+
+export const LEGACY_FORK_REFUSED_MESSAGE =
+  "Legacy room agents from Rooms 0.1 are not resumed or shared on Paseo 0.14 or later: other plugins can now attach tools to an agent when it starts, which Rooms cannot check. Archive these agents; Rooms 0.2 shares your existing agents live instead.";
+
+/** True only for a well-formed Paseo 0.13.x version (from 0.13.2), never for an unknown version. */
+export function legacyForkAgentsAllowed(version: unknown): boolean {
+  return typeof version === "string" && inTestedRange(version, LEGACY_FORK_RANGE);
+}
+
+/** Whether an "agent.session_open" request is of the kind that lets plugins add tools or MCP servers (Paseo 0.14+). */
+export function sessionOpenAllowsInjection(request: unknown): boolean {
+  if (!request || typeof request !== "object") return true;
+  return "mcpServers" in request || "tools" in request;
 }

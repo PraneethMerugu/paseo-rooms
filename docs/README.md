@@ -15,6 +15,7 @@ For installing and using Rooms, start with the [README](../README.md). This fold
 | [Implementation plan, identity v2](design/implementation-plan-identity-v2.md) | Milestones I-1 to I-17, spikes, follow-ups and decisions |
 | [Usability roadmap](design/usability-roadmap.md) | State by area and the milestones toward v0.2 |
 | [Milestone 1 results](design/m1-results.md) | What 0.1 delivered and how it was tested |
+| [Paseo 0.14 compatibility](design/paseo-0.14-compat.md) | What changed between Paseo 0.13.2 and 0.14.0 that matters to Rooms, the fixes in 0.2.1, and the version-combination tests |
 
 ## Security (`security/`)
 

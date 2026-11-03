@@ -23,14 +23,20 @@ export interface ClassificationRow {
 
 const def = (s: any): any => s?._zod?.def ?? s?.def ?? {};
 
-/** Every `type` literal of the session message unions in the installed @getpaseo/protocol. */
-export function protocolTypes(): { inbound: string[]; outbound: string[]; version: string } {
+/** A `@getpaseo/protocol/messages` module: the installed one, or an older release (test/unit/room-profile.test.ts). */
+export type ProtocolMessages = Record<string, unknown>;
+
+/**
+ * Every `type` literal of the session message unions in the installed @getpaseo/protocol, or in another
+ * release's messages module (`M`, with its package directory name under node_modules/@getpaseo).
+ */
+export function protocolTypes(M: ProtocolMessages = messages, packageDir = "protocol"): { inbound: string[]; outbound: string[]; version: string } {
   const list = (schema: any): string[] =>
     def(schema).options.map((o: any) => def((def(o).shape ?? o.shape).type).values[0] as string);
-  const pkg = JSON.parse(readFileSync(join(PLUGIN_DIR, "node_modules", "@getpaseo", "protocol", "package.json"), "utf8"));
+  const pkg = JSON.parse(readFileSync(join(PLUGIN_DIR, "node_modules", "@getpaseo", packageDir, "package.json"), "utf8"));
   return {
-    inbound: list((messages as any).SessionInboundMessageSchema).sort(),
-    outbound: list((messages as any).SessionOutboundMessageSchema).sort(),
+    inbound: list((M as any).SessionInboundMessageSchema).sort(),
+    outbound: list((M as any).SessionOutboundMessageSchema).sort(),
     version: pkg.version as string,
   };
 }
@@ -169,8 +175,8 @@ function unionOption(union: any, type: string): any {
 }
 
 /** Protocol schema for one reviewed object name (see profile/fields.csv). */
-export function fieldObjectSchema(object: string): any {
-  const M = messages as any;
+export function fieldObjectSchema(object: string, protocol: ProtocolMessages = messages): any {
+  const M = protocol as any;
   const [head, ...path] = object.split(".");
   // Message type names contain dots, so split the "in:"/"out:" type off by matching known types.
   let base: any;
@@ -196,8 +202,8 @@ export function fieldObjectSchema(object: string): any {
 }
 
 /** Field names the installed protocol defines for one reviewed object. */
-export function protocolFields(object: string): string[] {
-  const keys = shapeKeys(fieldObjectSchema(object));
+export function protocolFields(object: string, M: ProtocolMessages = messages): string[] {
+  const keys = shapeKeys(fieldObjectSchema(object, M));
   // capabilities is .passthrough(): CLIENT_CAPS lists the wire names that are not in the shape.
   if (object === "hello.capabilities") return [...new Set([...keys, ...Object.values(CLIENT_CAPS)])].sort();
   return keys.sort();
@@ -215,7 +221,7 @@ export interface FieldCoverage {
  * Field-level conformance: every field of every reviewed object is classified exactly once, every
  * allowed message type has a reviewed object, and every "nested" field has its own table.
  */
-export function fieldCoverage(fieldRows: FieldRow[], classification: ClassificationRow[]): FieldCoverage {
+export function fieldCoverage(fieldRows: FieldRow[], classification: ClassificationRow[], M: ProtocolMessages = messages): FieldCoverage {
   const byObject = new Map<string, FieldRow[]>();
   const seen = new Map<string, number>();
   for (const r of fieldRows) {
@@ -228,7 +234,7 @@ export function fieldCoverage(fieldRows: FieldRow[], classification: Classificat
   for (const [object, rows] of byObject) {
     let proto: string[];
     try {
-      proto = protocolFields(object);
+      proto = protocolFields(object, M);
     } catch (e) {
       stale.push(`${object} (${(e as Error).message})`);
       continue;

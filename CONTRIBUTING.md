@@ -7,7 +7,7 @@ Thank you for helping. Rooms is security-sensitive: it shares a live agent acros
 You need:
 
 - **Node.js 20.19 or later** and npm, for installing, type checking and unit tests;
-- **Paseo 0.13.x** (desktop app or CLI), for the end-to-end tests, the reliability suite and the UI check kit;
+- **Paseo 0.13.2 or 0.14.x** (desktop app, or the CLI from npm), for the end-to-end tests, the reliability suite and the UI check kit;
 - **bash**, for the test scripts. They have only ever run on Linux.
 
 ```bash
@@ -21,7 +21,7 @@ npm ci
 | `npm run typecheck` | `tsc --noEmit` over the entries, `server/`, `shared/`, `client/`, `tools/` and the tests |
 | `npm run typecheck:client` | The client alone, without Node or DOM types. The client bundle runs on desktop, web, iOS and Android, so `node:*`, `Buffer`, `process` and `document` must fail here. |
 | `npm run typecheck:reliability` | The reliability suite (`test/reliability/`) |
-| `npm test` | Unit and conformance tests (397, 10 to 30 s) on the `node` on your `PATH` |
+| `npm test` | Unit and conformance tests (400, 10 to 30 s) on the `node` on your `PATH` |
 | `npm run test:e2e` | Offline end-to-end test with disposable Paseo daemons (below) |
 | `npm run gen:profile` | Regenerates `server/room-profile/generated.ts` after editing `profile/*.csv` |
 | `npm run check:docs` | Checks that repository paths named in the user-facing Markdown files exist |
@@ -38,6 +38,15 @@ The scripts that start daemons source [`tools/paseo-env.sh`](tools/paseo-env.sh)
 | `PASEO_NODE` | Paseo's executable, used as Node with `ELECTRON_RUN_AS_NODE=1`, or any Node 20.19+ | `/opt/Paseo/Paseo.bin` | `/Applications/Paseo.app/Contents/Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper` | `%LOCALAPPDATA%\Programs\Paseo\Paseo.exe` |
 
 If a default is missing, `paseo` and `node` (20.19 or later) on `PATH` are used. Otherwise the script stops with a message naming the variable to set.
+
+`PASEO_BIN` may also be a CLI installed from npm. It then runs on `PASEO_NODE` (an npm CLI's shebang would use `node` from `PATH`):
+
+```bash
+mkdir /tmp/paseo-0.14 && (cd /tmp/paseo-0.14 && npm init -y > /dev/null && npm install @getpaseo/cli@0.14.0)
+PASEO_BIN=/tmp/paseo-0.14/node_modules/.bin/paseo PASEO_NODE=/opt/Paseo/Paseo.bin bash test/e2e-v2/run.sh
+```
+
+For a mixed-version end-to-end run, `PASEO_BIN_OWNER` and `PASEO_BIN_MEMBER` choose the CLI (and so the daemon version) of the owner and of both member daemons.
 
 ## Tests
 

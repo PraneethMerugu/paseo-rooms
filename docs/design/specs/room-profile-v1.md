@@ -1,7 +1,7 @@
 # Room Profile v1 (watch role)
 
 - **Status:** implemented in Milestone 1. Generated table `server/room-profile/generated.ts`; bindings in `server/room-profile/filter.ts`; endpoint in `server/gateway/lane-endpoint.ts`.
-- **Protocol pinned:** `@getpaseo/protocol` 0.13.2 (215 inbound and 234 outbound session message types).
+- **Protocol pinned:** `@getpaseo/protocol` 0.14.0 (218 inbound and 237 outbound session message types) since Rooms 0.2.1; it also covers every type and reviewed field of 0.13.2 (215 and 234), which reports the same protocol number 1. The six types new in 0.14.0 (`speech.local_models.*`) are denied. Review: [`../paseo-0.14-compat.md`](../paseo-0.14-compat.md).
 
 ## 1. Sources of truth
 

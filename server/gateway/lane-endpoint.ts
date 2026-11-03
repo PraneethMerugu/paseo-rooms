@@ -47,7 +47,7 @@ import {
 } from "../room-profile/sanitize";
 import { LaneErrorLog } from "./lane-errors";
 import { buildUpstreamHello, openDaemonSocket, RawDaemon } from "./local-daemon";
-import { checkPaseoCompat, type CompatGuard } from "../compat";
+import { checkPaseoCompat, LEGACY_FORK_REFUSED_MESSAGE, legacyForkAgentsAllowed, type CompatGuard } from "../compat";
 import { MAX_CONNECTION_ID_CHARS, parseRelayNotice, RelayConnection, RelayControlSocket, relayServerUrl, type RelayAddress } from "../transport/relay-server";
 
 /** What a lane endpoint needs to know about its lane (the owner-local binding plus the offer). */
@@ -272,6 +272,11 @@ export class LaneEndpoint {
         const verdict = this.deps.compat ? this.deps.compat.observe(d.serverInfo) : checkPaseoCompat(d.serverInfo);
         if (!verdict.ok) {
           this.block(`paseo_${verdict.code}`, verdict.message ?? verdict.code);
+          return;
+        }
+        // Legacy fork room agents are served only on Paseo 0.13.x (compat.ts LEGACY_FORK_RANGE).
+        if (this.lane.origin.kind === "fork" && !legacyForkAgentsAllowed(verdict.version)) {
+          this.block("legacy_fork_agent_refused", LEGACY_FORK_REFUSED_MESSAGE);
           return;
         }
         const res = await d.request({ type: "fetch_agent_request", agentId: this.lane.agentId });

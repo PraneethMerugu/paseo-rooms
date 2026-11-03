@@ -50,6 +50,11 @@ function tree(dir: string): string[] {
   return out.sort();
 }
 
+
+/** Session-open requests as Paseo sends them: 0.13.2 (env only) and 0.14.0 (tools and mcpServers, launch-time only). */
+const OPEN_0132 = { agentId: "x", workspaceId: null, provider: "claude", cwd: "/w", reason: "resume", purpose: "interactive", env: {} };
+const OPEN_0140 = { ...OPEN_0132, title: null, labels: {}, tools: [], mcpServers: {} };
+
 test("migration 1: a v1 tree is archived by rename, recorded in migration.json, and a second run does nothing", async () => {
   const h = home();
   try {
@@ -217,10 +222,22 @@ test("migration 1 (runtime): start archives v1 data before the keystore, status 
       fs.writeFileSync(join(d, `${V1.forkAgent}.json`), JSON.stringify({ id: V1.forkAgent, provider: "claude", cwd: "/w", labels: {}, config }));
     };
     store(restrictRoomAgentConfig({ provider: "claude" }, inert));
-    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.forkAgent));
-    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.shareAgent), "share lanes used the owner's own agent: not checked");
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132));
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.shareAgent, OPEN_0132), "share lanes used the owner's own agent: not checked");
+    // Paseo 0.14+ (session-time MCP and tool injection by other plugins): the intact legacy fork is refused,
+    // the owner sees a notice, and ordinary agents are not affected. Paseo 0.13.2 keeps the old behaviour.
+    assert.equal(rt.status().legacyForkAgents, null);
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0140), /not resumed: Legacy room agents/);
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.shareAgent, OPEN_0140), "share agents are not legacy forks");
+    assert.deepEqual(rt.status().legacyForkAgents?.agentIds, [V1.forkAgent]);
+    assert.match(rt.status().legacyForkAgents?.message ?? "", /Archive these agents/);
+    // A 0.13-shaped request is still refused once the daemon is known to be 0.14 (not provably 0.13.x).
+    rt.compat.observe({ version: "0.14.0", protocolVersion: 1 });
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), /not resumed/);
+    rt.compat.observe({ version: "0.13.2", protocolVersion: 1 });
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), "0.13.2: the intact legacy fork resumes as before");
     store({ mcpServers: { paseo: { type: "http", url: "http://127.0.0.1/mcp/agents" } } });
-    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /isolation check/);
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), /isolation check/);
 
     await rt.dismissMigrationNotice();
     assert.equal(rt.status().migration?.notice, false);
@@ -326,19 +343,19 @@ test("V-1: the resume tripwire fails closed when the start-time permission check
     assert.equal(fs.existsSync(join(h.data, "inert-mcp.cjs")), false, "the check writes nothing");
     // The M1 fork (listed in the live v1 state) with an altered stored config: refused.
     storeAgent(h.dir, V1.forkAgent, altered(V1.forkAgent));
-    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /isolation check/);
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), /isolation check/);
     // A room agent identified by its stored record alone (inert shadow plus an extra MCP server): refused.
     storeAgent(h.dir, V2_ROOM_AGENT, { id: V2_ROOM_AGENT, labels: {}, config: { mcpServers: { paseo: { type: "stdio", command: process.execPath, args: [join(h.data, "inert-mcp.cjs")], env: { ELECTRON_RUN_AS_NODE: "1" } }, extra: { type: "stdio", command: "/bin/sh", args: [] } } } });
-    assert.throws(() => rt.assertRoomAgentIntact(V2_ROOM_AGENT), /unexpected MCP servers/);
+    assert.throws(() => rt.assertRoomAgentIntact(V2_ROOM_AGENT, OPEN_0132), /unexpected MCP servers/);
     // An M1 room agent recognised by its lane label, even if no list names it.
     storeAgent(h.dir, OTHER_AGENT, altered(OTHER_AGENT, { "rooms.lane": "lane_eeeeeeeeeeeeeeee" }));
-    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /isolation check/);
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT, OPEN_0132), /isolation check/);
     // An ordinary agent passes; an unreadable stored record is refused.
     storeAgent(h.dir, OTHER_AGENT, plain(OTHER_AGENT));
-    assert.doesNotThrow(() => rt.assertRoomAgentIntact(OTHER_AGENT));
-    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.shareAgent), "share agents: no record, list readable");
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(OTHER_AGENT, OPEN_0132));
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.shareAgent, OPEN_0132), "share agents: no record, list readable");
     storeAgent(h.dir, OTHER_AGENT, "{not json");
-    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /unreadable/);
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT, OPEN_0132), /unreadable/);
     await rt.stop();
   } finally {
     h.cleanup();
@@ -355,17 +372,17 @@ test("V-1: the resume tripwire fails closed when migration.json cannot be read",
     assert.equal(rt.status().migration, null, "the record is not loaded");
     // The archived v1 state still names the fork.
     storeAgent(h.dir, V1.forkAgent, altered(V1.forkAgent));
-    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /isolation check/);
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), /isolation check/);
     // After "Delete keys" the archive no longer names it: a missing record is refused, since Rooms
     // cannot tell whether it belongs to a room agent; an unreadable one too; a marked one is checked.
     fs.unlinkSync(join(h.data, ARCHIVE, "gateway", "state.json"));
-    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /not readable/);
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT, OPEN_0132), /not readable/);
     storeAgent(h.dir, OTHER_AGENT, "[]");
-    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /unreadable/);
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT, OPEN_0132), /unreadable/);
     storeAgent(h.dir, OTHER_AGENT, altered(OTHER_AGENT, { "rooms.lane": V1.forkLane }));
-    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT), /isolation check/);
+    assert.throws(() => rt.assertRoomAgentIntact(OTHER_AGENT, OPEN_0132), /isolation check/);
     storeAgent(h.dir, OTHER_AGENT, plain(OTHER_AGENT));
-    assert.doesNotThrow(() => rt.assertRoomAgentIntact(OTHER_AGENT), "an ordinary agent with a readable record resumes");
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(OTHER_AGENT, OPEN_0132), "an ordinary agent with a readable record resumes");
     await rt.stop();
   } finally {
     h.cleanup();
@@ -379,11 +396,11 @@ test("V-1: the resume tripwire works before start reaches the migration step", (
     assert.equal(rt.state, "starting");
     const inert = ensureInertMcp(h.data);
     storeAgent(h.dir, V1.forkAgent, { id: V1.forkAgent, provider: "claude", cwd: "/w", labels: {}, config: restrictRoomAgentConfig({ provider: "claude" }, inert) });
-    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.forkAgent), "an intact shadow passes");
+    assert.doesNotThrow(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), "an intact shadow passes");
     storeAgent(h.dir, V1.forkAgent, altered(V1.forkAgent));
-    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /isolation check/, "listed only in the unmigrated gateway/state.json");
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), /isolation check/, "listed only in the unmigrated gateway/state.json");
     fs.rmSync(join(h.dir, "agents"), { recursive: true });
-    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent), /stored agent record not found/);
+    assert.throws(() => rt.assertRoomAgentIntact(V1.forkAgent, OPEN_0132), /stored agent record not found/);
   } finally {
     h.cleanup();
   }

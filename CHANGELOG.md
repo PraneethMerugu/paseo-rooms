@@ -2,6 +2,16 @@
 
 All notable changes to Paseo Rooms. Versions follow [semantic versioning](https://semver.org/); before 1.0, a minor version may break compatibility.
 
+## 0.2.1: Paseo 0.14 support (unreleased)
+
+### Changed
+
+- **Paseo range widened to `>=0.13.2 <0.15.0`.** Paseo checks this range against both the daemon and the app version, so a Paseo 0.14 app no longer refuses Rooms served by a 0.13.2 daemon. Tested with 0.13.2 and 0.14.0 daemons, including an owner and members on different versions ([`docs/design/paseo-0.14-compat.md`](docs/design/paseo-0.14-compat.md)).
+- **Room Profile regenerated from `@getpaseo/protocol` 0.14.0.** The new `speech.local_models.*` messages are denied and the new `wholeTurns` timeline field is dropped. The profile still covers every 0.13.2 message, which a new unit test checks. The version guard's tested entry is now protocol 1 with the 0.14.0 profile; untested versions, protocols and pre-releases still pause shared agents.
+- **Legacy room agents from Rooms 0.1 are refused on Paseo 0.14 and later.** Paseo 0.14 lets other plugins attach tools and MCP servers when an agent starts, which the Rooms isolation check cannot see. Rooms no longer resumes or shares these agents unless the daemon is Paseo 0.13.x, and the Rooms screen lists them with advice to archive them. On 0.13.2 nothing changes.
+- `@getpaseo/protocol`, `@getpaseo/relay`, `@getpaseo/client` and `@getpaseo/plugin` dependencies are 0.14.0. The modules Rooms uses at run time are unchanged from 0.13.2.
+- Test scripts accept a Paseo CLI installed from npm (`PASEO_BIN`, run on `PASEO_NODE`), and the end-to-end test accepts one CLI for the owner and another for the members (`PASEO_BIN_OWNER`, `PASEO_BIN_MEMBER`).
+
 ## 0.2.0: identity v2 pilot (unreleased)
 
 A rewrite of the identity, enrollment and access layer ("identity v2"). Pilot release for Linux; macOS and Windows are untested.

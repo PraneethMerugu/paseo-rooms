@@ -10,6 +10,14 @@
 //   - agent-manager.js createAgentInternal: before("agent.create") -> prepareSessionConfig
 //     (stored config, Paseo MCP injected unless a non-internal "paseo" entry exists) ->
 //     before("agent.session_open") -> createSession -> registerSession (stored record written).
+// Paseo 0.14.0 (verified in @getpaseo/server 0.14.0 plugins/lifecycle/index.js, plugins/runtime.js,
+// agent/agent-manager.js buildLaunchContext and resolveProviderLaunchConfig): "agent.session_open" may
+// also contribute `tools` and `mcpServers`. They apply at launch only and are NOT stored, so this check
+// cannot see them, and each plugin's hook sees only its own contributions. A contributed server named
+// "paseo" (or named like a stored server) is rejected by Paseo, so the inert shadow stays, and plugin
+// agent tools are served through the shadowed Paseo catalog. Because the added servers are invisible here,
+// legacy fork room agents are refused outright unless the daemon is provably 0.13.x (compat.ts
+// LEGACY_FORK_RANGE; runtime-v2.ts assertRoomAgentIntact; docs/design/paseo-0.14-compat.md).
 // So the final config is only observable after creation, in the daemon's stored agent record
 // ($PASEO_HOME/agents/<cwd slug>/<agentId>.json, config.mcpServers / config.toolPolicy). The
 // gateway creates room agents WITHOUT a prompt, runs this check, and only then sends the first

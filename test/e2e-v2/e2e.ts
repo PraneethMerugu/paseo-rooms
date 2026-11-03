@@ -65,6 +65,12 @@ const HOUR = 60 * 60 * 1000;
 const LIVE = process.env.E2E_LIVE === "1";
 const RELAY_LOG = process.env.E2E_RELAY_LOG ?? "";
 const PASEO_BIN = process.env.E2E_PASEO_BIN!;
+// Mixed-version runs (run.sh PASEO_BIN_OWNER / PASEO_BIN_MEMBER): one CLI per daemon.
+const PASEO_BIN_OWNER = process.env.E2E_PASEO_BIN_OWNER || PASEO_BIN;
+const PASEO_BIN_MEMBER = process.env.E2E_PASEO_BIN_MEMBER || PASEO_BIN;
+const cliFor = (home: string): string => (home === OWNER ? PASEO_BIN_OWNER : PASEO_BIN_MEMBER);
+// The viewer apps are simulated with the installed @getpaseo/client; report its version as the app version.
+const APP_VERSION: string = JSON.parse(readFileSync(join(__dirname, "..", "..", "node_modules", "@getpaseo", "client", "package.json"), "utf8")).version;
 const SCRATCH = process.env.E2E_SCRATCH!;
 const GRANT_TTL_S = Number(process.env.PASEO_ROOMS_DEV_GRANT_TTL_S ?? 40);
 const PLUGIN = "rooms";
@@ -100,7 +106,7 @@ async function daemonClient(home: string, name: string): Promise<any> {
     url: `ws://${address}/ws`,
     clientId: `rooms-e2e-v2-${name}-${randomUUID().slice(0, 8)}`,
     clientType: "cli",
-    appVersion: "0.13.2",
+    appVersion: APP_VERSION,
     localCredential: () => cred(home),
     webSocketFactory: wsFactory,
     reconnect: { enabled: false },
@@ -169,11 +175,11 @@ function daemonEnv(home: string): NodeJS.ProcessEnv {
 }
 
 function stopDaemon(home: string): void {
-  execFileSync(PASEO_BIN, ["daemon", "stop", "--home", home], { env: daemonEnv(home), stdio: ["ignore", "ignore", "ignore"], timeout: 120_000 });
+  execFileSync(cliFor(home), ["daemon", "stop", "--home", home], { env: daemonEnv(home), stdio: ["ignore", "ignore", "ignore"], timeout: 120_000 });
 }
 
 function startDaemon(home: string): void {
-  execFileSync(PASEO_BIN, ["daemon", "start", "--timeout", "120", "--home", home], { env: daemonEnv(home), stdio: ["ignore", "ignore", "ignore"], timeout: 180_000 });
+  execFileSync(cliFor(home), ["daemon", "start", "--timeout", "120", "--home", home], { env: daemonEnv(home), stdio: ["ignore", "ignore", "ignore"], timeout: 180_000 });
 }
 
 /**
@@ -373,7 +379,7 @@ async function main() {
     url: `ws://${listen(MEMBER)}/ws`,
     clientId: `rooms-e2e-v2-app-${randomUUID().slice(0, 8)}`,
     clientType: "mobile",
-    appVersion: "0.13.2",
+    appVersion: APP_VERSION,
     localCredential: () => cred(MEMBER),
     webSocketFactory: wsFactory,
   } as any);
@@ -384,7 +390,7 @@ async function main() {
   check("lane visible as a routed host on the member daemon", laneOnline.ok, laneOnline.ok ? { label: laneOnline.value.label, status: laneOnline.value.status, source: laneOnline.value.source?.id } : { error: laneOnline.error });
   const openRouted = () => {
     const clientId = randomUUID();
-    return new DaemonClient({ url: "ws://routed-host/ws", clientId, clientType: "mobile", appVersion: "0.13.2", transportFactory: createHostChannelTransport(origin, laneServerId, clientId, null) } as any) as any;
+    return new DaemonClient({ url: "ws://routed-host/ws", clientId, clientType: "mobile", appVersion: APP_VERSION, transportFactory: createHostChannelTransport(origin, laneServerId, clientId, null) } as any) as any;
   };
   const routed = openRouted();
   const statusLog: Array<{ at: number; status: string }> = [];
@@ -746,7 +752,7 @@ async function main() {
   const memberId2 = (await joined2())?.memberId;
   const lane1ServerId = (await owned2()).lanes.find((l: any) => l.laneId === l1.laneId).serverId;
   const rid = randomUUID();
-  const view1: any = new DaemonClient({ url: "ws://routed-host/ws", clientId: rid, clientType: "mobile", appVersion: "0.13.2", transportFactory: createHostChannelTransport(origin, lane1ServerId, rid, null) } as any);
+  const view1: any = new DaemonClient({ url: "ws://routed-host/ws", clientId: rid, clientType: "mobile", appVersion: APP_VERSION, transportFactory: createHostChannelTransport(origin, lane1ServerId, rid, null) } as any);
   const v1Status: Array<{ at: number; status: string }> = [];
   view1.subscribeConnectionStatus((x: any) => v1Status.push({ at: Date.now(), status: x.status }));
   const v1 = await attempt(() => until("view through lane 1", async () => (await attempt(() => view1.connect())).ok, 30_000, 1000));

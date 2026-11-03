@@ -474,6 +474,7 @@ function LanesTab({ view, theme, styles, admin, refresh }: TabProps) {
               <Badge theme={theme} label={l.status === "closed" ? "Closed" : l.blocked?.startsWith("paseo_") ? "Paused" : (l.endpoint ?? "offline")} tone={l.status === "closed" ? "muted" : l.endpoint === "online" ? "ok" : "warn"} />
             </View>
             {l.status !== "closed" && l.blocked?.startsWith("paseo_") ? <Text style={styles.small}>Not served: this Paseo version is untested with Rooms. See the notice at the top of Rooms.</Text> : null}
+            {l.status !== "closed" && l.blocked === "legacy_fork_agent_refused" ? <Text style={styles.small}>Not served: legacy room agents from Rooms 0.1 are not shared on Paseo 0.14 or later. Archive the agent; Rooms 0.2 shares existing agents live.</Text> : null}
             {l.status !== "closed" ? (
               <View style={styles.row}>
                 <Button

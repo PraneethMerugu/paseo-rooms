@@ -139,6 +139,13 @@ function RuntimeNotices({ s, theme, styles }: { s: Status; theme: PluginTheme; s
           </Text>
         </View>
       ) : null}
+      {s.legacyForkAgents ? (
+        <View style={box("warn")}>
+          <Text style={styles.h2}>Legacy room agents are not resumed</Text>
+          <Text style={styles.body}>{s.legacyForkAgents.message}</Text>
+          <Text style={styles.small}>Agents: {s.legacyForkAgents.agentIds.join(", ")}</Text>
+        </View>
+      ) : null}
       {s.staleHosts?.length ? <StaleHostsNotice s={s} theme={theme} styles={styles} /> : null}
       {s.state === "error" && s.error === "data_deleted" ? (
         <View style={box("warn")}>

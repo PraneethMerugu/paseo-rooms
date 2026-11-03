@@ -430,6 +430,11 @@ export const roomsV2Status = defineRpc({
      * and the Room Profile's tested entries. Null until the daemon answered. When `ok` is false, lanes
      * are not served and the Rooms screen shows `message` and `action`.
      */
+    /**
+     * Legacy fork room agents from Rooms 0.1 that are refused on this daemon (Paseo 0.14+: other plugins
+     * can attach tools at session open). Null when there are none or the daemon is Paseo 0.13.x.
+     */
+    legacyForkAgents: z.object({ agentIds: z.array(z.string()), message: z.string() }).nullable().optional(),
     paseoCompat: z
       .object({
         ok: z.boolean(),

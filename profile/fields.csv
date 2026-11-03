@@ -41,6 +41,7 @@ in:fetch_agent_timeline_request,cursor,keep,
 in:fetch_agent_timeline_request,limit,redact,"clamped: 0 (all) and values above the limit become maxTimelineLimit (P-17)"
 in:fetch_agent_timeline_request,projection,keep,
 in:fetch_agent_timeline_request,mergeWindow,keep,
+in:fetch_agent_timeline_request,wholeTurns,drop,"Paseo 0.14 whole-turn paging; the gateway does not advertise wholeTurnTimeline, so a 0.14 app does not send it (dropped if it does; item paging still applies)"
 in:agent.timeline.set_subscription.request,type,keep,
 in:agent.timeline.set_subscription.request,agentIds,keep,every id bound to the lane agent
 in:agent.timeline.set_subscription.request,requestId,keep,
